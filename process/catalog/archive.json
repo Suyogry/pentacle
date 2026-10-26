@@ -38,7 +38,8 @@
     ],
     "status": "completed",
     "machine": "local",
-    "owner": "maintainer"
+    "owner": "maintainer",
+    "completed_at": "2026-10-26"
   },
   {
     "id": "spec_mic_api_auth",
@@ -100,7 +101,8 @@
     ],
     "status": "completed",
     "machine": "local",
-    "owner": "maintainer"
+    "owner": "maintainer",
+    "completed_at": "2026-10-26"
   },
   {
     "id": "work_mic_api_auth",

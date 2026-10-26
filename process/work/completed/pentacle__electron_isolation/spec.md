@@ -6,6 +6,7 @@ status: completed
 canonical: false
 created_at: '2026-10-26'
 updated_at: '2026-10-26'
+completed_at: '2026-10-26'
 source_path: work/completed/pentacle__electron_isolation/spec.md
 machine: local
 owner: maintainer
@@ -59,4 +60,6 @@ Run full Node unit/renderer suite, desktop and web builds, relevant packaging co
 
 Shipped source commit `d4068baba0613f259193b64e853174375ef2bee9` to the personal fork's main; remote ref readback matches. All acceptance criteria are satisfied within the explicit macOS source-shipment scope. Personal services remain stopped and the built package is uninstalled. See [_artifacts/validation.md](_artifacts/validation.md) for the accepted evidence and platform/hardware bounds.
 
-Retrospective: Reusing the browser build preserved the UI while removing renderer Node access. Testing the actual sandboxed artifact exposed immutable-bridge config and harness assumptions that source-only checks miss. Keep test prerequisites complete and use a realistic per-file deadline for the existing Git integration suite.
+## Retro
+
+Reusing the browser build preserved the UI while removing renderer Node access. Testing the actual sandboxed artifact exposed immutable-bridge config and harness assumptions that source-only checks miss. Keep test prerequisites complete and use a realistic per-file deadline for the existing Git integration suite.

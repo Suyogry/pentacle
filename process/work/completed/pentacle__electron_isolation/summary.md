@@ -6,6 +6,7 @@ status: completed
 canonical: false
 created_at: '2026-10-26'
 updated_at: '2026-10-26'
+completed_at: '2026-10-26'
 source_path: work/completed/pentacle__electron_isolation/summary.md
 machine: local
 owner: maintainer
