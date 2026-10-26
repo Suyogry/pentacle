@@ -32,6 +32,9 @@ import json
 import math
 import sys
 import time
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _shared.operator_client import operator_hello
 from collections import Counter
 from typing import Any, Iterable
 
@@ -342,11 +345,9 @@ def desktop_handshake_fetch_reply_observed(
     bootstrap_frame_sizes: list[int] = []
     bootstrap_started = time.monotonic()
     with connect(url, open_timeout=timeout) as ws:
-        ws.send(json.dumps({
-            "type": "hello", "request_id": "probe-hello",
-            "client": "pentacle-contract-probe",
-            "subscribe": {"include_subagents": include_subagents, "events_mode": events_mode},
-        }))
+        welcome = json.loads(ws.recv(timeout=timeout))
+        ws.send(json.dumps(operator_hello(welcome, request_id="probe-hello",
+            subscribe={"include_subagents": include_subagents, "events_mode": events_mode})))
         hello = _recv_reply(ws, timeout=timeout, pushes=pushes, wire_sizes=bootstrap_frame_sizes)
         if hello.get("type") != "hello":
             raise RuntimeError(f"expected hello reply, got {hello.get('type')!r}: {hello}")

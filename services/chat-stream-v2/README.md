@@ -77,12 +77,10 @@ not enforce the new route-origin fence.
 
 ## Desktop and mobile credentials
 
-Unauthenticated local bootstrap is only for actual loopback peers whose
-WebSocket handshake omits `Origin` (native CLI tools and the Node web bridge).
-Any supplied `Origin`, including a local, empty or `null` value, requires the
-same authentication as a remote peer for reads, snapshots and broadcasts.
-Authenticated browser/mobile clients continue to use their existing credentials.
-This isolates websites; it is not authentication against other local processes.
+All clients, including native localhost tools, require credentials for commands,
+reads, snapshots and broadcasts. See [daemon authentication and migration](../../docs/daemon_authentication.md)
+for CLI launch environments, automatic worker credentials and recovery. The
+authenticated operator retains full existing command authority.
 
 `tools/operator_auth_cli.py issue --client-kind pentacle` issues a desktop credential; `--client-kind pentacle-mobile` issues a separate mobile credential. The JSON output's `code` field is secret. Store desktop credentials in a mode-0600 file under a mode-0700 directory and point `chatStream.tokenPath` at its canonical path. Do not place a v2 credential inline in the desktop config. The CLI's `list`, `revoke` and `rotate` commands manage credentials in the daemon's registry.
 

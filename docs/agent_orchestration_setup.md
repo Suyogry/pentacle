@@ -81,7 +81,7 @@ in the current shell. Use a loopback websocket for local development:
 }
 ```
 
-Keep local configuration and any optional credential material outside version control. The protocol's authentication boundaries are documented separately; an unauthenticated local development daemon may be used for fixture tests.
+Keep local configuration and any optional credential material outside version control. All localhost clients require credentials; fixture tests must provision synthetic credentials. See [daemon authentication](daemon_authentication.md) for operator environments and migration.
 
 ## Smoke checks
 

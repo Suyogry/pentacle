@@ -328,6 +328,9 @@ def test_real_socket_offer_creation_reconnect_expiry_and_terminal_are_target_onl
             await ws.send(json.dumps(hello))
             while True:
                 frame=json.loads(await ws.recv())
+                if not cid and not seat:
+                    assert frame == {'type': 'hello.error', 'error_code': 'authentication_required'}
+                    return ws, None
                 assert frame['type']!='hello.error'
                 if frame['type']=='snapshot':return ws,frame
         async def notifications(ws):
@@ -351,7 +354,7 @@ def test_real_socket_offer_creation_reconnect_expiry_and_terminal_are_target_onl
             for ws in (wa,wb,ww,wt,wu):assert not await notifications(ws)
             wr,sr=await open_client(a.cid)
             assert [r['notification_id'] for r in sr['notifications']]==[expected]
-            assert not sb['notifications'] and not sw['notifications'] and not st['notifications'] and not su['notifications']
+            assert not sb['notifications'] and not sw['notifications'] and not st['notifications'] and su is None
             await wa.send(json.dumps({'type':'consent_key.decline','request_id':'decline','offer_id':offer['offer_id']}))
             terminal=await notifications(wa)
             assert terminal[0]['consent_offer']['state']=='declined'

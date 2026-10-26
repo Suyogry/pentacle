@@ -158,13 +158,13 @@ def run_cell(path, identity, state="F1", caller="none", *, form="bearer", seat_e
         if seat_env:
             env["AGENT_ORCH_STREAM_ID"] = "fixture:seat"
         stack.enter_context(patch.dict(os.environ, env, clear=True))
-        original_read = Path.read_text
+        original_read = os.open
         if state == "F8":
-            def unreadable(self, *args, **kwargs):
-                if self == token_path:
+            def unreadable(path, *args, **kwargs):
+                if Path(path) == token_path:
                     raise PermissionError("fixture unreadable")
-                return original_read(self, *args, **kwargs)
-            stack.enter_context(patch.object(Path, "read_text", unreadable))
+                return original_read(path, *args, **kwargs)
+            stack.enter_context(patch.object(os, "open", unreadable))
         stack.enter_context(patch.object(w.uuid, "uuid4", lambda: "00000000-0000-4000-8000-000000000002"))
         stack.enter_context(patch.object(config_module, "_read_json_config", lambda: {}))
         stack.enter_context(patch.object(w, "_retry_next_delay", lambda *a: (0, None) if a[-1] < 2 else (None, "retry_exhausted")))

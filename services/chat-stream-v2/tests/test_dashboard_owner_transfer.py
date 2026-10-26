@@ -272,6 +272,9 @@ def test_real_dispatch_distinguishes_connection_operator_from_elevated_seat(tmp_
             hashlib.sha256(token.encode()).hexdigest(), STREAM_TOKEN_HASH_VERSION)
         server = Server(store=store, sessions=sessions, local_host="node-a", seat_operator_authority=True)
         server.handlers.update(f.assets.wire_handlers())
+        from types import SimpleNamespace
+        server.operator_credential_registry = SimpleNamespace(load=lambda: SimpleNamespace(
+            credentials={CREDENTIAL: {"client_kind": "pentacle", "revoked_at": None}}))
         class Peer:
             remote_address = ("192.0.2.10", 12345)
         peer = Peer()
@@ -290,7 +293,7 @@ def test_real_dispatch_distinguishes_connection_operator_from_elevated_seat(tmp_
             reply = (await server._dispatch(json.dumps(request), websocket=peer))[0]
             assert (reply["type"] == "dashboard.owner.transfer.ok") is expected, reply
             if not expected:
-                assert reply["error_code"] == ("authentication_required" if actor in {"spoof", "scoped_operator"}
+                assert reply["error_code"] == ("authentication_required" if actor == "spoof" else "scope_denied" if actor == "scoped_operator"
                                                 else "dashboard_unauthorized"), reply
                 assert f.snapshot() == before
             elif actor == "fd":

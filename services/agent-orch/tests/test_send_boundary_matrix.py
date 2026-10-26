@@ -22,7 +22,34 @@ def test_base_wire_parity(key, expected):
     # Parity concerns transmitted bytes, not a socket opened then closed
     # before admission. Dashboard's stronger no-connect rule is tested below.
     actual["frames"] = [frames for frames in actual["frames"] if frames]
-    assert actual == expected
+    if identity == "OP" and path == "inbox":
+        frames = [json.loads(raw) for group in actual["frames"] for raw in group]
+        assert frames[0]["token"] == "OPERATOR-sentinel"
+        assert "from_stream_id" not in frames[0] and "stream_token" not in frames[0]
+        assert actual["closed"] and actual["error"] is None
+    elif identity == "SEAT" or (identity == "OP" and path == "status"):
+        # Local authentication intentionally retires the old ambient operator
+        # token on seat hellos. Preserve the golden contract on other cells;
+        # assert the new identity contract explicitly on migrated seat cells.
+        frames = [json.loads(raw) for group in actual["frames"] for raw in group]
+        hellos = [frame for frame in frames if frame["type"] == "hello"]
+        if path == "envelope" and identity == "OP" and caller == "envelope":
+            for hello in hellos:
+                assert "from_stream_id" not in hello and "stream_token" not in hello
+        elif hellos:
+            for hello in hellos:
+                assert "token" not in hello and "auth_v2" not in hello
+                assert hello["from_stream_id"] == ("fixture:seat" if identity == "SEAT" else "fixture:target")
+                assert hello["stream_token"]
+        elif any(json.loads(raw).get("type") == "hello" for group in expected["frames"] for raw in group):
+            assert not frames
+            assert (actual["error"] == "SeatCredentialUnavailable" or actual["result"] == 2
+                    or path == "reader" and actual["result"]["error_code"] == "unavailable")
+        else:
+            assert actual == expected
+        assert actual["closed"]
+    else:
+        assert actual == expected
 
 
 @pytest.mark.parametrize("path", PATHS)
@@ -33,6 +60,9 @@ def test_service_wire_matrix(path, identity, state, caller):
     actual = run_cell(path, identity, state, caller)
     assert actual["closed"]
     frames = [json.loads(raw) for socket in actual["frames"] for raw in socket]
+    if path == "grant":
+        assert not frames and actual["error"] == "ServiceCredentialUnavailable"
+        return
     if path == "status" and identity == "CD":
         # This extra builder-policy row rejects a colon-free self stream id
         # before transport on the base too. Its egress class is covered by rpc.

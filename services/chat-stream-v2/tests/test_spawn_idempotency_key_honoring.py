@@ -25,6 +25,10 @@ class PerNameTmux:
     def __init__(self) -> None:
         self.live: set[str] = set()
         self.created = 0
+        self.staged = {}
+
+    async def stage_text(self, path, data):
+        self.staged[path] = data
 
     async def has_session(self, name: str) -> bool:
         return name in self.live
@@ -773,16 +777,16 @@ async def test_known_qa_refusal_stages_nothing_and_status_keeps_reason(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_explicit_command_and_frozen_request_do_not_stage_tokens(tmp_path):
+async def test_explicit_command_stages_token_but_frozen_request_does_not(tmp_path):
     store=Store(':memory:'); store.start(); tmux=_TokenTmux()
     try:
         ctl=SpawnCtl(store,Sessions(store,tmux=tmux,local_host=HOST),tmux=tmux,machine=_native_machine(tmp_path))
         await ctl.spawn(_native_message(command='fixture-command'),HOST)
-        assert tmux.stages==[]
+        assert len(tmux.stages)==1
         await store.set_spawn_admission_hold(HOST,held_until=__import__('time').time()+30,reason='fixture')
         with pytest.raises(VerbError) as error:
             await ctl.spawn(_native_message(request_id='other',idempotency_key='other',session_name='other'),HOST)
-        assert error.value.code=='spawn_frozen' and tmux.stages==[]
+        assert error.value.code=='spawn_frozen' and len(tmux.stages)==1
     finally: tmux.live.clear(); store.stop()
 
 

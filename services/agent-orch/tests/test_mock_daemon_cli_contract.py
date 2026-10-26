@@ -57,6 +57,7 @@ class MockDaemon:
 
 
 def _run_cli_against_mock(monkeypatch, tmp_path: Path, argv: list[str], responder) -> tuple[int, list[dict[str, Any]]]:
+    monkeypatch.setenv("AGENT_ORCH_STREAM_TOKEN", "synthetic-mock-seat")
     with MockDaemon(responder) as daemon:
         monkeypatch.setattr(cli, "load_config", lambda: Config(daemon.url, "tok", "hosta", tmp_path))
         monkeypatch.setattr(cli, "discover_leader_stream_id_short", lambda _config: "hosta:leader")

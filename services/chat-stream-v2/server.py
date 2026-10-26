@@ -611,7 +611,7 @@ def _welcome_frame(*, nonce: str, expires_at: float, runtime_sha: str = "") -> d
     return {
         "type": "welcome",
         "runtime_sha": runtime_sha,
-        "auth_required": False,
+        "auth_required": True,
         "auth": {
             "operator": {
                 "protocol_version": operator_auth.AUTH_PROTOCOL_VERSION,
@@ -1474,8 +1474,6 @@ class Server:
         state.events_mode = events_mode
         state.snapshot_requested = snapshot_requested
         state.work_lanes_v1 = self._client_wants_work_lanes(msg)
-        if not decision.successes and not decision.failures and self._is_loopback_client(websocket):
-            decision.successes["loopback"] = None
         self._diag_auth_finish(decision)
 
     @_conn_safe
@@ -1797,8 +1795,8 @@ class Server:
                     for frame in result
                 ):
                     if (websocket not in self._client_system_producers and (
-                            self._is_loopback_client(websocket)
-                            or self._operator_authenticated(websocket)
+                            self._operator_authenticated(websocket)
+                            or self._scoped_authenticated(websocket)
                             or websocket in self._client_authenticated_streams)):
                         self._activate_client(websocket)
                     result = [
@@ -1849,14 +1847,14 @@ class Server:
         # projected frame. Render it once per subscription group instead of
         # rebuilding and JSON-encoding a fleet inventory for every socket.
         groups: dict[
-            tuple[bool, frozenset[str] | None, frozenset[str], bool, str, bool, bool], list[Any],
+            tuple[bool, frozenset[str] | None, frozenset[str], bool, str, bool, bool, str | None], list[Any],
         ] = {}
         for websocket in tuple(recipients):
             if websocket in self._client_system_producers:
                 continue
-            if not self._is_loopback_client(websocket) and not self._operator_authenticated(websocket):
+            if not self._operator_authenticated(websocket):
                 auth = await self._auth_context(websocket, {})
-                if not auth.get("token_verified"):
+                if not (auth.get("token_verified") or auth.get("scoped_principal")):
                     continue
             key = (
                 bool(self._client_include_subagents.get(websocket, False)),
@@ -1871,6 +1869,7 @@ class Server:
                 # Never reuse an unsupported client's projection for a capable one.
                 bool(self._client_assistant_composite_v1.get(websocket, False)),
                 bool(self._client_work_lanes_v1.get(websocket, False)),
+                self._scoped_stream_for(websocket),
             )
             groups.setdefault(key, []).append(websocket)
         for clients in groups.values():
@@ -2314,15 +2313,13 @@ class Server:
                     )]
             if handler is None:
                 return [self._unsupported(verb, request_id, caller=caller)]
-            if not self._is_loopback_client(websocket) and verb not in {
-                "ping", "hello", "enroll", "event.push", "host.stats", "screen.lease.status",
-            }:
+            if verb not in {"ping", "pong", "hello", "enroll", "event.push", "host.stats"}:
                 auth = dispatch_msg["_auth_context"]
                 code = None
                 if not any(auth.get(key) for key in (
                     "operator_authenticated", "token_verified", "service_authenticated",
                     "scoped_principal",
-                )) and not (verb == 'assistant.transfer' and auth.get('retired_transfer_owner')):
+                )) and not self._independent_recovery_admitted(verb, dispatch_msg, auth):
                     code = "authentication_required"
                 elif verb in {"grant_token", "spawn_freeze", "spawn_unfreeze"} and not (
                     auth.get("operator_authenticated") or auth.get("service_authenticated")
@@ -3219,8 +3216,8 @@ class Server:
     def _frame_for_client(
         self, websocket: Any, frame_type: str, payload: dict[str, Any],
     ) -> dict[str, Any] | None:
-        if not (self._is_loopback_client(websocket)
-                or self._operator_authenticated(websocket)
+        if not (self._operator_authenticated(websocket)
+                or self._scoped_authenticated(websocket)
                 or websocket in self._client_authenticated_streams):
             return None
         # External scoped ("Dot") connection: keyed on the sticky marker so a
@@ -3327,6 +3324,12 @@ class Server:
         return (record is None or bool(record.get("revoked_at"))
                 or record.get("client_kind") != client_kind)
 
+    def _scoped_authenticated(self, websocket: Any) -> bool:
+        trust = self._connection_trust.get(websocket)
+        return bool(trust and self._scoped_stream_for(websocket)
+                    and websocket not in self._client_scoped_revoked
+                    and not self._scoped_credential_revoked(trust.credential_id, trust.client_kind))
+
     def _scoped_stream_for(self, websocket: Any) -> str | None:
         """The single stream a scoped connection is confined to, or None."""
         if websocket not in self._client_scoped_connections:
@@ -3348,6 +3351,25 @@ class Server:
             sha=sha, stream_id=scope_stream,
         )
 
+    @staticmethod
+    def _independent_recovery_admitted(verb: str, msg: dict, auth: dict) -> bool:
+        # These handlers independently verify their narrow recovery authority
+        # before any effect. Never promote a local-admin secret to an operator.
+        if auth.get("peer_loopback") and auth.get("local_admin_verified"):
+            if verb in {"consent_key.offer", "consent_key.devices", "consent_key.host_status",
+                        "consent_key.cancel", "consent_key.list", "consent_key.revoke",
+                        "assistant.transfer"}:
+                return True
+            if verb == "assistant.lifecycle":
+                return msg.get("action") == "inspect" or (msg.get("action") == "revoke" and msg.get("emergency"))
+        if verb == "assistant.transfer" and auth.get("retired_transfer_owner"):
+            return True
+        if verb == "spawn" and auth.get("retired_handoff_owner"):
+            return True
+        # Close rechecks the actual token hash and target row, allowing only
+        # idempotent self-close of a retired seat. No expired token is elevated.
+        return verb == "close" and auth.get("reason_code") == TOKEN_REASON_EXPIRED
+
     def _operator_authenticated(self, websocket: Any) -> bool:
         """The one connection-bound operator predicate used by auth and fanout.
 
@@ -3363,14 +3385,16 @@ class Server:
             and trust.operator_trusted
             and not getattr(trust, "scope", None)
             and trust.client_kind in operator_auth.CLIENT_KINDS
+            and not self._scoped_credential_revoked(trust.credential_id, trust.client_kind)
         )
 
     @staticmethod
     def _is_loopback_client(websocket: Any) -> bool:
-        """Bootstrap trusts local native tools, never browser-origin requests."""
-        # Browsers can connect to loopback from unrelated websites. Presence
-        # of Origin removes the local exception even for null/empty/local
-        # values; the existing operator/stream/service auth still applies.
+        """Physical native loopback restriction for secret-authenticated recovery.
+
+        This predicate never grants command or subscription authority.
+        """
+        # Browser requests cannot use the independent local-admin channel.
         # These are transport headers, never fields in a client message.
         headers = getattr(getattr(websocket, "request", None), "headers", None)
         if headers is None:  # supported legacy websockets server API
@@ -3521,7 +3545,7 @@ class Server:
             # connection registry/revocation set in sync.
             auth = await self._auth_context(websocket, msg)
             msg["_auth_context"] = auth
-            if not self._is_loopback_client(websocket) and not (
+            if not (
                 self._operator_authenticated(websocket) or auth.get("token_verified")
                 or auth.get("scoped_principal")
                 or (auth.get("service_authenticated") and not snapshot_requested
@@ -4726,8 +4750,7 @@ class Server:
             raise VerbError("work_lanes_unavailable", "work lanes are not enabled on this daemon")
         if (auth.get("dot_principal") or auth.get("scoped_principal")
                 or self._scoped_stream_for(websocket) is not None
-                or not (auth.get("operator_authenticated") or auth.get("token_verified")
-                        or (websocket is not None and self._is_loopback_client(websocket)))):
+                or not (auth.get("operator_authenticated") or auth.get("token_verified"))):
             raise VerbError("work_lanes_unauthorized", "work lanes require an operator or verified seat")
 
     async def _on_work_unattended(self, msg: dict[str, Any]) -> dict[str, Any]:

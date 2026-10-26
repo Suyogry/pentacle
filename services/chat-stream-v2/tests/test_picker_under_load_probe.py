@@ -21,7 +21,9 @@ class StubSocket:
         self.sent: list[dict] = []
         self.received: list[dict] = []
         self.catalog_sent_at = 0.0
-        self._incoming = [{"type": "welcome"}]
+        from server import _welcome_frame
+        from _shared import operator_auth
+        self._incoming = [_welcome_frame(nonce=operator_auth.encode_b64url(b"n" * 32), expires_at=time.time()+10)]
 
     def __enter__(self):
         return self
@@ -87,6 +89,12 @@ def _secret_db(tmp_path: Path) -> Path:
 
 
 def test_probe_exit_contract(monkeypatch, tmp_path: Path) -> None:
+    from _shared import operator_auth
+    envelope = operator_auth.encode_envelope("00000000-0000-4000-8000-000000000001", "pentacle", b"k" * 32)
+    credential_path = tmp_path / "operator.token"
+    credential_path.write_text(envelope)
+    credential_path.chmod(0o600)
+    monkeypatch.setenv("AGENT_ORCH_TOKEN_FILE", str(credential_path))
     db = _secret_db(tmp_path)
     fast = StubHarness(delay=0.01)
     monkeypatch.setattr(probe, "connect", fast.connect)

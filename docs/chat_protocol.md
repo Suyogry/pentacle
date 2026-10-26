@@ -78,7 +78,7 @@ household store. The daemon keeps no household state, cache or broadcast.
   is operator-authenticated with an `operator:<credential>` principal from operator-trusted
   transport. A seat token elevated by the opt-in `PENTACLE_SEAT_OPERATOR_AUTHORITY` mode
   (`operator_authority_source: stream_token`) is still a seat and is refused. No Cosmo call is made
-  for a refused caller. Denial codes: the dispatcher answers remote unauthenticated callers
+  for a refused caller. Denial codes: the dispatcher answers unauthenticated callers (including localhost)
   `authentication_required`, Dot principals `dot_scope_denied` and scoped (Cosmo) credentials
   `scope_denied` before the handler runs; every other non-operator caller (loopback without operator
   trust, seats, Nexus seats, service producers, seat-authority-elevated seats) gets `unauthorized`.

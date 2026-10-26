@@ -1486,6 +1486,7 @@ async def _connect_rpc_ready(
     identity_token: str | None = None,
     infer_identity_token: bool = True,
     require_seat_token: bool = False,
+    independent_auth: bool = False,
 ):
     keepalive = _websocket_keepalive_from_env()
     ws = await websockets.connect(
@@ -1499,6 +1500,8 @@ async def _connect_rpc_ready(
     hello = _rpc_hello(config, from_stream_id=from_stream_id, infer_from_env=infer_from_env,
                        identity_token=identity_token, infer_identity_token=infer_identity_token)
     hello.require_seat_token = require_seat_token
+    if independent_auth:
+        return ws
     try:
         await send_frame(ws, hello, config=config)
     except BaseException:
@@ -1759,7 +1762,7 @@ async def assistant_once(config: Config, payload: dict[str, Any], *, timeout: fl
 
 
 async def screen_lease_once(config: Config, payload: dict[str, Any], *, timeout: float = 30.0) -> dict[str, Any]:
-    """Status is public; lease mutations carry the verified calling seat identity.
+    """Lease status and mutations require an authenticated client.
 
     Mutations are deliberately excluded from automatic RPC retries: release is
     not idempotent, and retrying an expired acquisition can mint a new lease.
@@ -1975,7 +1978,7 @@ async def _catalog_operator_rpc(config: Config, payload: dict[str, Any], *,
         if (welcome.get("type") != "welcome" or challenge.get("protocol_version") != 2
                 or challenge.get("scheme") != operator_auth.AUTH_SCHEME):
             raise ValueError("operator credential challenge unavailable")
-        hello = _rpc_hello(config, from_stream_id=caller)
+        hello = _rpc_hello(config, infer_from_env=False, infer_identity_token=False)
         await asyncio.wait_for(send_frame(ws, hello, config=config, explicit_from_stream_id=caller, challenge=challenge, compact=False), timeout=max(0.01, deadline - time.monotonic()))
         while True:
             frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=max(0.01, deadline - time.monotonic())))
@@ -1999,9 +2002,9 @@ async def dashboard_once(config: Config, payload: dict[str, Any], *, timeout: fl
         identity = resolve_outbound_identity(caller)
         if identity.kind in {"service", "ambiguous"}:
             raise ServiceCredentialUnavailable(identity)
-        if resolve_operator_token(config).form == "envelope":
-            return await _catalog_operator_rpc(config, payload, caller=caller, timeout=timeout)
-        if not caller:
+        if identity.kind == "operator":
+            if resolve_operator_token(config).form == "envelope":
+                return await _catalog_operator_rpc(config, payload, caller=caller, timeout=timeout)
             raise ValueError("operator auth v2 credential envelope or authenticated seat is required")
     return await _one_shot_rpc(config, payload, prefix="dashboard", timeout=timeout, from_stream_id=caller)
 
@@ -2034,8 +2037,6 @@ def _asset_caller_identity(payload: dict[str, Any]) -> tuple[str | None, Frame]:
         if isinstance(payload.get("from_stream_id"), str)
         else payload.get("caller_stream_id")
         if isinstance(payload.get("caller_stream_id"), str)
-        else payload.get("stream_id")
-        if isinstance(payload.get("stream_id"), str)
         else _resolved_rpc_from_stream_id()
     )
     if caller_stream_id:
@@ -2195,7 +2196,7 @@ async def prompt_list_once(
 
 
 async def _inbox_once_attempt(config: Config, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
-    stream_id = payload.get("stream_id") if isinstance(payload.get("stream_id"), str) else None
+    stream_id = _resolved_rpc_from_stream_id()
     payload = defer_stream_token(payload, enabled=bool((stream_id)), keep=True)
     ws = await _connect_rpc_ready(config, from_stream_id=stream_id)
     try:
@@ -2276,12 +2277,13 @@ async def send_receipt_once(
 async def spawn_once(
     config: Config, payload: dict[str, Any], *, timeout: float = SPAWN_RPC_TIMEOUT_DEFAULT_S,
 ) -> dict[str, Any]:
-    parent_stream_id = payload.get("parent_stream_id") if isinstance(payload.get("parent_stream_id"), str) else None
-    handoff_from_stream_id = (
-        payload.get("handoff_from_stream_id") if isinstance(payload.get("handoff_from_stream_id"), str) else None
-    )
-    asserted_stream_id = handoff_from_stream_id or parent_stream_id
-    payload = defer_stream_token(payload, enabled=bool((asserted_stream_id)), keep=True)
+    # Parent and handoff fields describe the requested relationship, not the
+    # authenticated caller. Operators can target an existing parent, and seats
+    # must always authenticate as their actual launch identity.
+    caller_stream_id = (payload.get("from_stream_id")
+                        if isinstance(payload.get("from_stream_id"), str)
+                        else _resolved_rpc_from_stream_id())
+    payload = defer_stream_token(payload, enabled=bool(caller_stream_id), keep=True)
     payload["type"] = "spawn"
     request_id = payload.setdefault("request_id", f"spawn-{uuid.uuid4()}")
     payload.setdefault("idempotency_key", request_id)
@@ -2290,8 +2292,7 @@ async def spawn_once(
         payload,
         prefix="spawn",
         timeout=timeout,
-        from_stream_id=asserted_stream_id,
-        infer_from_env=asserted_stream_id is not None,
+        from_stream_id=caller_stream_id,
     )
     if isinstance(response, dict) and response.get("type") == "spawn.ok" and response.get("state") == "starting":
         return await _await_starting_spawn(config, response, deadline=time.monotonic() + max(0.1, timeout))
@@ -3000,7 +3001,8 @@ async def consent_once(config: Config, verb: str, fields: dict[str, Any], *,
                        local_admin: bool = False) -> dict[str, Any]:
     """Consent RPC; local ceremony deliberately carries no seat identity."""
     ws = await _connect_rpc_ready(config, from_stream_id=from_stream_id,
-                                 infer_from_env=not local_admin, infer_identity_token=not local_admin)
+                                 infer_from_env=not local_admin, infer_identity_token=not local_admin,
+                                 independent_auth=local_admin)
     request_id = str(fields.get("request_id") or f"consent-{uuid.uuid4()}")
     try:
         payload = {**fields, "type": verb, "request_id": request_id}
@@ -3028,6 +3030,9 @@ async def grant_token_once(
     with `token_already_set`/`stream_unknown`/`invalid_request`). The caller is
     responsible for exporting the plaintext into the agent's pane env.
     """
+    identity = resolve_outbound_identity(from_stream_id)
+    if identity.kind in {"service", "ambiguous"}:
+        raise ServiceCredentialUnavailable(identity)
     if ":" not in stream_id:
         raise ValueError("invalid_stream_id")
     host, session_name = stream_id.split(":", 1)

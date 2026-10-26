@@ -558,7 +558,7 @@ def test_one_shot_rpc_sends_without_waiting_for_snapshot(monkeypatch, tmp_path):
     assert response["type"] == "tell.ok"
     assert hello["from_stream_id"] == "hostc:leader"
     assert hello["stream_token"] == "stream-secret"
-    assert hello["token"] == "tok"
+    assert "token" not in hello
     assert_rpc_subscribe(hello["subscribe"])
     assert msg["type"] == "tell"
 
@@ -685,7 +685,8 @@ def test_prompt_ask_sends_verified_creator_identity(monkeypatch, tmp_path):
     assert msg["stream_token"] == "stream-secret"
 
 
-def test_one_shot_rpc_discards_old_daemon_snapshot_before_response(tmp_path):
+def test_one_shot_rpc_discards_old_daemon_snapshot_before_response(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_ORCH_STREAM_TOKEN", "synthetic-caller-token")
     async def handler(ws):
         await ws.recv()
         await ws.send(json.dumps({"type": "snapshot", "hosts": ["hostc"], "sessions": []}))
@@ -1042,12 +1043,12 @@ def test_close_rpc_omits_caller_stream_id_when_none(tmp_path):
 
 def test_await_report_once_sends_direct_rpc(monkeypatch, tmp_path):
     captured: Queue[dict] = Queue()
-    monkeypatch.delenv("AGENT_ORCH_STREAM_TOKEN", raising=False)
+    monkeypatch.setenv("AGENT_ORCH_STREAM_TOKEN", "synthetic-caller-token")
     monkeypatch.delenv("AGENT_ORCH_STREAM_TOKEN_FILE", raising=False)
 
     async def handler(ws):
         hello = json.loads(await ws.recv())
-        assert "from_stream_id" not in hello
+        assert hello["from_stream_id"] == "hostc:leader"
         await ws.send(json.dumps({"type": "snapshot", "hosts": ["hostc"], "sessions": []}))
         async for raw in ws:
             msg = json.loads(raw)
@@ -1584,6 +1585,7 @@ def test_send_receipt_once_uses_the_single_query_verb(tmp_path):
 
 def test_spawn_once_sends_direct_rpc_with_parent_identity_and_token(monkeypatch, tmp_path):
     captured: Queue[dict] = Queue()
+    monkeypatch.setenv("AGENT_ORCH_STREAM_ID", "hostc:leader")
     monkeypatch.delenv("AGENT_ORCH_STREAM_TOKEN_FILE", raising=False)
     monkeypatch.setenv("AGENT_ORCH_STREAM_TOKEN", "stream-secret")
 
@@ -1627,7 +1629,8 @@ def test_spawn_once_sends_direct_rpc_with_parent_identity_and_token(monkeypatch,
 
 def test_spawn_once_handoff_sends_handoff_identity_in_hello(monkeypatch, tmp_path):
     captured: Queue[dict] = Queue()
-    monkeypatch.delenv("AGENT_ORCH_STREAM_TOKEN", raising=False)
+    monkeypatch.setenv("AGENT_ORCH_STREAM_ID", "hostc:caller")
+    monkeypatch.setenv("AGENT_ORCH_STREAM_TOKEN", "synthetic-caller-token")
     monkeypatch.delenv("AGENT_ORCH_STREAM_TOKEN_FILE", raising=False)
 
     async def handler(ws):
@@ -1652,7 +1655,7 @@ def test_spawn_once_handoff_sends_handoff_identity_in_hello(monkeypatch, tmp_pat
         response = asyncio.run(spawn_once(Config(server.url, "", "hostc", tmp_path), payload, timeout=2))
 
     assert response["type"] == "spawn.ok"
-    assert "from_stream_id" not in captured.get(timeout=2)["hello"]
+    assert captured.get(timeout=2)["hello"]["from_stream_id"] == "hostc:caller"
     assert captured.get(timeout=2)["spawn"]["handoff_from_stream_id"] == "hostc:leader"
 
 
@@ -2797,9 +2800,9 @@ def test_spawn_once_retries_with_the_explicit_idempotency_key(monkeypatch, tmp_p
     assert {frame["idempotency_key"] for frame in frames} == {"logical-spawn-key-retry"}
 
 
-def test_identityless_spawn_rpc_omits_discovered_from_stream_id(monkeypatch, tmp_path):
+def test_top_level_spawn_rpc_authenticates_discovered_caller(monkeypatch, tmp_path):
     captured: Queue[dict] = Queue()
-    monkeypatch.delenv("AGENT_ORCH_STREAM_TOKEN", raising=False)
+    monkeypatch.setenv("AGENT_ORCH_STREAM_TOKEN", "synthetic-caller-token")
     monkeypatch.delenv("AGENT_ORCH_STREAM_TOKEN_FILE", raising=False)
 
     async def handler(ws):
@@ -2830,7 +2833,8 @@ def test_identityless_spawn_rpc_omits_discovered_from_stream_id(monkeypatch, tmp
 
     hello = captured.get(timeout=2)
     assert response["type"] == "spawn.ok"
-    assert "from_stream_id" not in hello
+    assert hello["from_stream_id"] == "hostc:internal"
+    assert "token" not in hello
 
 
 def test_fetch_blob_retry_reuses_request_id_and_dedupes(monkeypatch, tmp_path):

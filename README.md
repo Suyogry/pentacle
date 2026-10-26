@@ -65,6 +65,14 @@ python services/chat-stream-v2/tools/operator_auth_cli.py issue --client-kind pe
   python -c 'import json,os,pathlib,sys; p=pathlib.Path.home()/".config/pentacle/desktop.token"; fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600); os.write(fd,json.load(sys.stdin)["code"].encode()); os.close(fd); p.chmod(0o600)'
 ```
 
+For operator CLI commands, export the credential path in that terminal or service
+launch environment. Workers receive their own credentials automatically. See
+[daemon authentication](docs/daemon_authentication.md) for existing-session migration.
+
+```sh
+export AGENT_ORCH_TOKEN_FILE="$HOME/.config/pentacle/desktop.token"
+```
+
 Start the daemon in one terminal. The `local` identity matches the example config; the provider binaries come from your PATH, and transcripts remain in the provider's native directories.
 
 ```sh

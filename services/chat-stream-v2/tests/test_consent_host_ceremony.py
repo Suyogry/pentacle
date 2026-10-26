@@ -204,6 +204,9 @@ async def _ceremony(root: Path):
                 frame = json.loads(await ws.recv())
                 if frame['type'] == 'snapshot':
                     return ws, frame
+                if not credential and not seat_auth:
+                    assert frame == {'type': 'hello.error', 'error_code': 'authentication_required'}
+                    return ws, None
                 assert frame['type'] != 'hello.error'
 
         async def rpc(ws, verb, **fields):
@@ -225,7 +228,7 @@ async def _ceremony(root: Path):
         seat_ws, snapshot = await socket(seat_auth=True)
         assert 'consent_enrollment_offer_v1' not in snapshot['capabilities']
         local_ws, snapshot = await socket()
-        assert 'consent_enrollment_offer_v1' not in snapshot['capabilities']
+        assert snapshot is None
 
         for ws in (phone, web, seat_ws, local_ws):
             for verb in ('consent_key.enroll_code', 'consent_key.prepare', 'consent_key.enroll', 'consent_key.confirm'):

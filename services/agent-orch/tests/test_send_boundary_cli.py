@@ -84,7 +84,7 @@ def test_every_network_dispatch_translates_only_service_error(monkeypatch, tmp_p
         for socket in sockets:
             asyncio.run(socket.close())
     output = capsys.readouterr()
-    assert hits or row["command"] == "dashboard transfer-owner", (row, result, output)
+    assert hits or row["command"] in {"dashboard transfer-owner", "grant-self-token"}, (row, result, output)
     assert not any(socket.raw for socket in sockets)
     assert "sentinel" not in output.out + output.err
     assert "OPERATOR-must-not-appear" not in output.out + output.err

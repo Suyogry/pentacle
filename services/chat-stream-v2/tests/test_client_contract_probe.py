@@ -18,6 +18,37 @@ from server import Server, STREAM_EVENTS_FRAME_BUDGET_BYTES, _welcome_frame  # n
 from sessions import Sessions  # noqa: E402
 
 
+_ISOLATED_MAIN = '''
+import os, pathlib, runpy, sys
+root = pathlib.Path(os.environ['PENTACLE_FIXTURE_HOME'])
+pathlib.Path.home = classmethod(lambda cls: root)
+def expand(value):
+    text = os.fspath(value)
+    if text == '~': return str(root)
+    if text.startswith('~/'): return str(root / text[2:])
+    if text.startswith('~'): raise ValueError('named-user expansion refused')
+    return text
+os.path.expanduser = expand
+sys.path.insert(0, os.getcwd())
+sys.argv = ['main.py', *sys.argv[1:]]
+runpy.run_path('main.py', run_name='__main__')
+'''
+
+
+def _probe_environment(tmp_path, monkeypatch):
+    from _shared.operator_auth import OperatorCredentialRegistry
+    root = tmp_path / 'owned-home'
+    directory = root / '.config/pentacle-stream'
+    directory.mkdir(mode=0o700, parents=True)
+    registry = OperatorCredentialRegistry(directory / 'operator-credentials.json')
+    _, envelope = registry.issue('pentacle')
+    path = directory / 'operator.token'
+    path.write_text(envelope)
+    path.chmod(0o600)
+    monkeypatch.setenv('AGENT_ORCH_TOKEN_FILE', str(path))
+    return dict(os.environ, PYTHONUNBUFFERED='1', PENTACLE_FIXTURE_HOME=str(root))
+
+
 def _process_group_popen_kwargs() -> dict[str, bool]:
     """Start the local fixture service in its own process group."""
     return {"start_new_session": True}
@@ -407,15 +438,15 @@ def _seed(db: str, stream_id: str, n: int, *, text_bytes: int = 0) -> None:
     asyncio.run(_go())
 
 
-def test_probe_passes_against_a_fixed_daemon_over_the_wire(tmp_path: Path) -> None:
+def test_probe_passes_against_a_fixed_daemon_over_the_wire(tmp_path: Path, monkeypatch) -> None:
     db = str(tmp_path / "probe.db")
     stream_id = "testhost:v2-probe"
     _seed(db, stream_id, 4)
 
-    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    env = _probe_environment(tmp_path, monkeypatch)
     env.setdefault("EXAMPLE_MACHINES_JSON", '{"machines":[{"name":"testhost"}]}')
     proc = subprocess.Popen(
-        [sys.executable, "main.py", "--port", "0", "--db", db, "--local-host", "testhost",
+        [sys.executable, "-c", _ISOLATED_MAIN, "--port", "0", "--db", db, "--local-host", "testhost",
          "--notifications-db", str(tmp_path / "n.db"), "--blob-root", str(tmp_path / "b"),
          "--assets-db", str(tmp_path / "a.db")],
         cwd=str(SERVICE_DIR), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -446,15 +477,15 @@ def test_probe_passes_against_a_fixed_daemon_over_the_wire(tmp_path: Path) -> No
         terminate_process_group(proc)
 
 
-def test_probe_can_resume_an_older_cursor_page(tmp_path: Path) -> None:
+def test_probe_can_resume_an_older_cursor_page(tmp_path: Path, monkeypatch) -> None:
     db = str(tmp_path / "cursor.db")
     stream_id = "testhost:v2-cursor"
     _seed(db, stream_id, 12)
 
-    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    env = _probe_environment(tmp_path, monkeypatch)
     env.setdefault("EXAMPLE_MACHINES_JSON", '{"machines":[{"name":"testhost"}]}')
     proc = subprocess.Popen(
-        [sys.executable, "main.py", "--port", "0", "--db", db, "--local-host", "testhost",
+        [sys.executable, "-c", _ISOLATED_MAIN, "--port", "0", "--db", db, "--local-host", "testhost",
          "--notifications-db", str(tmp_path / "n.db"), "--blob-root", str(tmp_path / "b"),
          "--assets-db", str(tmp_path / "a.db")],
         cwd=str(SERVICE_DIR), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -492,7 +523,7 @@ def test_probe_can_resume_an_older_cursor_page(tmp_path: Path) -> None:
         terminate_process_group(proc)
 
 
-def test_probe_receives_all_oversized_history_as_bounded_chunks(tmp_path: Path, capsys) -> None:
+def test_probe_receives_all_oversized_history_as_bounded_chunks(tmp_path: Path, capsys, monkeypatch) -> None:
     db = str(tmp_path / "oversized.db")
     stream_id = "testhost:v2-oversized"
     # 500 recent events at 36 KiB each create a large history without pruning
@@ -500,10 +531,10 @@ def test_probe_receives_all_oversized_history_as_bounded_chunks(tmp_path: Path, 
     event_count = 500
     _seed(db, stream_id, event_count, text_bytes=36 * 1024)
 
-    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    env = _probe_environment(tmp_path, monkeypatch)
     env.setdefault("EXAMPLE_MACHINES_JSON", '{"machines":[{"name":"testhost"}]}')
     proc = subprocess.Popen(
-        [sys.executable, "main.py", "--port", "0", "--db", db, "--local-host", "testhost",
+        [sys.executable, "-c", _ISOLATED_MAIN, "--port", "0", "--db", db, "--local-host", "testhost",
          "--notifications-db", str(tmp_path / "n.db"), "--blob-root", str(tmp_path / "b"),
          "--assets-db", str(tmp_path / "a.db")],
         cwd=str(SERVICE_DIR), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

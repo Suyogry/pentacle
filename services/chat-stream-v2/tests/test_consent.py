@@ -558,7 +558,7 @@ def test_real_socket_signed_designation_and_revoked_live_deny(tmp_path):
                 ch = (await rpc('consent.open', intent_id=pending['intent']['request_id'], key_id=c.key_id))['challenge']
                 c.registry.revoke(c.cid)
                 denied = await rpc('consent.deny', challenge_id=ch['challenge_id'])
-                assert denied['error_code'] == 'consent_principal_invalid'
+                assert denied['error_code'] == 'authentication_required'
                 assert (await env.grant())['revision'] == 1
         finally:
             await env.server.close()
@@ -784,8 +784,11 @@ def test_approve_vs_expiry_barrier(tmp_path, monkeypatch, first):
         else:
             def barrier_load(*args, **kwargs):
                 result = original_load(*args, **kwargs)
-                entered.set()
-                assert release.wait(5)
+                # Hold the store-side expiry read, not per-RPC transport
+                # credential revalidation on the event-loop thread.
+                if threading.current_thread() is not threading.main_thread():
+                    entered.set()
+                    assert release.wait(5)
                 return result
             monkeypatch.setattr(c.registry, 'load', barrier_load)
             monkeypatch.setattr(consent.time, 'time', lambda: ch['expires_at'] + 1)
@@ -855,6 +858,9 @@ def test_enrollment_readiness_is_current_mobile_operator_only(tmp_path, monkeypa
         try:
             frames = await env.server._on_hello({'client': kind or 'agent-orch', '_client_websocket': peer,
                 '_auth_context': {'token_verified': seat}, 'subscribe': {'snapshot': True}})
+            if kind != 'pentacle-mobile':
+                assert frames == [{'type': 'hello.error', 'error_code': 'authentication_required'}]
+                return
             snapshot = next(frame for frame in frames if frame['type'] == 'snapshot')
             assert snapshot['capabilities'].get('consent_enrollment_offer_v1') is (True if expected else None)
             assert snapshot['capabilities']['close_expected_generation'] is True
@@ -1005,6 +1011,8 @@ def test_scheduled_handoff_real_spawn_serializes_generation_through_finish(tmp_p
     monkeypatch.setenv('PENTACLE_ASSISTANT_ROLE', 'assistant')
     class BootTmux(IdleTmux):
         created = 0
+        async def stage_text(self, path, data):
+            self.staged = (path, data)
         async def new_session(self, name, command, cwd=None, env=None):
             self.created += 1
             self.live.add(name)

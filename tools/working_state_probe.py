@@ -14,6 +14,10 @@ import argparse
 import asyncio
 import json
 import time
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services"))
+from _shared.operator_client import operator_hello
 from typing import Any
 
 import websockets
@@ -63,16 +67,10 @@ async def _run(args: argparse.Namespace) -> int:
     deadline = time.monotonic() + args.timeout
     async with websockets.connect(args.url, max_size=16 * 1024 * 1024, open_timeout=min(10.0, args.timeout)) as ws:
         welcome = await _recv_until(ws, lambda frame: frame.get("type") == "welcome", deadline)
-        await ws.send(json.dumps({
-            "type": "hello",
-            "request_id": "working-state-probe-hello",
-            "client": "pentacle-mobile",
-            "subscribe": {
-                "all": True,
-                "include_subagents": True,
-                "events_mode": "summary",
-            },
-        }, separators=(",", ":")))
+        await ws.send(json.dumps(operator_hello(welcome,
+            request_id="working-state-probe-hello",
+            subscribe={"all": True, "include_subagents": True, "events_mode": "summary"}),
+            separators=(",", ":")))
         await _recv_until(
             ws,
             lambda frame: frame.get("type") == "hello"

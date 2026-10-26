@@ -8,6 +8,7 @@ at every send, including retries and persistent queue replay.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -70,7 +71,8 @@ def _token_path() -> Path:
 
 def _file_token(path: Path | None = None) -> str | None:
     path = _token_path() if path is None else path
-    return path.read_text(encoding="utf-8").strip() if path.exists() else None
+    from _shared.private_credentials import read_private_token
+    return read_private_token(path) if path.exists() or path.is_symlink() else None
 
 
 def resolve_operator_token(config: Config) -> ResolvedOperatorToken:
@@ -91,15 +93,11 @@ def _stream_token_from_file() -> str | None:
     token_file = os.environ.get("AGENT_ORCH_STREAM_TOKEN_FILE")
     if not token_file:
         return None
+    from _shared.private_credentials import read_private_token
     try:
-        path = Path(token_file).expanduser()
-        info = path.stat()
-        if not path.is_file() or info.st_uid != os.getuid() or info.st_mode & 0o077:
-            return None
-        value = path.read_text(encoding="utf-8").strip()
-    except (OSError, ValueError, UnicodeError):
+        return read_private_token(Path(token_file).expanduser())
+    except PermissionError:
         return None
-    return value or None
 
 
 def stream_token_from_env() -> str | None:
@@ -245,7 +243,7 @@ def _insert(frame: dict, before: tuple, fields: dict) -> dict:
 
 
 def _ordinary_frame(frame: Frame, identity: OutboundIdentity, config: Config,
-                    challenge: dict | None) -> dict:
+                    challenge: dict | None, operator: ResolvedOperatorToken | None = None) -> dict:
     wire = dict(frame)
     token = None
     required_token = None
@@ -257,9 +255,10 @@ def _ordinary_frame(frame: Frame, identity: OutboundIdentity, config: Config,
         if not required_token:
             raise SeatCredentialUnavailable()
     if frame.hello_style:
-        operator = resolve_operator_token(config)
+        operator = operator or (resolve_operator_token(config) if identity.kind == "operator"
+                                else ResolvedOperatorToken("none", ""))
         explicit = frame.explicit_identity
-        stream_id = identity.stream_id if frame.infer_identity else explicit
+        stream_id = identity.stream_id if frame.infer_identity or identity.kind == "seat" else explicit
         style = frame.hello_style
         if style in {"persistent", "snapshot"}:
             token = required_token if frame.require_seat_token else stream_token_from_env()
@@ -287,11 +286,13 @@ def _ordinary_frame(frame: Frame, identity: OutboundIdentity, config: Config,
                 wire["from_stream_id"] = stream_id
                 if token:
                     wire["stream_token"] = token
-            if challenge is not None:
-                wire.pop("token", None)
-                wire.update(operator_auth_v2_hello_fields(operator, challenge))
-        if frame.require_seat_token and not token:
-            raise SeatCredentialUnavailable()
+        if (frame.require_seat_token or stream_id) and not token:
+            raise SeatCredentialUnavailable("seat credential unavailable")
+        if operator.form == "envelope":
+            if challenge is None:
+                raise PermissionError("operator credential challenge required")
+            wire.pop("token", None)
+            wire.update(operator_auth_v2_hello_fields(operator, challenge))
         return wire
     for before, action, argument, stream_id, identity_with_token in frame.edits:
         if action == "caller":
@@ -334,7 +335,19 @@ async def send_frame(ws, payload: dict, identity: OutboundIdentity | None = None
         if identity.stream_id != "work-report-reader" or wire.get("type") == "hello":
             wire.update(from_stream_id=identity.stream_id, stream_token=token)
     else:
-        wire = _ordinary_frame(frame, identity, config, challenge)
+        if frame.require_seat_token and not stream_token_from_env():
+            raise SeatCredentialUnavailable("seat credential unavailable")
+        resolved = None
+        if frame.hello_style and identity.kind == "operator" and challenge is None:
+            resolved = resolve_operator_token(config)
+            if resolved.form == "envelope":
+                from _shared import operator_auth
+                welcome = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                challenge = welcome.get("auth", {}).get("operator", {})
+                if (welcome.get("type") != "welcome" or challenge.get("protocol_version") != 2
+                        or challenge.get("scheme") != operator_auth.AUTH_SCHEME):
+                    raise PermissionError("operator credential challenge unavailable")
+        wire = _ordinary_frame(frame, identity, config, challenge, resolved)
     await ws.send(json.dumps(wire, separators=(",", ":") if compact else None))
 
 

@@ -17,7 +17,8 @@ class Peer:
 
 
 @pytest.mark.parametrize("verb", ["spawn", "send", "tell", "spawn_freeze", "spawn_unfreeze", "grant_token", "list_sessions", "request_stream_events"])
-def test_remote_unauthenticated_rpc_never_reaches_handler(verb):
+@pytest.mark.parametrize("address", ["127.0.0.1", "::1", "::ffff:127.0.0.1", "192.0.2.10", None])
+def test_remote_unauthenticated_rpc_never_reaches_handler(verb, address):
     async def run():
         daemon = Server()
         calls = []
@@ -28,20 +29,20 @@ def test_remote_unauthenticated_rpc_never_reaches_handler(verb):
         reply = await daemon._dispatch(json.dumps({
             "type": verb, "request_id": "denied", "client": "pentacle",
             "from_stream_id": "local:claimed", "_auth_context": {"operator_authenticated": True},
-        }), websocket=Peer())
+        }), websocket=Peer(address))
         assert reply == [{"type": f"{verb}.error", "error_code": "authentication_required", "request_id": "denied"}]
         assert calls == []
     asyncio.run(run())
 
 
 @pytest.mark.parametrize("address", ["127.0.0.1", "::1", "::ffff:127.0.0.1"])
-def test_actual_loopback_keeps_local_cli_bootstrap(address):
+def test_actual_loopback_requires_credentials(address):
     async def run():
         daemon = Server()
         async def handler(msg):
             return {"type": "grant_token.ok"}
         daemon.handlers["grant_token"] = handler
-        assert (await daemon._dispatch('{"type":"grant_token"}', websocket=Peer(address)))[0]["type"] == "grant_token.ok"
+        assert (await daemon._dispatch('{"type":"grant_token"}', websocket=Peer(address)))[0]["error_code"] == "authentication_required"
     asyncio.run(run())
 
 
@@ -63,13 +64,17 @@ def test_remote_hello_without_proof_has_no_snapshot_or_subscription():
     asyncio.run(run())
 
 
-def test_authenticated_operator_can_invoke_protected_rpc():
+def test_authenticated_operator_can_invoke_protected_rpc(tmp_path):
     async def run():
         daemon = Server()
         peer = Peer()
+        from _shared.operator_auth import OperatorCredentialRegistry
+        directory = tmp_path / "auth"
+        directory.mkdir(mode=0o700)
+        daemon.operator_credential_registry = OperatorCredentialRegistry(directory / "registry.json")
+        credential_id, _ = daemon.operator_credential_registry.issue("pentacle")
         daemon._connection_trust[peer] = ConnectionTrust(
-            transport="v2", client_kind="pentacle", operator_trusted=True,
-            credential_id="00000000-0000-4000-8000-000000000001",
+            transport="v2", client_kind="pentacle", operator_trusted=True, credential_id=credential_id,
         )
         async def handler(msg):
             assert msg["_auth_context"]["operator_authenticated"]

@@ -1,4 +1,4 @@
-"""Local-bootstrap trust belongs to native tools, not arbitrary browser pages."""
+"""All native and browser clients require credentials for private daemon access."""
 from __future__ import annotations
 
 import asyncio
@@ -43,27 +43,16 @@ def test_actual_socket_read_hello_and_fanout_boundary(origin):
                 assert json.loads(await socket.recv())["type"] == "welcome"
                 await socket.send(json.dumps({"type": "list_sessions", "request_id": "read"}))
                 response = json.loads(await asyncio.wait_for(socket.recv(), 2))
-                if origin is None:
-                    assert response["type"] == "list_sessions.ok" and len(response["active"]) == 1
-                else:
-                    assert response == {"type": "list_sessions.error", "error_code": "authentication_required", "request_id": "read"}
+                assert response == {"type": "list_sessions.error", "error_code": "authentication_required", "request_id": "read"}
                 await socket.send(json.dumps({"type": "hello", "client": "origin-test", "subscribe": {"exclude_event_types": ["hosts.stats"]}}))
                 response = json.loads(await asyncio.wait_for(socket.recv(), 2))
-                if origin is None:
-                    assert response["type"] == "hello"
-                    snapshot = json.loads(await asyncio.wait_for(socket.recv(), 2))
-                    assert snapshot["type"] == "snapshot" and len(snapshot["sessions"]) == 1
-                else:
-                    assert response == {"type": "hello.error", "error_code": "authentication_required"}
-                frame = {"type": "origin.fixture", "marker": "not-for-anonymous-browsers"}
+                assert response == {"type": "hello.error", "error_code": "authentication_required"}
+                frame = {"type": "origin.fixture", "marker": "private"}
                 peer = next(iter(server._clients))
-                assert (server._frame_for_client(peer, frame["type"], frame) is not None) is (origin is None)
+                assert server._frame_for_client(peer, frame["type"], frame) is None
                 await server.broadcast(frame)
-                if origin is None:
-                    assert json.loads(await asyncio.wait_for(socket.recv(), 2)) == frame
-                else:
-                    with pytest.raises(asyncio.TimeoutError):
-                        await asyncio.wait_for(socket.recv(), .05)
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(socket.recv(), .05)
         finally:
             await server.close()
     asyncio.run(run())

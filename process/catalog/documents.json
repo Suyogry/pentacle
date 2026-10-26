@@ -203,6 +203,26 @@
     "status": "stable"
   },
   {
+    "id": "spec_daemon_auth",
+    "path": "work/in_progress/pentacle__daemon_auth/spec.md",
+    "title": "Require credentials for local daemon clients",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/in_progress/pentacle__daemon_auth/spec.md",
+    "tags": [
+      "security",
+      "daemon"
+    ],
+    "summary": "Remove anonymous localhost authority and migrate trusted clients to existing credentials.",
+    "related": [
+      "work_daemon_auth"
+    ],
+    "status": "in_progress",
+    "machine": "local",
+    "owner": "maintainer"
+  },
+  {
     "id": "spec_pentacle_th_h1_2026_10",
     "path": "work/in_progress/pentacle__th-h1-bounded-root-suite/spec.md",
     "title": "TH-H1 bounded root suite",
@@ -301,6 +321,26 @@
     "status": "in_progress",
     "machine": "shared",
     "owner": "dot"
+  },
+  {
+    "id": "work_daemon_auth",
+    "path": "work/in_progress/pentacle__daemon_auth/summary.md",
+    "title": "Require credentials for local daemon clients",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/in_progress/pentacle__daemon_auth/summary.md",
+    "tags": [
+      "security",
+      "daemon"
+    ],
+    "summary": "Remove anonymous localhost authority and migrate trusted clients to existing credentials.",
+    "related": [
+      "spec_daemon_auth"
+    ],
+    "status": "in_progress",
+    "machine": "local",
+    "owner": "maintainer"
   },
   {
     "id": "work_pentacle_th_h1_2026_10",

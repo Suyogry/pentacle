@@ -1,6 +1,6 @@
 # Operator authentication: public verification guide
 
-The websocket handshake may run unauthenticated for a loopback development daemon. A deployment that enables operator authentication must keep proof material outside the repository and must test only the public protocol boundary.
+All daemon clients, including localhost, require credentials for protected operations. Keep proof material outside the repository and test the public protocol boundary with synthetic credentials. See [daemon authentication](daemon_authentication.md).
 
 ## Credential model
 

@@ -295,7 +295,8 @@ def _utc_now() -> str:
 
 def operator_hello(token_path: Path, welcome: dict[str, Any]) -> dict[str, object]:
     """Build the only supported authenticated operator hello frame."""
-    envelope = token_path.read_text(encoding="utf-8").strip()
+    from _shared.private_credentials import read_private_token
+    envelope = read_private_token(token_path)
     credential = operator_auth.decode_envelope(envelope)
     if credential.get("client_kind") != "pentacle":
         raise LiveWindowError("live-window credential must be pentacle client kind")

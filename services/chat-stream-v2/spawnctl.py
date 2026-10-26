@@ -258,8 +258,8 @@ def new_work_commission(msg: dict[str, Any], *, resume: bool) -> bool:
     """A2/R5: a token-verified agent commissioning new work, by operation only.
 
     Handoffs, resumes, host transfers, daemon fires and recovery keep continuity
-    and are never refused. Operator chats without a seat token and anonymous
-    loopback spawns (a known local bypass) are independent work. Seat operator
+    and are never refused. Operator chats without a seat token and trusted
+    in-process daemon launches are independent work. Seat operator
     elevation does not exempt a token-verified caller. Text is never inspected."""
     auth = msg.get("_auth_context") or {}
     if resume or msg.get("handoff") or msg.get("handoff_from_stream_id"):
@@ -1051,6 +1051,22 @@ class SpawnCtl:
             stream_id=f"{host}:{name}",
             operation=f"spawn:{provider}",
         )
+
+    async def _raw_command_launch(self, msg, host, name, command, machine):
+        machine = machine or launch.local_machine(host)
+        token = launch.mint_stream_token()
+        path = launch.stream_token_file_for(machine, name)
+        # export applies to compound commands as well as a single executable.
+        envelope = (f"export {launch.stream_env_assignments(machine, name, path)}; "
+                    f"{self._envelope_command(command, machine)}")
+        plan = launch.LaunchPlan(envelope, "", "", token, path)
+        resolution = {}
+        if msg.get("_defer_launch_token_stage"):
+            resolution["_deferred_launch_plan"] = plan
+        else:
+            await self._stage_launch_token(plan, host=host, name=name, provider="command")
+        return envelope, resolution, {"token_hash": hashlib.sha256(token.encode()).hexdigest(),
+                                      "token_hash_version": STREAM_TOKEN_HASH_VERSION}
 
     @staticmethod
     def _envelope_command(command: str, machine: "launch.LocalMachine | None") -> str:
@@ -3323,8 +3339,8 @@ class SpawnCtl:
 
         `resolution` is the byte-parity launch-tuple metadata for `spawn.ok`;
         `overrides` are the resolved columns to persist on the open row. Both are
-        empty on the explicit-`command`, no-provider path (the smoke tier), while
-        that command still receives the target-host PATH envelope.
+        provider metadata is empty on raw commands; all launches receive their
+        own private seat credential and target-host PATH envelope.
         """
         explicit = str(msg.get("command") or "").strip()
         provider = str(msg.get("provider") or "").strip()
@@ -3349,7 +3365,7 @@ class SpawnCtl:
             command = explicit or self.default_command
             if not command:
                 raise VerbError("bad_request", "provider (or command) is required")
-            return self._envelope_command(command, self._launch_machine(host)), {}, {}
+            return await self._raw_command_launch(msg, host, name, command, self._launch_machine(host))
 
         schema = msg.get("schema")
         try:
@@ -3404,7 +3420,10 @@ class SpawnCtl:
         if explicit:
             # Tests may resolve a tuple AND pin the command (stub launch). Honor
             # the command but still stamp the resolved tuple fields.
-            command = self._envelope_command(explicit, self._launch_machine(host, provider))
+            command, raw_resolution, raw_overrides = await self._raw_command_launch(
+                msg, host, name, explicit, self._launch_machine(host, provider))
+            token_hash = raw_overrides["token_hash"]
+            deferred_launch_plan = raw_resolution.get("_deferred_launch_plan")
         else:
             # A remote tuple spawn builds its launch from the TARGET host's
             # machines.json profile — the local stopgap's paths are wrong on a
@@ -3463,7 +3482,7 @@ class SpawnCtl:
             "resolved_launch_tuple": dict(tuple_fields),
             "actual_launch_tuple": dict(tuple_fields),
         }
-        if not explicit and deferred_launch_plan is not None:
+        if deferred_launch_plan is not None:
             resolution["_deferred_launch_plan"] = deferred_launch_plan
         if resolved.get("_handoff_model_change_warning"):
             resolution["handoff_model_change_warning"] = resolved["_handoff_model_change_warning"]

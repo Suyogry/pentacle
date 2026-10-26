@@ -31,11 +31,7 @@ def test_unavailable_registry_projects_no_consent_without_breaking_transport(tmp
         try:
             if surface == "hello":
                 result = await env.server._on_hello({"client": "pentacle-mobile", "_client_websocket": peer})
-                snapshot = next(frame for frame in result if frame["type"] == "snapshot")
-                assert snapshot["capabilities"]["close_expected_generation"]
-                assert "consent_open_v1" not in snapshot["capabilities"]
-                assert "consent_enrollment_offer_v1" not in snapshot["capabilities"]
-                assert [r["producer"] for r in snapshot["notifications"]] == ["fixture.v1"]
+                assert result == [{"type": "hello.error", "error_code": "authentication_required"}]
             elif surface == "notification.list":
                 result = await notify.notification({"type": "notification.list", "request_id": "list", "_client_websocket": peer})
                 assert result["type"] == "notification.list.ok"

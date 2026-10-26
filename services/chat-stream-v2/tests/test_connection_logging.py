@@ -284,24 +284,23 @@ def test_ping_bad_json_and_bad_envelope_before_hello_do_not_authenticate(daemon,
     ("pentacle-mobile", "mobile"), ("pentacle-web", "web"),
     ("pentacle", "desktop"), ("agent-orch", "cli"), ("unrecognized", "unknown"),
 ])
-def test_loopback_hello_claims_and_negotiated_settings(daemon, caplog, client, kind):
+def test_loopback_hello_claims_do_not_authenticate(daemon, caplog, client, kind):
     async def run():
         async with connected(daemon) as (socket, _, _):
             reply = await socket.rpc({"type": "hello", "client": client,
                 "build_sha": "abcdef0123456789", "capabilities": {"work_lanes_v1": True},
                 "subscribe": {"events_mode": "summary", "snapshot": False, "mode": "rpc"}})
-            assert reply["type"] == "ready" and reply["snapshot"] is False
+            assert reply["type"] == "hello.error" and reply["error_code"] == "authentication_required"
             assert (await socket.rpc({"type": "ping"}))["type"] == "pong"
-        auth = one(caplog, "auth_ok")
-        assert auth["auth_method"] == "loopback" and auth["auth_stage"] == "hello"
+        auth = one(caplog, "auth_fail")
+        assert auth["auth_method"] == "none" and auth["auth_stage"] == "hello"
         assert auth["client_kind"] == kind
         assert auth["client_name"] == (client if kind != "unknown" else "unknown")
         assert auth["client_metadata_source"] == "hello_claim"
         assert auth["app_build"] == "abcdef0123456789"
-        assert auth["events_mode"] == "summary"
-        assert auth["snapshot_requested"] is False and auth["work_lanes_v1"] is True
+        assert auth["reason"] == "authentication_required"
         assert len(auth_records(caplog)) == 1
-        assert [event["event"] for event in records(caplog)] == ["connect", "auth_ok", "close"]
+        assert [event["event"] for event in records(caplog)] == ["connect", "auth_fail", "close"]
     asyncio.run(run())
 
 
@@ -845,6 +844,7 @@ def test_cancelled_sends_record_timing_but_never_success(daemon, caplog, clock, 
 
 def test_detached_accepted_send_survives_disconnect_without_late_state_recreation(daemon, caplog):
     async def run():
+        token, owner = await issue_seat(daemon)
         entered, finish = asyncio.Event(), asyncio.Event()
         completed = []
         async def accepted_send(message):
@@ -854,7 +854,7 @@ def test_detached_accepted_send_survives_disconnect_without_late_state_recreatio
             return {"type": "send.result", "delivery": "landed"}
         daemon.handlers["send"] = accepted_send
         async with connected(daemon) as (socket, _, task):
-            socket.feed({"type": "send", "request_id": "durable-request", "text": "synthetic payload"})
+            socket.feed({"type": "send", "request_id": "durable-request", "text": "synthetic payload", "from_stream_id": owner, "stream_token": token})
             await asyncio.wait_for(entered.wait(), 5)
             socket.finish()
             await task

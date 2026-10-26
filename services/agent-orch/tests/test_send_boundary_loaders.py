@@ -116,6 +116,7 @@ def test_operator_file_success_from_real_cli(monkeypatch, tmp_path, source, expe
     operator_file.parent.mkdir(parents=True)
     if source != "missing":
         operator_file.write_text(" FILE-operator-sentinel\n")
+        operator_file.chmod(0o600)
     monkeypatch.setattr(os, "environ", env)
     assert not env.reads
     cfg = config.load_config()
@@ -336,12 +337,12 @@ def test_thread_unusable_seat_source_precedes_operator_loader(monkeypatch, tmp_p
         raise PermissionError("operator file unreadable")
     monkeypatch.setattr(b, "_file_token", operator_loader)
     if state == "unreadable-file":
-        original = Path.read_text
-        def read(self, *args, **kwargs):
-            if self == token:
+        original = os.open
+        def read(path, *args, **kwargs):
+            if Path(path) == token:
                 raise PermissionError("seat file unreadable")
-            return original(self, *args, **kwargs)
-        monkeypatch.setattr(Path, "read_text", read)
+            return original(path, *args, **kwargs)
+        monkeypatch.setattr(os, "open", read)
     socket = Socket()
     monkeypatch.setattr(w.websockets, "connect", lambda *args, **kwargs: Connection(socket))
     assert cli.main(["thread", "fixture:child", "--timeout", "1"]) == 2

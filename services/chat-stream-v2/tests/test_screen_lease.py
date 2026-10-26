@@ -249,7 +249,7 @@ def test_public_remote_dispatch_and_notice_delivery():
             websocket=Remote(),
         )
         assert (
-            response[0]["type"] == "screen.lease.status.ok"
+            response[0]["error_code"] == "authentication_required"
             and response[0]["request_id"] == "public-read"
         )
         denied = await server._dispatch(

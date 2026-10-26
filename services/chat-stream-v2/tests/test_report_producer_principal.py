@@ -514,7 +514,13 @@ def test_reader_list_filtered_by_a_system_producer_id_is_a_filter_not_a_login(cr
             producer_peer = Peer()
             await authenticate(h.server, producer_peer)
             assert (await dispatch(h.server, producer_peer, frame()))['type'] == 'asset.publish.ok'
-            reader = Peer('127.0.0.1')  # the web host reads over loopback
+            reader = Peer('127.0.0.1')  # the web host authenticates on loopback
+            from _shared.operator_auth import OperatorCredentialRegistry, ConnectionTrust
+            registry = OperatorCredentialRegistry(tmp_path / 'reader-auth' / 'credentials.json')
+            registry.path.parent.mkdir(mode=0o700)
+            cid, _ = registry.issue('pentacle')
+            h.server.operator_credential_registry = registry
+            h.server._connection_trust[reader] = ConnectionTrust('v2', cid, 'pentacle')
             window = dict(type='asset.list', request_id='reader-list', spec_id=SPEC,
                           asset_id_prefix='daily-report-', sort='asset_id_desc', limit=120)
             unfiltered = await dispatch(h.server, reader, window)

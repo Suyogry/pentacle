@@ -21,6 +21,7 @@ def test_config_precedence(monkeypatch, tmp_path):
     token_dir = home / ".config" / "pentacle-stream"
     token_dir.mkdir(parents=True)
     (token_dir / "token").write_text(" tok \n", encoding="utf-8")
+    (token_dir / "token").chmod(0o600)
     monkeypatch.setattr("socket.gethostname", lambda: "hostb.local")
 
     config = load_config()

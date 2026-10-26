@@ -1,10 +1,10 @@
 # Daemon network access
 
-The daemon defaults to loopback. Connections whose actual peer is IPv4 or IPv6
-loopback can use local CLI bootstrap, including the initial spawn and one-time
-seat token grant. This is a single-user local trust boundary: other processes
-on that computer can use the local daemon. A claimed client name, host, or
-sender field does not establish local access.
+The daemon defaults to loopback, and every protected operation requires verified
+credentials on loopback too. Claimed client names, host/sender fields and omitted
+browser Origin headers confer no authority. See [daemon authentication and
+migration](daemon_authentication.md) for operator CLI environments and existing
+workers. The authenticated operator retains full existing command authority.
 
 Before exposing the daemon on a LAN or VPN for mobile, provision a separate
 operator credential for each UI client with `services/chat-stream-v2/tools/operator_auth_cli.py`.
@@ -13,7 +13,7 @@ Desktop uses a private credential-envelope file configured with
 hello. Invalid or absent authentication receives `hello.error`; it does not
 receive an inventory or subscribe to broadcasts.
 
-Remote agent CLI connections authenticate with their launch-provisioned seat
+Agent CLI connections authenticate with their launch-provisioned seat
 token. Persistent clients, snapshots and one-shot RPCs carry that identity.
 After a verified hello, the socket may omit repeated tokens; the daemon retains
 only the token hash and owner and revalidates the open seat on each RPC. Closed
@@ -48,9 +48,9 @@ the flag defaults OFF and should stay OFF on any deployment with a human operato
 surface. Enable it only with that whole-context grant in mind, not just the four
 named RPCs.
 
-A fresh operator CLI with no seat credential should run on the daemon machine
-(directly or over SSH), or use the enrolled UI to start an agent. Legacy token
-strings and arbitrary `from_stream_id` claims do not authenticate remote access.
+A fresh operator CLI must use its provisioned v2 credential file, including on
+the daemon machine or over SSH, or use the enrolled UI to start an agent. Legacy
+token strings and arbitrary `from_stream_id` claims do not authenticate access.
 Authentication errors fail promptly instead of being retried as timeouts.
 
 Unauthenticated network routes are limited to ping, hello, enrollment redemption,

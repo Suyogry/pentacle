@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import hashlib
 import time
 
 import pytest
@@ -9,7 +10,7 @@ import websockets
 
 from server import Server
 from sessions import Sessions
-from store import Store
+from store import Store, STREAM_TOKEN_HASH_VERSION
 
 
 def test_early_hello_and_broadcast_wait_for_complete_bootstrap():
@@ -19,6 +20,8 @@ def test_early_hello_and_broadcast_wait_for_complete_bootstrap():
         server = None
         try:
             await store.open_session("local", "seeded", provider="codex")
+            token = "synthetic-bootstrap-seat"
+            await store.grant_stream_token("local", "seeded", hashlib.sha256(token.encode()).hexdigest(), STREAM_TOKEN_HASH_VERSION)
             sessions = Sessions(store, local_host="local")
             server = Server(port=0, store=store, sessions=sessions, local_host="local")
             # Also runs against the pre-fix server: its handler ignores this gate.
@@ -26,7 +29,7 @@ def test_early_hello_and_broadcast_wait_for_complete_bootstrap():
             server.inventory_ready.clear()
             port = await server.bind()
             async with websockets.connect(f"ws://127.0.0.1:{port}") as socket:
-                await socket.send(json.dumps({"type": "hello", "client": "bootstrap-test"}))
+                await socket.send(json.dumps({"type": "hello", "client": "bootstrap-test", "from_stream_id": "local:seeded", "stream_token": token}))
                 await server.broadcast({"type": "session.inventory", "sessions": []})
                 receive = asyncio.create_task(socket.recv())
                 try:

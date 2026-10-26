@@ -7,6 +7,10 @@ import argparse
 import asyncio
 import json
 import uuid
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _shared.operator_client import operator_hello
 
 import websockets
 
@@ -20,9 +24,13 @@ async def read_daemon_stats(*, ws_url: str, timeout_s: float) -> dict:
         open_timeout=timeout_s,
         max_size=DAEMON_WS_MAX_SIZE,
     ) as websocket:
+        welcome = json.loads(await asyncio.wait_for(websocket.recv(), timeout=timeout_s))
+        await websocket.send(json.dumps(operator_hello(welcome)))
         await websocket.send(json.dumps({"type": "daemon.stats", "request_id": request_id}))
         while True:
             frame = json.loads(await asyncio.wait_for(websocket.recv(), timeout=timeout_s))
+            if frame.get("type", "").endswith(".error"):
+                raise PermissionError("daemon statistics authentication refused")
             if frame.get("type") == "daemon.stats.ok" and frame.get("request_id") == request_id:
                 return frame
 

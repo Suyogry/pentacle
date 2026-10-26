@@ -40,6 +40,10 @@ class Inventory:
 
 
 class AcceptingRegistry:
+    def load(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(credentials={CREDENTIAL_ID: {"client_kind": "pentacle", "revoked_at": None}})
+
     def verify(
         self, credential_id: str, client_kind: str, _nonce: str, _proof: str,
     ) -> operator_auth.ConnectionTrust:
@@ -114,6 +118,7 @@ def test_registered_broadcast_recipient_gets_schedule_frames_only_after_operator
 ) -> None:
     async def go() -> None:
         server = Server()
+        server.operator_credential_registry = AcceptingRegistry()
         pre_hello = object()
         token_cli = object()
         peer = object()

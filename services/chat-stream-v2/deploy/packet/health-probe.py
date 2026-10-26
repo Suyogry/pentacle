@@ -17,7 +17,6 @@ def probe(expected,url):
     try:
      welcome=json.loads(w.recv(timeout=3));row['welcome_received_utc']=now();row['welcome_conn_id']=welcome.get('conn_id');row['observed_runtime_sha']=welcome.get('runtime_sha')
      if welcome.get('runtime_sha')!=expected:raise AssertionError('runtime SHA mismatch')
-     w.send(json.dumps({'type':'hello','client':'agent-orch','subscribe':{'snapshot':False}}))
      w.send(json.dumps({'type':'ping','request_id':'inc2-health'}))
      until=time.monotonic()+5
      while time.monotonic()<until:

@@ -26,7 +26,10 @@ The reader authenticates its hello; its lookup request has only `type`,
 `request_id` and `report_id`. Dashboard ownership transfer rejects service
 identities before connecting; operator envelope proofs stay inside the boundary.
 
-Ordinary seat/operator credential precedence and transmitted frames are retained.
+Native localhost clients now authenticate too. Operator connections use the v2
+welcome challenge proof on every connection, including reconnects; seat hellos
+carry only their own identity and token. Missing seat credentials never fall
+back to operator material. See [setup and migration](../../docs/daemon_authentication.md).
 `load_config()` records an operator source descriptor without reading its value;
 the boundary loads it after resolving identity. An explicitly empty operator
 environment token skips the file. Direct `Config(token=...)` callers remain
@@ -1361,7 +1364,7 @@ Sources are listed in precedence order:
 | Input | Sources, in order | Default |
 |---|---|---|
 | Websocket URL | `AGENT_ORCH_WS_URL` > `chat_stream.url` in config.json | `ws://127.0.0.1:7791` |
-| Auth token | `AGENT_ORCH_TOKEN` > `~/.config/pentacle-stream/token` | `""` (unauthenticated; valid only when daemon has no token configured) |
+| Operator credential | `AGENT_ORCH_TOKEN` > `AGENT_ORCH_TOKEN_FILE` > `PENTACLE_OPERATOR_TOKEN_FILE` > `chat_stream.token_path` in config.json > `~/.config/pentacle-stream/token` | Required v2 envelope for operator access |
 | Local host id | `AGENT_ORCH_HOST_ID` > `local_host_id` in config.json > hostname-derived fallback | Set an explicit stable host ID such as `coordinator` in the environment or configuration. |
 | Runtime dir | `AGENT_ORCH_RUNTIME_DIR` | `~/.agent-orch/` |
 | Memory repo path | `memory_repo_path` in config.json | Optional role-baseline directory; no memory repository is required for daemon startup. |

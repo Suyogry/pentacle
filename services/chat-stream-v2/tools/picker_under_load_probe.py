@@ -19,6 +19,8 @@ import sqlite3
 import sys
 import time
 from uuid import uuid4
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _shared.operator_client import operator_hello
 
 from websockets.sync.client import connect
 
@@ -65,18 +67,17 @@ def _recv_correlated(ws: object, request_id: str, *, timeout: float) -> dict:
             return frame
 
 
-def _expect_welcome(ws: object, *, timeout: float) -> None:
+def _expect_welcome(ws: object, *, timeout: float) -> dict:
     frame = _recv_json(ws, timeout=timeout)
     if frame.get("type") != "welcome":
         raise RuntimeError(f"expected welcome, got {frame.get('type')!r}")
+    return frame
 
 
 def _start_observer(ws: object, *, timeout: float) -> None:
-    _expect_welcome(ws, timeout=timeout)
-    ws.send(json.dumps({  # type: ignore[attr-defined]
-        "type": "hello", "request_id": "picker-observer", "client": "pentacle",
-        "subscribe": {"include_subagents": True, "events_mode": "summary"},
-    }))
+    welcome = _expect_welcome(ws, timeout=timeout)
+    ws.send(json.dumps(operator_hello(welcome, request_id="picker-observer",
+        subscribe={"include_subagents": True, "events_mode": "summary"})))
     hello = _recv_correlated(ws, "picker-observer", timeout=timeout)
     if hello.get("type") != "hello":
         raise RuntimeError(f"observer hello failed: {hello}")

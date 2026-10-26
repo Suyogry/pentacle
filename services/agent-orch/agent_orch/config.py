@@ -94,7 +94,10 @@ def load_config() -> Config:
     operator_source = OperatorTokenSource(
         env_name="AGENT_ORCH_TOKEN",
         env_present="AGENT_ORCH_TOKEN" in os.environ,
-        path=Path("~/.config/pentacle-stream/token").expanduser(),
+        path=Path(os.environ.get("AGENT_ORCH_TOKEN_FILE")
+                  or os.environ.get("PENTACLE_OPERATOR_TOKEN_FILE")
+                  or (config.get("chat_stream", {}).get("token_path") if isinstance(config.get("chat_stream"), dict) else None)
+                  or "~/.config/pentacle-stream/token").expanduser(),
     )
 
     host_id = local_host_id(config)
