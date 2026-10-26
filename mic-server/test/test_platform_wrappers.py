@@ -180,11 +180,38 @@ def test_recovery_serializes_concurrent_runs(tmp_path, monkeypatch):
 def test_recovery_probes_loopback_on_the_configured_port(monkeypatch):
     module = load('recover-local-service.py')
     urls = []
-    monkeypatch.setattr(module, 'urlopen', lambda url, timeout: urls.append(url) or (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(module, 'open_request', lambda req, timeout: urls.append(req.full_url) or (_ for _ in ()).throw(OSError()))
     assert module.status() is None
     module.PORT = 17781
     module.status()
     assert urls == ['http://127.0.0.1:7780/status', 'http://127.0.0.1:17781/status']
+
+
+@pytest.mark.parametrize('code', [401, 403, 500])
+def test_recovery_http_refusal_never_restarts_a_responding_service(tmp_path, monkeypatch, code):
+    from urllib.error import HTTPError
+    module = load('recover-local-service.py')
+    run = Mock()
+    monkeypatch.setattr(module.subprocess, 'run', run)
+    monkeypatch.setattr(module, 'LOCK_PATH', tmp_path/'recover.lock')
+    def refused(req, timeout):
+        assert req.get_header('Authorization', '').startswith('Bearer ')
+        raise HTTPError(req.full_url, code, 'refused', {}, None)
+    monkeypatch.setattr(module, 'open_request', refused)
+    with pytest.raises(RuntimeError, match='probe was refused'):
+        module.recover(config(tmp_path))
+    run.assert_not_called()
+
+
+def test_recovery_missing_credential_never_restarts(tmp_path, monkeypatch):
+    module = load('recover-local-service.py')
+    monkeypatch.delenv('MIC_AUTH_TOKEN_FILE')
+    monkeypatch.setattr(module, 'LOCK_PATH', tmp_path/'recover.lock')
+    run = Mock()
+    monkeypatch.setattr(module.subprocess, 'run', run)
+    with pytest.raises(RuntimeError, match='credential'):
+        module.recover(config(tmp_path))
+    run.assert_not_called()
 
 
 @pytest.mark.parametrize('etime,seconds', [('00:29', 29), ('05:03', 303), ('01:02:03', 3723), ('2-03:04:05', 183845)])

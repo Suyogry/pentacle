@@ -1,3 +1,4 @@
+from mic_http import read_token, auth_headers
 """POST /transcribe adapter route (spec § Shared contract item 1 / C4).
 
 The route reads raw audio, requires prompt_profile=fleet, calls the SAME model
@@ -79,6 +80,7 @@ class TranscribeRouteTest(unittest.TestCase):
         mic_server.always_on_listener = SimpleNamespace(whisper_model=self.model, running=True)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), mic_server.MicHandler)
+        self.server.mic_token = read_token()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -93,7 +95,7 @@ class TranscribeRouteTest(unittest.TestCase):
     def post_audio(self, path, data=b"AUDIODATA", content_type="audio/mp4"):
         req = urllib.request.Request(
             self.base + path, data=data, method="POST",
-            headers={"Content-Type": content_type},
+            headers={"Content-Type": content_type, **auth_headers()},
         )
         try:
             with urllib.request.urlopen(req, timeout=5) as resp:
@@ -105,7 +107,7 @@ class TranscribeRouteTest(unittest.TestCase):
     def test_status_carries_the_configured_microphone_name(self):
         # Existing HTTP status transports the same value recognition consumes.
         with mock.patch.object(mic_server, "ASSISTANT_NAME", "Aster"):
-            with urllib.request.urlopen(self.base + "/status", timeout=5) as response:
+            with urllib.request.urlopen(urllib.request.Request(self.base + "/status", headers=auth_headers()), timeout=5) as response:
                 status = json.loads(response.read().decode())
         self.assertEqual(status["assistant_name"], "Aster")
 
@@ -159,8 +161,15 @@ class TranscribeRouteTest(unittest.TestCase):
         self.assertEqual(status, 503)
 
     def test_too_large_is_413(self):
-        big = b"x" * (mic_server.MicHandler.TRANSCRIBE_MAX_BYTES + 1)
-        status, _ = self.post_audio("/transcribe?prompt_profile=fleet", data=big)
+        # The rejection happens before a body read; send only the declared size.
+        import http.client
+        conn = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=2)
+        conn.request('POST', '/transcribe?prompt_profile=fleet', headers={
+            **auth_headers(), 'Content-Length': str(mic_server.MicHandler.TRANSCRIBE_MAX_BYTES + 1)})
+        response = conn.getresponse()
+        status = response.status
+        response.read()
+        conn.close()
         self.assertEqual(status, 413)
         self.assertEqual(self.model.calls, [])
 

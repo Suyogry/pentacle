@@ -203,6 +203,26 @@
     "status": "stable"
   },
   {
+    "id": "spec_mic_api_auth",
+    "path": "work/in_progress/pentacle__mic_api_auth/spec.md",
+    "title": "Authenticate the microphone API and proxy browser clients",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/in_progress/pentacle__mic_api_auth/spec.md",
+    "tags": [
+      "security",
+      "microphone"
+    ],
+    "summary": "Require private credentials and reject browser-origin access to the microphone backend.",
+    "related": [
+      "work_mic_api_auth"
+    ],
+    "status": "in_progress",
+    "machine": "local",
+    "owner": "maintainer"
+  },
+  {
     "id": "spec_pentacle_th_h1_2026_10",
     "path": "work/in_progress/pentacle__th-h1-bounded-root-suite/spec.md",
     "title": "TH-H1 bounded root suite",
@@ -301,6 +321,26 @@
     "status": "in_progress",
     "machine": "shared",
     "owner": "dot"
+  },
+  {
+    "id": "work_mic_api_auth",
+    "path": "work/in_progress/pentacle__mic_api_auth/summary.md",
+    "title": "Authenticate the microphone API and proxy browser clients",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/in_progress/pentacle__mic_api_auth/summary.md",
+    "tags": [
+      "security",
+      "microphone"
+    ],
+    "summary": "Require private credentials and reject browser-origin access to the microphone backend.",
+    "related": [
+      "spec_mic_api_auth"
+    ],
+    "status": "in_progress",
+    "machine": "local",
+    "owner": "maintainer"
   },
   {
     "id": "work_pentacle_th_h1_2026_10",

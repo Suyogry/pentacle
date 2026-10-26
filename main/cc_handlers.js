@@ -171,7 +171,7 @@ function createCcHandlers({
 
   function publicConfig() {
     const { token, tokenPath, ...chatStream } = CONFIG.chatStream || {};
-    const { startCommand, ...mic } = CONFIG.mic || {};
+    const { startCommand, token: micToken, tokenPath: micTokenPath, ...mic } = CONFIG.mic || {};
     // The private catalog root is a host filesystem path; the browser only
     // needs the catalog spec id.
     const { catalogRoot, ...dashboards } = CONFIG.dashboards || {};

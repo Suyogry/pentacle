@@ -18,6 +18,8 @@ import time
 import signal
 import threading
 import subprocess
+import hmac
+from urllib.parse import urlsplit
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from datetime import datetime
@@ -28,6 +30,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from audio_buffer import get_audio_buffer
 from speaker_service import get_service
 from local_actions import ASSISTANT_NAME
+from mic_http import is_loopback, read_token, TOKEN_PATTERN
 
 def audio_duration_s(path):
     """Probe container duration before upload inference; never load another model."""
@@ -703,6 +706,58 @@ def stop_always_on():
 # --- HTTP Handler ---
 
 class MicHandler(BaseHTTPRequestHandler):
+    MAX_JSON_BYTES = 64 * 1024
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+
+    def parse_request(self):
+        # This runs for EVERY method, including OPTIONS and unknown verbs,
+        # before the standard library dispatches to a route or reads a body.
+        if not super().parse_request():
+            return False
+        return self._authorize_request()
+
+    def _refuse(self, code, error):
+        self.close_connection = True  # never reuse an unread rejected body
+        self._json({"error": error}, code)
+        return False
+
+    def _authorize_request(self):
+        if self.headers.get_all("Origin") is not None:
+            return self._refuse(403, "browser_origin_refused")
+        hosts = self.headers.get_all("Host", [])
+        try:
+            authority = hosts[0] if len(hosts) == 1 else ""
+            url = urlsplit("http://" + authority)
+            valid = (bool(authority) and is_loopback(url.hostname or "")
+                     and not url.username and not url.password and not url.path
+                     and not url.query and not url.fragment and "\\" not in authority
+                     and not any(c.isspace() for c in authority)
+                     and (url.port or 80) == self.server.server_address[1])
+        except ValueError:
+            valid = False
+        if not valid or not self.path.startswith("/") or self.path.startswith("//"):
+            return self._refuse(403, "host_refused")
+        token = getattr(self.server, "mic_token", None)
+        if not isinstance(token, str) or TOKEN_PATTERN.fullmatch(token) is None:
+            return self._refuse(503, "microphone_auth_unavailable")
+        credentials = self.headers.get_all("Authorization", [])
+        candidate = credentials[0] if len(credentials) == 1 else ""
+        if not hmac.compare_digest(candidate.encode("utf-8"), ("Bearer " + token).encode("ascii")):
+            return self._refuse(401, "authentication_required")
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get_all("Transfer-Encoding") is not None or len(lengths) > 1:
+            return self._refuse(400, "invalid_body_length")
+        if lengths and (not lengths[0].isascii() or not lengths[0].isdigit() or len(lengths[0]) > 10):
+            return self._refuse(400, "invalid_body_length")
+        length = int(lengths[0]) if lengths else 0
+        limit = self.TRANSCRIBE_MAX_BYTES if self.path.split("?", 1)[0] == "/transcribe" else self.MAX_JSON_BYTES
+        if length > limit:
+            return self._refuse(413, "request_too_large")
+        return True
+
     def do_GET(self):
         if self.path == "/status":
             audio = audio_health.snapshot()
@@ -826,7 +881,11 @@ class MicHandler(BaseHTTPRequestHandler):
             self._handle_transcribe()
             return
 
-        body = self._read_body()
+        try:
+            body = self._read_body()
+        except (ValueError, UnicodeError):
+            self._refuse(400, "invalid_json_body")
+            return
 
         if self.path in ("/speak", "/turn-ended", "/speaker/rules/reload", "/conversation/timing"):
             if self.client_address[0] not in ("127.0.0.1", "::1"):
@@ -1253,31 +1312,36 @@ class MicHandler(BaseHTTPRequestHandler):
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
         if length:
-            try:
-                return json.loads(self.rfile.read(length))
-            except json.JSONDecodeError:
-                return {}
+            data = json.loads(self.rfile.read(length))
+            if not isinstance(data, dict):
+                raise ValueError("JSON body must be an object")
+            return data
         return {}
 
     def _json(self, data, code=200):
+        body = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
+        self._json({"error": "browser_access_disabled"}, 405)
 
     def log_message(self, format, *args):
         pass  # Suppress default logging
 
 
 def main():
+    # Validate configuration before allocating audio buffers or loading models.
+    bind_host = get_bind_host()
+    if not is_loopback(bind_host):
+        raise ValueError("Microphone service must bind to loopback; use the authenticated web host for remote access")
+    token = read_token()
     def handle_signal(sig, frame):
         log("Shutting down...")
         stop_all()
@@ -1288,8 +1352,8 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
 
     get_audio_buffer()  # Startup expiry and cleanup continue even when mic is Off.
-    bind_host = get_bind_host()
     server = ThreadingHTTPServer((bind_host, PORT), MicHandler)
+    server.mic_token = token
     threading.Thread(target=get_service().start, name="resident-speaker-start", daemon=True).start()
     log(f"Mic Server running on http://{bind_host}:{PORT}")
     log(f"Platform: {sys.platform}")

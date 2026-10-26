@@ -1,3 +1,4 @@
+from mic_http import read_token, auth_headers
 import json
 import time
 import wave
@@ -286,12 +287,13 @@ def test_single_thread_http_off_and_status_work_during_copy(tmp_path, monkeypatc
     monkeypatch.setattr(mic_server, 'always_on_listener', None)
     monkeypatch.setattr(mic_server, 'state', dict(mic_server.state, mode='off', last_error=None))
     server = HTTPServer(('127.0.0.1', 0), mic_server.MicHandler)
+    server.mic_token = read_token()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     def request(path, body=None):
         req = Request(f'http://127.0.0.1:{server.server_port}'+path,
                       data=None if body is None else json.dumps(body).encode(),
-                      headers={'Content-Type': 'application/json'})
+                      headers={'Content-Type': 'application/json', **auth_headers()})
         with urlopen(req, timeout=1) as response:
             return response.status, json.load(response)
     try:

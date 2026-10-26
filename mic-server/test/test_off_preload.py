@@ -1,3 +1,4 @@
+from mic_http import read_token, auth_headers
 """Managed OFF startup loads the existing model without capture."""
 import os
 import sys
@@ -115,24 +116,25 @@ class OffPreloadLifecycleTest(unittest.TestCase):
              mock.patch.object(mic_server, "get_audio_buffer", return_value=None):
             preload = threading.Thread(target=mic_server.preload_always_on)
             server = HTTPServer(("127.0.0.1",0),mic_server.MicHandler)
+            server.mic_token = read_token()
             worker = threading.Thread(target=server.serve_forever)
             preload.start(); worker.start()
             try:
                 self.assertTrue(entered.wait(1))
                 base = f"http://127.0.0.1:{server.server_port}"
-                with urllib.request.urlopen(base+"/status",timeout=1) as response:
+                with urllib.request.urlopen(urllib.request.Request(base+"/status",headers=auth_headers()),timeout=1) as response:
                     status = json.load(response)
                 self.assertEqual(status["mode"], "off")
                 self.assertFalse(status["asr"]["loaded"])
                 self.assertEqual(status["asr"]["load_state"], "loading")
-                request = urllib.request.Request(base+"/mode/on",data=b"{}",headers={"Content-Type":"application/json"})
+                request = urllib.request.Request(base+"/mode/on",data=b"{}",headers={"Content-Type":"application/json", **auth_headers()})
                 with self.assertRaises(urllib.error.HTTPError) as error:
                     urllib.request.urlopen(request,timeout=1)
                 self.assertEqual(error.exception.code,409)
                 listener.start.assert_not_called()
                 release.set(); preload.join(2)
                 self.assertFalse(preload.is_alive())
-                with urllib.request.urlopen(base+"/status",timeout=1) as response:
+                with urllib.request.urlopen(urllib.request.Request(base+"/status",headers=auth_headers()),timeout=1) as response:
                     status = json.load(response)
                 self.assertTrue(status["asr"]["loaded"])
                 self.assertEqual(status["asr"]["vocabulary_version"],"fleet-example")

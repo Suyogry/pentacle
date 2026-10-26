@@ -34,6 +34,11 @@ import re
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "mic-server"))
+from mic_http import make_request, open_request
 from typing import Any, Callable
 
 from sessions import VerbError
@@ -73,14 +78,12 @@ def _urllib_post(url: str, *, data: bytes, content_type: str, timeout: float) ->
     ``backend_unavailable``; an HTTP error status is returned as data so the
     caller can map 4xx/5xx to the right verb error.
     """
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={"Content-Type": content_type, "Content-Length": str(len(data))},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - loopback only
+        from urllib.parse import urlsplit
+        target = urlsplit(url)
+        req = make_request(f"{target.scheme}://{target.netloc}", target.path + ("?" + target.query if target.query else ""),
+                           data=data, method="POST", headers={"Content-Type": content_type, "Content-Length": str(len(data))})
+        with open_request(req, timeout=timeout) as resp:
             return int(resp.getcode() or 0), resp.read()
     except urllib.error.HTTPError as exc:
         try:
@@ -88,8 +91,8 @@ def _urllib_post(url: str, *, data: bytes, content_type: str, timeout: float) ->
         except Exception:  # noqa: BLE001 - best effort error body
             body = b""
         return int(exc.code), body
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        raise ConnectionError(str(exc)) from exc
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        raise ConnectionError("Microphone backend or private credential is unavailable") from exc
 
 
 class Transcriber:

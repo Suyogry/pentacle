@@ -6,6 +6,7 @@ const fs=require('node:fs');
 const {createWakeDelivery}=require('../renderer/wake_delivery');
 const {createRoomMicTurns}=require('../renderer/room_mic_turns');
 const client=require('../main/chat_stream_client');
+const {micAuthHeaders,localMicUrl,fetchMic}=require('../main/mic_auth');
 
 async function main() {
   const [endpoint,seat,msgId,inputPath,outputPath]=process.argv.slice(2);
@@ -18,7 +19,7 @@ async function main() {
     ||!inventory.session?.objective?.includes('disposable'))throw Error('Target must be the caller-owned disposable fixture worker');
   const input=fs.readFileSync(inputPath,'utf8');
   const api=async(method,path,body)=>{
-    const result=await fetch(endpoint+path,{method,headers:{'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})});
+    const result=await fetchMic(localMicUrl(endpoint)+path,{method,headers:{'Content-Type':'application/json',...micAuthHeaders({})},...(body?{body:JSON.stringify(body)}:{})});
     return result.json();
   };
   let delivered,receiptPromise;

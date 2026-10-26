@@ -12,7 +12,9 @@
 // hostColors: { workstation: 'royal-blue' }, // default: indexed palette, wrapping
 // localHostId: 'local', // default: chatStream.hostMap.local, then chatStream.localHost
 // micServerUrl: 'http://127.0.0.1:7780', // default: this local endpoint
-// mic: { useStreamHost: false, alwaysOnEnabled: false, autoSpawn: true },
+// mic: { tokenPath: '~/.config/pentacle/mic.token', useStreamHost: false, alwaysOnEnabled: false, autoSpawn: true },
+//   // mic.tokenPath (or MIC_AUTH_TOKEN_FILE) is required. See docs/mic_api_security.md.
+//   // Web mic features also require --token-file or --auth tailscale.
 //   // mic.useStreamHost derives http://<chatStream URL hostname>:7780.
 //   // autoSpawn is compatibility-only; public main probes, never starts a server.
 // wakeWord: 'Computer', // no built-in default; optional mic display text

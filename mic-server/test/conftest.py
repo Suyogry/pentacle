@@ -6,6 +6,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def private_mic_credential(tmp_path, monkeypatch):
+    token = tmp_path / 'mic.token'
+    token.write_text('synthetic-private-microphone-token-' + 'x' * 32)
+    token.chmod(0o600)
+    monkeypatch.setenv('MIC_AUTH_TOKEN_FILE', str(token))
+
+
+@pytest.fixture(autouse=True)
 def forbid_real_audio_output(monkeypatch):
     monkeypatch.setenv('MIC_SPEAKER_SINK', 'null')
     original = subprocess.Popen

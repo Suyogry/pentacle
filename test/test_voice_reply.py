@@ -1,3 +1,6 @@
+import os
+import tempfile
+from pathlib import Path
 import json
 import threading
 import time
@@ -34,6 +37,14 @@ class LineTests(unittest.TestCase):
 
 class HelperTests(unittest.TestCase):
     def setUp(self):
+        self.token_dir = tempfile.TemporaryDirectory()
+        token = Path(self.token_dir.name)/'mic.token'
+        token.write_text('synthetic-speech-helper-credential-'+'x'*32)
+        token.chmod(0o600)
+        env = patch.dict(os.environ, {'MIC_AUTH_TOKEN_FILE':str(token)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.addCleanup(self.token_dir.cleanup)
         self.seen = []
         self.limits = dict(sentences_per_line=2, words_per_line=40, characters_per_line=300)
         self.result = {'outcome': 'spoken'}
@@ -41,10 +52,12 @@ class HelperTests(unittest.TestCase):
         owner = self
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                owner.assertEqual(self.headers['Authorization'], 'Bearer '+'synthetic-speech-helper-credential-'+'x'*32)
                 self.send_response(200)
                 self.end_headers()
                 self.wfile.write(json.dumps({'speaker':{'rules':{'replies':owner.limits}}}).encode())
             def do_POST(self):
+                owner.assertEqual(self.headers['Authorization'], 'Bearer '+'synthetic-speech-helper-credential-'+'x'*32)
                 owner.seen.append((self.path, json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
                 time.sleep(owner.delay)
                 self.send_response(200)

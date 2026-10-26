@@ -1,6 +1,7 @@
 'use strict';
 const fs=require('node:fs');
 const {createRoomMicTurns}=require('../renderer/room_mic_turns');
+const {micAuthHeaders,localMicUrl,fetchMic}=require('../main/mic_auth');
 async function main(){
   const [endpoint,deliveryPath,eventsPath,outputPath]=process.argv.slice(2);
   const delivery=JSON.parse(fs.readFileSync(deliveryPath,'utf8'));
@@ -9,7 +10,7 @@ async function main(){
   const outcomes=[];
   const tracker=createRoomMicTurns({api:async(method,path,body)=>{
     calls.push({method,path,body});
-    const response=await fetch(endpoint+path,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const response=await fetchMic(localMicUrl(endpoint)+path,{method,headers:{'Content-Type':'application/json',...micAuthHeaders({})},body:JSON.stringify(body)});
     return response.json();
   },onOutcome:result=>outcomes.push(result)});
   tracker.register(delivery.turn);

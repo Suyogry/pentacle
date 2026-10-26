@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const {buildCc} = require('../renderer/web_cc');
 const {createCcHandlers,createCollector}=require('../main/cc_handlers');
 const {createMicStarter}=require('../server/mic_starter');
-const config={features:{mic:true},mic:{autoSpawn:false,startCommand:{file:'/trusted/helper',args:['literal $arg']}}};
+const config={features:{mic:true},mic:{tokenPath:'/private/synthetic-mic.token',autoSpawn:false,startCommand:{file:'/trusted/helper',args:['literal $arg']}}};
 test('web Start calls the existing RPC without accepting caller commands',async()=>{
  const calls=[];const transport={call:async(...a)=>{calls.push(a);return {ok:true};},fire(){},on(){}};
  const cc=buildCc(transport,{config,clipboard:{}});
@@ -16,7 +16,7 @@ test('server-owned launcher is omitted from browser configuration',()=>{
  assert.equal(config.mic.startCommand.file,'/trusted/helper');
 });
 test('concurrent starts execute once, use argv without shell, and wait for helper readiness',async()=>{
- let finish,calls=0; const starter=createMicStarter(config,{execFile:(file,args,opts,cb)=>{calls++;assert.equal(file,'/trusted/helper');assert.deepEqual(args,['literal $arg']);assert.equal(opts.shell,false);assert.equal(opts.windowsHide,true);assert.equal(opts.timeout,75000);finish=cb;}});
+ let finish,calls=0; const starter=createMicStarter(config,{execFile:(file,args,opts,cb)=>{calls++;assert.equal(file,'/trusted/helper');assert.deepEqual(args,['literal $arg']);assert.equal(opts.env.MIC_AUTH_TOKEN_FILE,'/private/synthetic-mic.token');assert.equal(opts.shell,false);assert.equal(opts.windowsHide,true);assert.equal(opts.timeout,75000);finish=cb;}});
  const a=starter(),b=starter();assert.equal(calls,1);
  finish(null,'{"ok":true,"ready":true}','');
  assert.deepEqual(await a,{ok:true});assert.deepEqual(await b,{ok:true});

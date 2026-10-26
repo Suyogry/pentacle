@@ -1,3 +1,4 @@
+from mic_http import read_token, auth_headers
 import pytest
 
 
@@ -236,11 +237,11 @@ def test_model_wait_does_not_block_http_off_or_status(monkeypatch):
     def stop(): listener.running=False;listener.wake.invalidate()
     listener.stop=stop
     monkeypatch.setattr(mic_server,'stop_all',stop)
-    server=HTTPServer(('127.0.0.1',0),mic_server.MicHandler);thread=threading.Thread(target=server.serve_forever);thread.start()
+    server=HTTPServer(('127.0.0.1',0),mic_server.MicHandler);server.mic_token=read_token();thread=threading.Thread(target=server.serve_forever);thread.start()
     try:
         base=f'http://127.0.0.1:{server.server_port}'
-        with urlopen(base+'/status',timeout=1) as r: assert json.load(r)['local_actions']['last']['state']=='classifying'
-        with urlopen(Request(base+'/mode/off',data=b'{}',headers={'Content-Type':'application/json'}),timeout=1) as r:assert r.status==200
+        with urlopen(Request(base+'/status',headers=auth_headers()),timeout=1) as r: assert json.load(r)['local_actions']['last']['state']=='classifying'
+        with urlopen(Request(base+'/mode/off',data=b'{}',headers={'Content-Type':'application/json', **auth_headers()}),timeout=1) as r:assert r.status==200
         assert worker.is_alive() and not listener.running
         release.set();worker.join(2);assert not listener.wake.pending
     finally:

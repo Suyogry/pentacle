@@ -1,6 +1,7 @@
 'use strict';
 const path = require('node:path');
 const { execFile } = require('node:child_process');
+const { micTokenPath } = require('../main/mic_auth');
 
 // Host-owned configuration only. No command or argument is accepted from RPC.
 function createMicStarter(config, deps = {}) {
@@ -13,9 +14,13 @@ function createMicStarter(config, deps = {}) {
     if (!command || typeof command.file !== 'string' || !path.isAbsolute(command.file)
       || !Array.isArray(command.args) || !command.args.every(a => typeof a === 'string'))
       return Promise.resolve({ ok: false, error: 'Microphone recovery is not configured on this host.' });
+    let tokenPath;
+    try { tokenPath = micTokenPath(config); }
+    catch { return Promise.resolve({ ok: false, error: 'Microphone credential is not configured on this host.' }); }
     if (pending) return pending;
     pending = new Promise(resolve => {
-      execute(command.file, [...command.args], { shell: false, windowsHide: true, timeout: 75000, killSignal: 'SIGKILL', maxBuffer: 16384 }, (error, stdout) => {
+      execute(command.file, [...command.args], { shell: false, windowsHide: true, timeout: 75000, killSignal: 'SIGKILL', maxBuffer: 16384,
+        env: { ...process.env, MIC_AUTH_TOKEN_FILE: tokenPath } }, (error, stdout) => {
         if (error) return resolve({ ok: false, error: error.killed
           ? 'Microphone startup timed out. Check the microphone connection and retry.'
           : 'Microphone could not start. Check the local service log and microphone connection.' });

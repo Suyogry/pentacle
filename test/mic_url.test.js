@@ -103,12 +103,16 @@ test('test_should_spawn_local_mic_server_truth_table', () => {
 });
 
 
- test('external mic service probe returns a boolean and honors stream-host routing', async () => {
+test('authenticated probe uses loopback and never follows redirects', async () => {
   const { probeMicServer } = require('../main/mic-url');
-  const config = { features: { mic: true }, mic: { useStreamHost: true }, chatStream: { url: 'ws://peer.example:7791' } };
-  let requested;
-  assert.equal(await probeMicServer(config, async (url) => { requested = url; return { ok: true }; }), true);
-  assert.equal(requested, 'http://peer.example:7780/status');
-  assert.equal(await probeMicServer(config, async () => { throw Error('offline'); }), false);
-  assert.equal(await probeMicServer({ features: { mic: false } }, async () => { throw Error('must not request'); }), false);
+  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mic-probe-'));
+  const file=path.join(dir,'mic.token');const token='x'.repeat(43);
+  fs.writeFileSync(file,token,{mode:0o600});
+  try {
+    const config={features:{mic:true},mic:{tokenPath:file},micServerUrl:'http://127.0.0.1:7780'};
+    assert.equal(await probeMicServer(config, async (url,opts)=>{assert.equal(url,'http://127.0.0.1:7780/status');assert.equal(opts.headers.Authorization,'Bearer '+token);assert.equal(opts.redirect,'error');return {ok:true};}),true);
+    assert.equal(await probeMicServer(config,async()=>{throw Error('offline');}),false);
+    assert.equal(await probeMicServer({...config,micServerUrl:'http://peer.example:7780'},async()=>{throw Error('must not connect');}),false);
+    assert.equal(await probeMicServer({features:{mic:false}},async()=>{throw Error('must not connect');}),false);
+  } finally {fs.rmSync(dir,{recursive:true,force:true});}
 });

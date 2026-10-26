@@ -323,3 +323,45 @@ def test_request_result_survives_older_sha_cache_expiry(tmp_path):
         await subject.transcribe_blob(request_id='second', blob_sha=sha, mime='audio/mp4')
         assert len(poster.calls) == 1
     asyncio.run(run())
+
+
+def test_native_http_transport_authenticates_and_rejects_redirects(tmp_path, monkeypatch):
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from transcribe import _urllib_post
+    token = tmp_path/'mic.token'
+    token.write_text('synthetic-transcriber-secret-'+'x'*32)
+    token.chmod(0o600)
+    monkeypatch.setenv('MIC_AUTH_TOKEN_FILE', str(token))
+    seen = []
+    class Backend(BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append((self.path, self.headers.get('Authorization'), self.rfile.read(int(self.headers['Content-Length']))))
+            if self.path == '/redirect':
+                self.send_response(307)
+                self.send_header('Location', '/leak')
+            else:
+                self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{}')
+        def log_message(self, *args): pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Backend)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_port}'
+    try:
+        assert _urllib_post(base+'/transcribe?prompt_profile=fleet', data=b'audio', content_type='audio/wav', timeout=2) == (200, b'{}')
+        assert seen == [('/transcribe?prompt_profile=fleet', 'Bearer '+token.read_text(), b'audio')]
+        assert _urllib_post(base+'/redirect', data=b'audio', content_type='audio/wav', timeout=2)[0] == 307
+        assert len(seen) == 2 and all(path != '/leak' for path, _, _ in seen)
+        monkeypatch.delenv('MIC_AUTH_TOKEN_FILE')
+        with pytest.raises(ConnectionError, match='credential'):
+            _urllib_post(base+'/transcribe', data=b'audio', content_type='audio/wav', timeout=2)
+        assert len(seen) == 2
+        with pytest.raises(ConnectionError):
+            _urllib_post('http://remote.example/transcribe', data=b'audio', content_type='audio/wav', timeout=2)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)

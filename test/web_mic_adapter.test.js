@@ -15,10 +15,18 @@ test('mic operations require same-origin websocket admission',async()=>{
  bridge.removeSocket(socket);bridge.addSocket(socket,{micStartAllowed:true});await bridge.handleMessage(socket,JSON.stringify({id:2,method:'mic:request',args:['GET','/status']}));assert.equal(calls,1);bridge.closeAll();
 });
 const {createMicRequest}=require('../main/mic_request');
+const fs=require('node:fs'),os=require('node:os'),path=require('node:path');
+const tokenDir=fs.mkdtempSync(path.join(os.tmpdir(),'mic-adapter-auth-'));
+const tokenPath=path.join(tokenDir,'mic.token');
+const token='synthetic-private-microphone-token-'+'x'.repeat(32);
+fs.writeFileSync(tokenPath,token,{mode:0o600});
+const priorTokenFile=process.env.MIC_AUTH_TOKEN_FILE;
+process.env.MIC_AUTH_TOKEN_FILE=tokenPath;
+test.after(()=>{if(priorTokenFile===undefined)delete process.env.MIC_AUTH_TOKEN_FILE;else process.env.MIC_AUTH_TOKEN_FILE=priorTokenFile;fs.rmSync(tokenDir,{recursive:true,force:true});});
 const http=require('node:http');
 test('host adapter reaches configured service and forwards existing response/error shape',async()=>{
  const seen=[];
- const server=http.createServer((req,res)=>{let body='';req.on('data',c=>body+=c);req.on('end',()=>{seen.push([req.method,req.url,body]);res.setHeader('Content-Type','application/json');if(req.url==='/copy/start'){res.statusCode=409;res.end('{"error":"wake active"}');}else res.end('{"mode":"off","ok":true}');});});
+ const server=http.createServer((req,res)=>{let body='';req.on('data',c=>body+=c);req.on('end',()=>{assert.equal(req.headers.authorization,'Bearer '+token);seen.push([req.method,req.url,body]);res.setHeader('Content-Type','application/json');if(req.url==='/copy/start'){res.statusCode=409;res.end('{"error":"wake active"}');}else res.end('{"mode":"off","ok":true}');});});
  await new Promise(r=>server.listen(0,'127.0.0.1',r));
  try {
   const request=createMicRequest({features:{mic:true},micServerUrl:`http://127.0.0.1:${server.address().port}`});
@@ -46,7 +54,7 @@ test('every browser mic call shape survives real JSON websocket transport',async
  global.WebSocket=previousWebSocket||require('ws');
  let backend,wire,ws,bridge,transport;
  try {
- const seen=[];backend=http.createServer((req,res)=>{let body='';req.on('data',c=>body+=c);req.on('end',()=>{seen.push([req.method,req.url,body]);res.setHeader('Content-Type','application/json');res.end('{"ok":true,"mode":"off"}');});});
+ const seen=[];backend=http.createServer((req,res)=>{let body='';req.on('data',c=>body+=c);req.on('end',()=>{assert.equal(req.headers.authorization,'Bearer '+token);seen.push([req.method,req.url,body]);res.setHeader('Content-Type','application/json');res.end('{"ok":true,"mode":"off"}');});});
  await new Promise(r=>backend.listen(0,'127.0.0.1',r));
  const request=createMicRequest({features:{mic:true},micServerUrl:`http://127.0.0.1:${backend.address().port}`});
  bridge=createWsBridge({table:{'mic:request':{mode:'invoke',handler:(_e,...args)=>request(...args)},'mic:start-server':{mode:'invoke',handler:()=>true}}});

@@ -110,8 +110,9 @@ provider models and effort. See [daemon setup](../services/chat-stream-v2/README
 | `features.assistantDirectTarget` | Object; absent | Optional temporary **web entry** alias: `{sourceStreamId, streamId, generation}`. The protected composite source row opens the exact ordinary target stream and generation when that target is online. Keep actual IDs in an ignored private web profile. Removing the object restores the prior entry route. |
 | `features.rawTmux` | Boolean; example false | Retained compatibility flag; currently unused. |
 | `mic` | Object; absent | Optional microphone settings below. |
-| `micServerUrl` | String; `http://127.0.0.1:7780` | Mic HTTP endpoint unless useStreamHost is enabled. |
-| `mic.useStreamHost` | Boolean; false | Derive `http://<chatStream.url hostname>:7780`. Missing/invalid chatStream URL falls back to micServerUrl. |
+| `micServerUrl` | String; `http://127.0.0.1:7780` | Loopback HTTP origin reached by the host; remote destinations, URL credentials/base paths and redirects are refused. |
+| `mic.tokenPath` | Absolute path or `~/…`; absent | Private mode-0600 token file; falls back to host environment `MIC_AUTH_TOKEN_FILE`. Never sent to the browser. |
+| `mic.useStreamHost` | Boolean; false | Legacy hostname derivation; usable only when the derived address is loopback. Remote viewers use a web host colocated with the mic backend. |
 | `mic.alwaysOnEnabled` | Boolean; false | Show the always-on controls. |
 | `mic.autoSpawn` | Boolean; helper default true | Compatibility-only in public main: the desktop probes the service; it does not start a mic server. |
 | `wakeWord` | String; absent | Text displayed in the sleeping mic state. Set it to the server's actual configured wake word. |
@@ -127,14 +128,7 @@ setting does not redirect the mobile app or change composite daemon delivery.
 Record the binding before changing it and update or remove it when the target
 conversation hands off; no successor is selected automatically.
 
-Microphone controls require an independently installed, running compatible HTTP
-service implementing the [mic-server contract](../mic-server/README.md). The
-public repository does not ship a microphone server; keep `features.mic: false`
-unless you operate that endpoint yourself.
-Set its URL (or useStreamHost), verify its `/status` response, then enable mic.
-For a hosted web profile, explicitly set `micServerUrl` to the endpoint reachable
-**from the web server**. A service on that same host uses
-`http://127.0.0.1:7780`; this is server loopback, not the browser viewer’s host.
+Microphone controls require the independently provisioned optional [mic service](../mic-server/README.md). Keep `features.mic: false` until [credential setup and migration](mic_api_security.md) is complete. Configure `mic.tokenPath` or `MIC_AUTH_TOKEN_FILE`, then verify authenticated status. Web profiles with mic enabled also require token or Tailscale web authentication, even on loopback. Set `micServerUrl` to the service on the web host's machine, normally `http://127.0.0.1:7780`.
 The browser sends allow-listed mic operations through its authenticated,
 same-origin WebSocket (`cc.micRequest`), so HTTPS viewers do not contact an HTTP
 backend directly. This controls the server’s hardware microphone; it does not

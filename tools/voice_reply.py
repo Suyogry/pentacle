@@ -6,6 +6,10 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "mic-server"))
+from mic_http import make_request
 
 from tools.voice_line import check_line, check_expects_answer, limit_refusal, DEFAULT_LIMITS
 
@@ -28,7 +32,7 @@ def submit_line(conversation_id, kind, text, action=None, final=False, endpoint=
         if url.scheme != "http" or url.hostname not in {"127.0.0.1", "::1", "localhost"} or url.username or url.password or url.query or url.fragment or url.path not in {"", "/"}:
             return {"outcome": "refused", "reason": "nonlocal_endpoint"}
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-        with opener.open(base.rstrip('/')+'/status', timeout=3) as response:
+        with opener.open(make_request(base, '/status'), timeout=3) as response:
             status = json.loads(response.read(131073))
         replies = status['speaker']['rules']['replies']
         limits = {key:replies[key] for key in DEFAULT_LIMITS}
@@ -45,7 +49,7 @@ def submit_line(conversation_id, kind, text, action=None, final=False, endpoint=
             payload["expects_answer"] = True
         if action is not None:
             payload["action"] = action
-        request = urllib.request.Request(base.rstrip('/') + '/speak', data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
+        request = make_request(base, '/speak', data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}, method="POST")
         # No proxy, redirect or shell can send this line somewhere else.
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
         try:

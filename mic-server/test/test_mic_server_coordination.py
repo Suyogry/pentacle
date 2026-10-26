@@ -1,3 +1,4 @@
+from mic_http import read_token, auth_headers
 import contextlib
 import importlib
 import io
@@ -78,12 +79,13 @@ class FakeAlwaysOnListener:
 class MicServerTestCase(unittest.TestCase):
     def setUp(self):
         self._reset_state()
+        self.auth = auth_headers()
         self.popen_lines = []
         self.popen_calls = []
         self.last_proc = None
         self.popen_delay = 0
         self.popen_entered = None
-        self.env = mock.patch.dict(os.environ, {}, clear=True)
+        self.env = mock.patch.dict(os.environ, {"MIC_AUTH_TOKEN_FILE": os.environ["MIC_AUTH_TOKEN_FILE"]}, clear=True)
         self.env.start()
         self.audio_module = mock.patch.dict(sys.modules, {
             'audio_device': SimpleNamespace(refresh_audio_backend=lambda: None),
@@ -97,6 +99,7 @@ class MicServerTestCase(unittest.TestCase):
         self.popen.start()
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), mic_server.MicHandler)
+        self.server.mic_token = read_token()
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -145,7 +148,7 @@ class MicServerTestCase(unittest.TestCase):
         mic_server.audio_health.reset()
 
     def get(self, path):
-        with urllib.request.urlopen(self.base + path, timeout=3) as resp:
+        with urllib.request.urlopen(urllib.request.Request(self.base + path, headers=self.auth), timeout=3) as resp:
             return resp.status, json.loads(resp.read().decode())
 
     def post(self, path, body=None):
@@ -154,7 +157,7 @@ class MicServerTestCase(unittest.TestCase):
             self.base + path,
             data=data,
             method="POST",
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **self.auth},
         )
         try:
             with urllib.request.urlopen(req, timeout=3) as resp:

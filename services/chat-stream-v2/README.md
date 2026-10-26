@@ -508,3 +508,10 @@ leases survive daemon restarts in the session database and release atomically
 when their holder closes, including presumed-dead closes. There is no input
 locking or presence detection. Consumers must acquire before visible actions
 and release their acquired lease IDs in a `finally` block.
+
+## Microphone backend credentials
+
+Audio transcription forwards to the private loopback mic backend. Set
+`MIC_AUTH_TOKEN_FILE` in the daemon's actual launch environment, matching the
+backend's owner-only mode-0600 credential file. Remote URLs and redirects are
+refused; missing credentials fail closed. See [mic setup and migration](../../docs/mic_api_security.md).

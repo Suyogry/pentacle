@@ -4,7 +4,7 @@ from datetime import datetime
 import json
 import math
 import time
-from urllib.request import Request, urlopen
+from mic_http import make_request, open_request
 
 
 def utc_seconds(value):
@@ -16,8 +16,8 @@ def utc_seconds(value):
 
 def request(path, body=None):
     data = None if body is None else json.dumps(body).encode()
-    req = Request('http://127.0.0.1:7780'+path, data=data, headers={'Content-Type': 'application/json'})
-    with urlopen(req, timeout=15) as response:
+    req = make_request('http://127.0.0.1:7780', path, data=data, headers={'Content-Type': 'application/json'})
+    with open_request(req, timeout=15) as response:
         return json.load(response)
 
 

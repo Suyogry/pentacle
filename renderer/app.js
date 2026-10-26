@@ -22,7 +22,6 @@ const { configuredAssistantRole, isConfiguredAssistant, isCompositeAssistant } =
 const { resolveAssistantDirectTarget } = require('./assistant_direct_entry');
 const { createClosedChatSlots } = require('./closed_chat_slots');
 const { applyVersionedConnectionState } = require('./chat_stream_connection_state');
-const { resolveMicUrl } = require('../main/mic-url');
 const { createSpawnCatalogLoader } = require('./spawn_catalog_loader');
 const { createProviderRelogin } = require('./provider_relogin_ui');
 const householdSelectors = require('./household/selectors');
@@ -8030,7 +8029,6 @@ startMachineStatsStaleReevaluation();
 
 // ── Mic API ──────────────────────────────────────────────────
 
-const MIC_API = resolveMicUrl(CONFIG);
 
 function resolveLocalMicCaller() {
   return hostPresentation.localIdentity(CONFIG);
@@ -8042,17 +8040,7 @@ function micModeBody(extra = {}) {
 
 async function micApi(method, path, body) {
   try {
-    if (window.cc.micRequest) return await window.cc.micRequest(method, path, body);
-    const opts = { method };
-    if (body !== undefined) {
-      opts.headers = { 'Content-Type': 'application/json' };
-      opts.body = JSON.stringify(body);
-    }
-    const r = await fetch(MIC_API + path, opts);
-    let data = null;
-    try { data = await r.json(); } catch {}
-    if (!r.ok) return { ...(data || {}), ok: false, status: r.status };
-    return data;
+    return await window.cc.micRequest(method, path, body);
   } catch (e) {
     return null;
   }

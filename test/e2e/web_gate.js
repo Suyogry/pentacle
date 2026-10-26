@@ -19,7 +19,7 @@ const { headlessChromeArgs } = require('./lib/chrome_launch.cjs');
 
 const fs = require('fs');
 const net = require('net');
-const { randomBytes } = require('crypto');
+const { randomBytes, createHash } = require('crypto');
 const os = require('os');
 const path = require('path');
 const { spawn, execFileSync } = require('child_process');
@@ -517,8 +517,23 @@ async function runIsolated(args, runtimeDir, cleanupRuntime) {
     } : null;
 
     // Scenario-scoped mic profile (hermetic runs only); false restores the default.
+    let preMicAuthArgs = null;
     const configureMic = fixture ? async enabled => {
       const mic = enabled ? { micServerUrl: `http://127.0.0.1:${await freePort()}`, hostNames: { local: 'Gate Room' } } : null;
+      if (enabled) {
+        preMicAuthArgs = [...hostAuthArgs];
+        const token = randomBytes(32).toString('hex');
+        const tokenFile = path.join(scratch, 'mic-scenario-web.token');
+        fs.writeFileSync(tokenFile, token, { mode: 0o600 });
+        hostAuthArgs = ['--token-file', tokenFile];
+        await session.send('Network.setCookie', { name: 'pentacle_web',
+          value: createHash('sha256').update(token).digest('hex'), url,
+          httpOnly: true, sameSite: 'Strict' });
+      } else {
+        hostAuthArgs = preMicAuthArgs || [];
+        preMicAuthArgs = null;
+        await session.send('Network.deleteCookies', { name: 'pentacle_web', url });
+      }
       writeProfile(scratch, daemon.port, runtime.modelerFixture.url, null, mic);
       await restartHost();
       await session.send('Page.navigate', { url });

@@ -13,7 +13,8 @@ import plistlib
 import subprocess
 import time
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from mic_http import make_request, open_request
 
 DEADLINE_SECS = 70          # web starter kills the helper at 75 s
 PROBE_TIMEOUT_SECS = 3
@@ -38,8 +39,14 @@ def ready(status):
 
 def status(timeout=PROBE_TIMEOUT_SECS):
     try:
-        with urlopen(f'http://127.0.0.1:{PORT}/status', timeout=timeout) as response:
+        with open_request(make_request(f'http://127.0.0.1:{PORT}', '/status'), timeout=timeout) as response:
             return json.load(response)
+    except HTTPError as exc:
+        # A responding protected service is not dead. Never restart it because
+        # a client has stale credentials or reached the wrong endpoint.
+        raise RuntimeError('Microphone probe was refused; check the private credential and endpoint') from exc
+    except ValueError as exc:
+        raise RuntimeError('Microphone probe credential is not configured securely') from exc
     except Exception:
         return None
 

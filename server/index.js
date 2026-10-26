@@ -452,6 +452,10 @@ async function main(argv = process.argv.slice(2)) {
     CONFIG.chatStream = { ...(CONFIG.chatStream || {}), tokenPath: args.tokenPath };
   }
 
+  if (CONFIG.features?.mic && !auth) {
+    throw new Error('Microphone features require web authentication: use --token-file or --auth tailscale.');
+  }
+
   // Freeze the served dist and derive the build id once, before any request.
   const frozen = freezeWebDist(WEB_DIST);
   const ccHandlers = createCcHandlers({ CONFIG, chatStreamClient, configError, configWarnings,

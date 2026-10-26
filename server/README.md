@@ -85,6 +85,12 @@ node server --profile workstation \
 
 ## HTTP
 
+With `features.mic` enabled, web authentication is required even on loopback:
+use `--token-file` or `--auth tailscale`. Mic operations use the same-origin
+`/cc` bridge. Configure the separate backend credential with `mic.tokenPath`
+or `MIC_AUTH_TOKEN_FILE`; it never reaches the browser. The backend must run
+on this web host's loopback interface. See [mic authentication and migration](../docs/mic_api_security.md).
+
 | Route | Purpose |
 |---|---|
 | `/` | `renderer/dist/web/web.html` with the computed config injected as `window.__PENTACLE_CONFIG__` |

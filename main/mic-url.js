@@ -27,10 +27,12 @@ function shouldSpawnLocalMicServer(CONFIG) {
   return !!(CONFIG && CONFIG.features && CONFIG.features.mic && !(CONFIG.mic && CONFIG.mic.useStreamHost) && !(CONFIG.mic && CONFIG.mic.autoSpawn === false));
 }
 
-async function probeMicServer(config, fetchStatus = fetch) {
+async function probeMicServer(config, fetchStatus) {
   if (!config?.features?.mic) return false;
   try {
-    const response = await fetchStatus(`${resolveMicUrl(config)}/status`, { signal: AbortSignal.timeout(2000) });
+    const { micAuthHeaders, localMicUrl, fetchMic } = require('./mic_auth');
+    const response = await (fetchStatus || fetchMic)(`${localMicUrl(resolveMicUrl(config))}/status`, {
+      redirect: 'error', headers: micAuthHeaders(config), signal: AbortSignal.timeout(2000) });
     return response.ok;
   } catch { return false; }
 }
