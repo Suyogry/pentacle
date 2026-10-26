@@ -63,6 +63,27 @@
     "completed_at": "2026-10-26"
   },
   {
+    "id": "spec_upstream_sync_20261026",
+    "path": "work/completed/pentacle__upstream_sync_20261026/spec.md",
+    "title": "Pull official Pentacle main while preserving fork security fixes",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/completed/pentacle__upstream_sync_20261026/spec.md",
+    "tags": [
+      "maintenance",
+      "upstream"
+    ],
+    "summary": "Merge the official main branch into the local fork without discarding its security commits.",
+    "related": [
+      "work_upstream_sync_20261026"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-26"
+  },
+  {
     "id": "work_daemon_auth",
     "path": "work/completed/pentacle__daemon_auth/summary.md",
     "title": "Require credentials for local daemon clients",
@@ -119,6 +140,27 @@
     "summary": "Require private credentials and reject browser-origin access to the microphone backend.",
     "related": [
       "spec_mic_api_auth"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-26"
+  },
+  {
+    "id": "work_upstream_sync_20261026",
+    "path": "work/completed/pentacle__upstream_sync_20261026/summary.md",
+    "title": "Pull official Pentacle main while preserving fork security fixes",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/completed/pentacle__upstream_sync_20261026/summary.md",
+    "tags": [
+      "maintenance",
+      "upstream"
+    ],
+    "summary": "Merge the official main branch into the local fork without discarding its security commits.",
+    "related": [
+      "spec_upstream_sync_20261026"
     ],
     "status": "completed",
     "machine": "local",
