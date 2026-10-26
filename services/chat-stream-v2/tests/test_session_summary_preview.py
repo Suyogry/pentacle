@@ -191,6 +191,8 @@ def test_startup_tail_bound_and_same_name_reopen(tmp_path):
 @pytest.mark.parametrize("events_mode", ["summary", "full"])
 def test_summary_wire_list_inventory_and_restart(tmp_path, events_mode):
     import websockets
+    from _shared.operator_auth import OperatorCredentialRegistry
+    from _shared.operator_client import operator_hello
     from inventory import InventoryEmitter
     from server import Server
     from ingest import append_ingested_event
@@ -204,6 +206,15 @@ def test_summary_wire_list_inventory_and_restart(tmp_path, events_mode):
 
     async def run():
         database = tmp_path / "wire.db"
+        # Exercise the public wire through this fork's mandatory authentication.
+        # Each connection/restart proves possession against its fresh challenge.
+        auth_dir = tmp_path / "auth"
+        auth_dir.mkdir(mode=0o700)
+        credentials = OperatorCredentialRegistry(auth_dir / "registry.json")
+        _, envelope = credentials.issue("pentacle", label="summary-preview-test")
+        token_path = auth_dir / "operator.token"
+        token_path.write_text(envelope)
+        token_path.chmod(0o600)
         for restart in (False, True):
             store = Store(str(database))
             store.start()
@@ -217,12 +228,14 @@ def test_summary_wire_list_inventory_and_restart(tmp_path, events_mode):
                     await store.append_session_event("fixture:chat", event("Initial"), identity="initial", limit=500)
                 await sessions.refresh()
                 server = Server(port=0, store=store, sessions=sessions, local_host="fixture")
+                server.operator_credential_registry = credentials
                 server.inventory_ready.set()
                 port = await server.bind()
                 emitter = InventoryEmitter(sessions, server.broadcast, min_interval_s=0)
                 async with websockets.connect(f"ws://127.0.0.1:{port}") as socket:
-                    await socket.send(json.dumps({"type": "hello", "client": "summary-preview-test",
-                        "subscribe": {"all": True, "include_subagents": True, "events_mode": events_mode}}))
+                    welcome = await receive(socket, "welcome")
+                    await socket.send(json.dumps(operator_hello(welcome, token_path=token_path,
+                        subscribe={"all": True, "include_subagents": True, "events_mode": events_mode})))
                     snapshot = await receive(socket, "snapshot")
                     rows = {row["stream_id"]: row for row in snapshot["sessions"]}
                     if events_mode == "summary":
