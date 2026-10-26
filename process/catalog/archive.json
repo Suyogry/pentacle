@@ -21,6 +21,26 @@
     "completed_at": "2026-10-26"
   },
   {
+    "id": "spec_electron_isolation",
+    "path": "work/completed/pentacle__electron_isolation/spec.md",
+    "title": "Isolate Electron renderers while preserving desktop workflows",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/completed/pentacle__electron_isolation/spec.md",
+    "tags": [
+      "security",
+      "electron"
+    ],
+    "summary": "Sandbox the desktop display and preserve its existing privileged API and agent autonomy.",
+    "related": [
+      "work_electron_isolation"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer"
+  },
+  {
     "id": "spec_mic_api_auth",
     "path": "work/completed/pentacle__mic_api_auth/spec.md",
     "title": "Authenticate the microphone API and proxy browser clients",
@@ -61,6 +81,26 @@
     "machine": "local",
     "owner": "maintainer",
     "completed_at": "2026-10-26"
+  },
+  {
+    "id": "work_electron_isolation",
+    "path": "work/completed/pentacle__electron_isolation/summary.md",
+    "title": "Isolate Electron renderers while preserving desktop workflows",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/completed/pentacle__electron_isolation/summary.md",
+    "tags": [
+      "security",
+      "electron"
+    ],
+    "summary": "Sandbox the desktop display and preserve its existing privileged API and agent autonomy.",
+    "related": [
+      "spec_electron_isolation"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer"
   },
   {
     "id": "work_mic_api_auth",

@@ -77,3 +77,8 @@ smoke directories. Receipt SHA256:
 `c098aed64cb7ac248bd60b087cd9ad90a26d6eb33c18e0f7903f9cf0c4a50079`.
 Process metadata validates with zero errors and five pre-existing stale-work
 warnings; no new warning remains for this work item.
+
+Shipped source commit: `d4068baba0613f259193b64e853174375ef2bee9`. Personal fork main ref independently
+read back at that exact commit after push. The source/tests/docs patch content
+identity is unchanged from independent QA; lifecycle closure metadata follows
+in a separate commit. No personal runtime installation or activation occurred.

@@ -2,11 +2,11 @@
 id: spec_electron_isolation
 title: Isolate Electron renderers while preserving desktop workflows
 type: spec
-status: in_progress
+status: completed
 canonical: false
 created_at: '2026-10-26'
 updated_at: '2026-10-26'
-source_path: work/in_progress/pentacle__electron_isolation/spec.md
+source_path: work/completed/pentacle__electron_isolation/spec.md
 machine: local
 owner: maintainer
 tags: [security, electron]
@@ -53,8 +53,10 @@ Run full Node unit/renderer suite, desktop and web builds, relevant packaging co
 - [x] Existing desktop bridge methods/config/startup and core task workflows remain usable.
 - [x] Untrusted IPC senders/frames/documents and injected script paths fail closed.
 - [x] Agent authority and approval policy remain unchanged.
-- [ ] Tests, real desktop smoke, screenshot, build/docs, independent QA and push complete.
+- [x] Tests, real desktop smoke, screenshot, build/docs, independent QA and push complete.
 
-## Checkpoint
+## Closure
 
-Independent spec and final QA ACCEPT; final reviewer ran 73 independent checks. Frozen source/tests/docs diff 3217b0658bda71accc414287b257117e3b396d4d2d0de23dd4d7f0272cd1ed0a. Full Node gate passed 200 files / 2,461 passed / one Windows-only skip. Real desktop security/workflows/cleanup, macOS package/readback and web build passed. Evidence and limitations: [_artifacts/validation.md](_artifacts/validation.md). Next: commit and push source, then mark shipped and close metadata. Personal services remain stopped; package remains uninstalled.
+Shipped source commit `d4068baba0613f259193b64e853174375ef2bee9` to the personal fork's main; remote ref readback matches. All acceptance criteria are satisfied within the explicit macOS source-shipment scope. Personal services remain stopped and the built package is uninstalled. See [_artifacts/validation.md](_artifacts/validation.md) for the accepted evidence and platform/hardware bounds.
+
+Retrospective: Reusing the browser build preserved the UI while removing renderer Node access. Testing the actual sandboxed artifact exposed immutable-bridge config and harness assumptions that source-only checks miss. Keep test prerequisites complete and use a realistic per-file deadline for the existing Git integration suite.
