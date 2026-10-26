@@ -2,11 +2,12 @@
 id: spec_daemon_auth
 title: Require credentials for local daemon clients
 type: spec
-status: in_progress
+status: completed
 canonical: false
 created_at: '2026-10-26'
 updated_at: '2026-10-26'
-source_path: work/in_progress/pentacle__daemon_auth/spec.md
+completed_at: '2026-10-26'
+source_path: work/completed/pentacle__daemon_auth/spec.md
 machine: local
 owner: maintainer
 tags: [security, daemon]
@@ -52,19 +53,20 @@ Run focused daemon and CLI suites, Node auth/client regressions and web build. C
 - [x] Credentialed orchestrator retains full existing authority with automatic worker credentials.
 - [x] Revocation and missing/bad credentials fail closed, with no seat-to-operator fallback.
 - [x] CLI, web, launch, recovery and operational consumers migrate coherently.
-- [ ] Relevant checks, independent QA, migration docs and push complete.
+- [x] Relevant checks, independent QA, migration docs and push complete.
 
-## Checkpoint
+## Checkpoint and closure
 
-Spec review ACCEPT at the recorded base. Initial final review accepted server,
+Shipped source commit `6b68a998bd9cee0cb8939fefdedcee9b97bb327c` to origin/main and read back the
+matching remote SHA. The committed source diff matches the independently
+accepted digest above. Spec QA ACCEPT; initial final review accepted server,
 private loading, scoped egress and docs, and rejected two CLI identity migration
-defects. Fixed parent/handoff relationship fields being used as caller identity,
-and removed special operator fallback from worker maintenance. Four real-socket
-regressions cover these repairs. Bounded final repair review ACCEPT on the frozen
-candidate above (19 independent real-socket tests pass). Next action: commit
-and push the authorized source change. Source-only
-shipment; personal services remain stopped. A separate private orchestrator
-credential and launch-environment paths were verified offline.
+defects. Repaired caller/relationship separation and removed worker maintenance
+operator fallback; bounded final repair review ACCEPT with 19 independent
+actual-socket checks. The source working tree was clean after shipment. This
+closure record is a documentation follow-up. No runtime activation was requested
+or performed; personal services remain stopped. Private orchestrator credential
+and all three launch environments were verified offline without exposing keys.
 
 ## Validation disposition
 
@@ -77,3 +79,13 @@ credentials; they do not prove a real tmux/provider launch. The unrelated CLI
 installer's automatic macOS Python 3.13 discovery test lacks that interpreter;
 its supported explicit Python override passes a no-install dry run. No missing
 prerequisite has been represented as a passed certification gate.
+
+## Retro
+
+- Authenticate transport before dispatch and private fanout; locality is not identity.
+- Migrate worker provisioning and operator clients in the same source change.
+- Relationship targets must not select the caller's credential. Maintenance paths
+  must preserve worker identity rather than use ambient operator material.
+- Scope event grouping by stream as well as negotiated subscription settings.
+- Disposable WebSockets verify admission and revocation without starting providers;
+  they do not replace unavailable real tmux workflow certification.

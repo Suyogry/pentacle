@@ -21,3 +21,5 @@ The broad full CLI result predates only the bounded CLI identity repair; the 622
 Unavailable: tmux/native provider workflow certification; smoke autouse isolation fails before its test subject because tmux is absent; multi-bind macOS alias unprovisioned. No full certification claimed. Installer auto-discovery of a Python 3.13 executable is an unrelated environment prerequisite (one test deselected); explicit supported Python override verified without installing. Paid-provider, device and fleet runs were outside source shipment scope.
 
 The owned services were stopped throughout. Private launch files use a separate full operator credential for the orchestrator, with valid offline challenge/proof and owner-only files; no secret material is tracked.
+
+Shipped source `6b68a998bd9cee0cb8939fefdedcee9b97bb327c`; remote main readback matches. Source diff identity read back after commit still matches the accepted candidate above. Work tree clean before this closure metadata update.
