@@ -2,11 +2,12 @@
 id: spec_mic_api_auth
 title: Authenticate the microphone API and proxy browser clients
 type: spec
-status: in_progress
+status: completed
 canonical: false
 created_at: '2026-10-26'
 updated_at: '2026-10-26'
-source_path: work/in_progress/pentacle__mic_api_auth/spec.md
+completed_at: '2026-10-26'
+source_path: work/completed/pentacle__mic_api_auth/spec.md
 machine: local
 owner: maintainer
 tags: [security, microphone]
@@ -56,12 +57,23 @@ MicHandler serves transcripts and recording controls without authentication, acc
 - [x] UI never receives backend secrets or calls the backend directly; web auth required with mic enabled.
 - [x] Startup, credentials, URL handling, redirects, input sizes and recovery fail safely.
 - [x] Migration/setup documentation covers every required credential consumer and local-only transport.
-- [ ] Independent spec/final review and scoped verification complete, commit pushed to origin/main, clean tree.
+- [x] Independent spec/final review and scoped verification complete, commit pushed to origin/main, clean tree.
 
 ## Non-goals
 
 Agent permission policy, Electron isolation, dependency upgrades, device/model provisioning, fleet deployment and live recording/playback.
 
-## Checkpoint
+## Checkpoint and closure
 
-Implementation: independent spec QA ACCEPT (spec digest 216260051156cd8f74c59d66560e296c4f4953f1306d631ffeaf4bb0ff50adb8). Source implementation complete. Real HTTP + actual Node-host integration passes; portable mic suite 451 passed, one existing ffprobe-dependent case deselected after confirming missing tool. Final npm suite 199 files/2455 tests passes; independent final review ACCEPT. Next: commit/push reviewed source to origin/main, then close this record. Native Windows fails closed: use the POSIX backend/web host in WSL. No runtime activation.
+Shipped source: `7986a3b3a9f2e288711398f99f50acc90484ec49` was pushed to
+origin/main and verified against the remote ref. Runtime installation and
+activation were outside the user's request and were not performed. The source
+working tree was clean after shipment; this closure record is a documentation
+follow-up. Acceptance is scoped to the tests and limitations in the evidence.
+
+## Retro
+
+- Authentication must cover status/probes and every HTTP method before dispatch, not just recording routes.
+- Migrating all native callers and the web host together avoids an anonymous compatibility bypass.
+- Recovery must distinguish a refused authenticated service from a dead process.
+- Real HTTP plus the actual Node host verified the browser-to-backend boundary without opening devices.
