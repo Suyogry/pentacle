@@ -5,6 +5,7 @@ import argparse
 from xml.sax.saxutils import escape
 import hashlib
 import json
+import math
 import os
 import plistlib
 import pwd
@@ -21,6 +22,14 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from websockets.sync.client import connect
+
+# This process switches its own checkout during activation. Load every local
+# dependency first, including when invoked directly with deploy/ on sys.path.
+_SERVICE_DIR = str(Path(__file__).resolve().parent.parent)
+if _SERVICE_DIR not in sys.path:
+    sys.path.insert(0, _SERVICE_DIR)
+from deploy.packet.log_scan import AttributionAmbiguous, freeze, generation_ranges, lines_many
+from managed_logs import Config, retained_paths
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -285,6 +294,10 @@ def _new_restart_activation(
 GATE_REQUIRED_TIER = "merge"
 GATE_REQUIRED_EXECUTABLES = ("git", "tmux")
 GATE_SYSTEM_PATHS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin")
+# The inline gate runs under `env -i`, so run_gate.py would fall back to 900 s per
+# tier. Use the qualified v2-merge-capacity tier bounds (scripts/gate-env.json);
+# a caller's own V2_<TIER>_TIMEOUT_S still wins.
+DEPLOY_GATE_TIER_TIMEOUTS = {"V2_UNIT_TIMEOUT_S": "1200", "V2_SMOKE_TIMEOUT_S": "900"}
 
 
 def _effective_home() -> Path:
@@ -295,6 +308,18 @@ def _effective_home() -> Path:
 def _gate_path(repo: Path, service: ServiceConfig | None = None) -> str:
     paths = [str(_venv_python(repo, service).parent), *GATE_SYSTEM_PATHS]
     return os.pathsep.join(dict.fromkeys(paths))
+
+
+def _gate_tier_timeouts() -> dict[str, str]:
+    bounds = {name: os.environ.get(name, default) for name, default in DEPLOY_GATE_TIER_TIMEOUTS.items()}
+    for name, value in bounds.items():
+        try:
+            seconds = float(value)
+        except ValueError:
+            seconds = math.nan
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise DeployError(f"gate_timeout_invalid: {name}={value!r} must be a finite positive number of seconds")
+    return bounds
 
 
 def _gate_environment(repo: Path, service: ServiceConfig | None = None) -> dict[str, str]:
@@ -311,6 +336,7 @@ def _gate_environment(repo: Path, service: ServiceConfig | None = None) -> dict[
         "PATH": path,
         "PYTHON": str(python),
         "PYTHONNOUSERSITE": "1",
+        **_gate_tier_timeouts(),
     }
 
 
@@ -896,10 +922,6 @@ def _daemon_log_paths(service: ServiceConfig) -> tuple[Path, ...]:
 
 
 def _managed_log_config(service: ServiceConfig):
-    service_path = str(Path(__file__).resolve().parent.parent)
-    if service_path not in sys.path:
-        sys.path.insert(0, service_path)
-    from managed_logs import Config
     try:
         return Config.from_env(_launchd_environment(service.launchd_label))
     except ValueError as exc:
@@ -907,11 +929,6 @@ def _managed_log_config(service: ServiceConfig):
 
 
 def _frozen_log_ranges(path: Path, previous_size: LogOffsets | None, managed=None):
-    service_path = str(Path(__file__).resolve().parent.parent)
-    if service_path not in sys.path:
-        sys.path.insert(0, service_path)
-    from deploy.packet.log_scan import freeze
-    from managed_logs import retained_paths
     offset = _previous_log_offset(previous_size, path)
     if offset is None:
         raise ValueError("missing frozen start offset")
@@ -1228,7 +1245,6 @@ class _ManagedAppendedLogScanner:
         self.incomplete_reason: str | None = None
 
     def read_new(self) -> str:
-        from deploy.packet.log_scan import lines_many
         try:
             ranges = _frozen_log_ranges(self.path, self.previous, self.managed)
             if sum(item["bytes_read"] for item in ranges) > _MAX_SCAN_BYTES:
@@ -1275,8 +1291,6 @@ def _scan_slow_consumer_window(
     prior_start: str | None = None,
     runner: Runner,
 ) -> dict[str, object]:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from deploy.packet.log_scan import AttributionAmbiguous, generation_ranges, lines_many
     paths = _daemon_log_paths(service)
     inputs = []
     groups = []
