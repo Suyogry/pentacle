@@ -322,6 +322,9 @@ app.whenReady().then(async () => {
       activeCommands++;try{return await run(file,args,opts)}finally{activeCommands--;lastCommandFinished=Date.now()}
     } });
     ipcMain.handle("fixture:config", () => ({ sourceRoot, dependencyRoot, mode }));
+    // Legacy terminal wiring fixture uses Node to inspect source; production
+    // window isolation is tested separately by tools/public_desktop_smoke.py.
+    ipcMain.on("desktop:bootstrap", (event) => { event.returnValue = { config: {}, HOST: {} }; });
     win = new BrowserWindow({ width: 950, height: 700, show: true, webPreferences: { nodeIntegration: true, contextIsolation: false, sandbox: false, preload: path.join(sourceRoot, "preload.js") } });
     await win.loadFile(path.join(__dirname, "index.html"));
   } catch (error) {

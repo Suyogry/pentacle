@@ -220,7 +220,7 @@ test('Electron preload exposes householdCommand with the same invocation contrac
     },
     window: {}, process,
   };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8'), context,
+  require('./helpers/preload').run(fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8'), context,
     { filename: 'preload.js' });
   const fields = { event_id: 'fixture-event' };
   assert.equal(await context.window.cc.householdCommand('household.event.remove', fields), reply);

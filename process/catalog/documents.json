@@ -203,6 +203,26 @@
     "status": "stable"
   },
   {
+    "id": "spec_electron_isolation",
+    "path": "work/in_progress/pentacle__electron_isolation/spec.md",
+    "title": "Isolate Electron renderers while preserving desktop workflows",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/in_progress/pentacle__electron_isolation/spec.md",
+    "tags": [
+      "security",
+      "electron"
+    ],
+    "summary": "Sandbox the desktop display and preserve its existing privileged API and agent autonomy.",
+    "related": [
+      "work_electron_isolation"
+    ],
+    "status": "in_progress",
+    "machine": "local",
+    "owner": "maintainer"
+  },
+  {
     "id": "spec_pentacle_th_h1_2026_10",
     "path": "work/in_progress/pentacle__th-h1-bounded-root-suite/spec.md",
     "title": "TH-H1 bounded root suite",
@@ -301,6 +321,26 @@
     "status": "in_progress",
     "machine": "shared",
     "owner": "dot"
+  },
+  {
+    "id": "work_electron_isolation",
+    "path": "work/in_progress/pentacle__electron_isolation/summary.md",
+    "title": "Isolate Electron renderers while preserving desktop workflows",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/in_progress/pentacle__electron_isolation/summary.md",
+    "tags": [
+      "security",
+      "electron"
+    ],
+    "summary": "Sandbox the desktop display and preserve its existing privileged API and agent autonomy.",
+    "related": [
+      "spec_electron_isolation"
+    ],
+    "status": "in_progress",
+    "machine": "local",
+    "owner": "maintainer"
   },
   {
     "id": "work_pentacle_th_h1_2026_10",

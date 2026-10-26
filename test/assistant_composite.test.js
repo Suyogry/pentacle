@@ -169,7 +169,7 @@ async function wireRenderer(t, compositeMode = true, {
     if (name === './config-loader') return { loadConfig: () => ({ config: {} }) };
     return require(name);
   } };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8'), preload);
+  require('./helpers/preload').run(fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8'), preload);
   h.dom.window.cc.chatSendCorrelated = preload.window.cc.chatSendCorrelated;
   h.context.cc = h.dom.window.cc;
   h.context.crypto = h.dom.window.crypto;

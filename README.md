@@ -106,7 +106,7 @@ The private config selects `chatStream.url`, `chatStream.tokenPath`, host labels
 
 ### Desktop (deprecated)
 
-The Electron desktop app still starts from the same config, but it receives no upgrades and is not recommended for new users. Use Pentacle Web instead unless you already depend on the desktop app:
+The retained Electron desktop starts from the same config and is not recommended for new users. This fork hardens its renderer isolation; see [desktop security and compatibility](docs/electron_security.md). Use Pentacle Web instead unless you already depend on the desktop app:
 
 ```sh
 PENTACLE_CONFIG="$HOME/.config/pentacle/pentacle.config.js" npm start
@@ -115,14 +115,14 @@ PENTACLE_CONFIG="$HOME/.config/pentacle/pentacle.config.js" npm start
 ## Build and test
 
 ```sh
-npm run prestart                          # all renderer bundles
+npm run build:desktop                     # isolated desktop browser bundles
 npm test                                  # desktop unit/renderer tests
 python -m pytest services/chat-stream-v2/tests
 python -m pytest services/agent-orch/tests
 python tools/public_desktop_smoke.py       # real Electron + isolated daemon/provider
 ```
 
-The daemon tests exercise both Bash and Zsh remote shells; install both before running them (`sudo apt-get install bash zsh` on Debian/Ubuntu). The desktop smoke requires an available graphical desktop, tmux and lsof. It uses an isolated tmux socket, temporary credentials and deterministic provider JSONL; it never launches your paid provider CLI. The default Python suite excludes the explicitly marked long-running soak tier. Tests needing real provider CLIs are opt-in with `PENTACLE_LIVE_TESTS=1`.
+The daemon tests exercise both Bash and Zsh remote shells; install both before running them (`sudo apt-get install bash zsh` on Debian/Ubuntu). Build the desktop bundle before running its smoke. The desktop smoke requires an available graphical desktop, tmux and lsof. It uses an isolated tmux socket, temporary credentials and deterministic provider JSONL; it never launches your paid provider CLI. The default Python suite excludes the explicitly marked long-running soak tier. Tests needing real provider CLIs are opt-in with `PENTACLE_LIVE_TESTS=1`.
 
 The certified daemon runner is `python services/chat-stream-v2/tools/run_gate.py merge` from a clean Git checkout. It runs unit and socket smoke tiers and writes evidence outside the repository. On macOS its multi-bind preflight requires the documented [loopback alias](services/chat-stream-v2/deploy/loopback-alias/README.md). CI runs these same public checks.
 

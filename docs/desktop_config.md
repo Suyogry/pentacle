@@ -155,7 +155,7 @@ characters. See [limits health contract](#limits-health-contract).
 | `terminal` | Xterm theme object; bundled example | Terminal colours. Recognized fields: background, foreground, cursor, cursorAccent, selectionBackground; black/red/green/yellow/blue/magenta/cyan/white and their bright-prefixed counterparts. Exact bundled hex defaults are in the example. Missing objects are backfilled; partial objects are not deep-merged. |
 | `artifactDirs` | String array; `[<working directory>/test/artifacts]` | Search roots for the retained local UI-review artifact helper. Leading `~` is expanded. |
 | `repoRoots` | String array; `[]` | Additional repository parents for the artifact helper; scans each child repository's .ui-review and test/artifacts directories. |
-| `dashboardHub` | Object; absent | Preload exposes it to optional dashboard adapters when `url` (string) is set. No bundled hub is started. Additional adapter-owned fields pass through. |
+| `dashboardHub` | Object; absent | Public HOST metadata includes it when `url` (string) is set. No bundled hub is started. Credential fields are redacted; file-based desktop hosted views remain unsupported (see [desktop isolation](electron_security.md)). |
 
 The retained `hosts.js` helper accepts the following legacy inputs. Current
 public main uses `hosts`, `remote`, `tmux` and `localWsl` through terminal_adapter
@@ -171,8 +171,10 @@ instead; the other helper inputs do not configure that terminal path.
 Main adds these read-only IPC fields; they are not user-config keys:
 `hostIds` (chatStream.hosts or `['local']`), `isClient` (remote present),
 `hostname` (OS hostname), `platform` (OS platform), `configError` (error message
-or null), and `configWarnings` (warning objects). Main removes chatStream token
-and tokenPath before returning its configuration over IPC.
+or null), and `configWarnings` (warning objects). Main removes chatStream and
+mic credentials, mic startCommand and the private dashboard catalog root. It
+also redacts nested secret/token/password/credential/API-key/private-key fields
+and URL credentials before exposing configuration. See [desktop isolation](electron_security.md).
 
 ## Configuration warnings
 
@@ -193,8 +195,9 @@ reachability, credentials, every nested field, or completeness of host maps.
 
 ## Upgrading an existing install
 
-The web client updates on its public-code host. Electron remains maintained,
-with desktop upgrades on demand rather than per web landing.
+The web client updates on its public-code host. The upstream Electron app is
+deprecated; this fork retains its desktop isolation fix. Desktop packages must
+be rebuilt to consume source changes.
 
 Keep your private overlay outside the app/repository and keep selecting it with
 PENTACLE_CONFIG after replacing the package. Preserve hostNames, hostColors,

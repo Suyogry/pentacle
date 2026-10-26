@@ -1,7 +1,7 @@
 'use strict';
 
-// Browser stand-in for ../config-loader. The desktop reads the config file from
-// disk inside the preload; the web host injects the *computed* config (the same
+// Browser/isolated desktop stand-in for ../config-loader. The desktop reads the config file from
+// disk inside the main process; the web host injects the *computed* config (the same
 // object `get-config` returns) into window.__PENTACLE_CONFIG__ before the bundle
 // runs, so the renderer sees byte-identical values on both transports.
 
@@ -10,7 +10,8 @@ function loadConfig() {
   if (!config) {
     throw new Error('window.__PENTACLE_CONFIG__ is missing — the page was not served by the Pentacle web host');
   }
-  return { config, path: 'window.__PENTACLE_CONFIG__', tried: [] };
+  // contextBridge freezes config. The UI intentionally updates its local copy.
+  return { config: JSON.parse(JSON.stringify(config)), path: 'window.__PENTACLE_CONFIG__', tried: [] };
 }
 
 function machineKey() {

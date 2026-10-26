@@ -1,4 +1,5 @@
 'use strict';
+const { redactConfig } = require('./public_config');
 const { fetchBlobReply } = require('./blob_fetch_reply');
 
 // ── Shared `window.cc` handler registration ──────────────────────────────────
@@ -175,9 +176,9 @@ function createCcHandlers({
     // The private catalog root is a host filesystem path; the browser only
     // needs the catalog spec id.
     const { catalogRoot, ...dashboards } = CONFIG.dashboards || {};
-    return { ...CONFIG, mic, chatStream, ...(CONFIG.dashboards ? { dashboards } : {}), hostIds: CONFIG.chatStream?.hosts || ['local'], platform: process.platform,
+    return redactConfig({ ...CONFIG, mic, chatStream, ...(CONFIG.dashboards ? { dashboards } : {}), hostIds: CONFIG.chatStream?.hosts || ['local'], platform: process.platform,
       hostname: os.hostname(), isClient: Boolean(CONFIG.remote), configError: configError?.message || null, configWarnings,
-      buildId, hostedDashboardAuthMode };
+      buildId, hostedDashboardAuthMode });
   }
 
   function protectedAssistantRenameError(host, sessionName) {

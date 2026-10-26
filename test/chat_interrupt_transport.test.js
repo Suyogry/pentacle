@@ -56,7 +56,7 @@ function desktopInterruptArgs(host, sessionName, expectedSessionGeneration) {
     },
     window: {}, process, console,
   };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8'), context,
+  require('./helpers/preload').run(fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8'), context,
     { filename: 'preload.js' });
   context.window.cc.chatInterrupt(host, sessionName, expectedSessionGeneration);
   return { channel: calls[0]?.channel, args: Array.from(calls[0]?.args || []) };

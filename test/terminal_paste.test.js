@@ -74,7 +74,7 @@ test('clipboard preload bridges asynchronous main API without renderer clipboard
     if (name === './config-loader') return { loadConfig: () => ({ config: {} }) };
     return require(name);
   } };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8'), context);
+  require('./helpers/preload').run(fs.readFileSync(path.join(__dirname, '../preload.js'), 'utf8'), context);
   assert.equal(await context.window.cc.readClipboard(), 'clipboard text');
   await context.window.cc.writeClipboard(42); assert.deepEqual(writes, ['42']);
 });

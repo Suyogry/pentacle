@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const { desktopPolicy, desktopPreferences } = require('./desktop_security');
 
 function assetIdFromArgs(args) {
   return String(args?.asset_id || args?.assetId || '').trim();
@@ -99,9 +100,7 @@ function createAssetPopoutManager({
       title: args.title || args.asset?.title || assetId,
       backgroundColor,
       webPreferences: {
-        preload,
-        contextIsolation: false,
-        nodeIntegration: true,
+        ...desktopPreferences(preload),
       },
     });
     const entry = { key, assetId, window, args: { ...args, asset_id: assetId } };
@@ -110,7 +109,9 @@ function createAssetPopoutManager({
       if (byKey.get(key)?.window === window) byKey.delete(key);
     });
     window.webContents?.on?.('did-finish-load', () => sendInit(entry));
-    window.loadFile(path.join(root, 'renderer', 'asset_popout.html'));
+    const page = path.join(root, 'renderer', 'dist', 'desktop', 'asset-popout.html');
+    desktopPolicy.own(window, page);
+    window.loadFile(page);
     return { ok: true, reused: false, windowId: window.id };
   }
 

@@ -5,6 +5,7 @@ const { EventEmitter } = require('node:events');
 const { createAssetPopoutManager } = require('../main/asset_popout_windows');
 
 class FakeWebContents extends EventEmitter {
+  setWindowOpenHandler(handler) { this.windowOpenHandler = handler; }
   constructor() {
     super();
     this.sent = [];

@@ -99,3 +99,26 @@ test('every stylesheet index.html pulls from outside renderer/ is copied in', as
     assert.ok(fs.existsSync(path.join(OUT, local)), `missing stylesheet copy: ${local}`);
   }
 });
+
+test('desktop builds the same page with CSP and a native bridge rather than web transport', async () => {
+  await build({ desktop: true });
+  const out = path.join(RENDERER, 'dist', 'desktop');
+  for (const page of ['desktop.html', 'asset-popout.html']) {
+    const html = fs.readFileSync(path.join(out, page), 'utf8');
+    assert.match(html, /Content-Security-Policy/);
+    assert.match(html, /script-src 'self'/);
+    assert.doesNotMatch(html, /unsafe-eval|unsafe-inline[^;]*script|PENTACLE_CONFIG/);
+    for (const ref of [...scriptSources(html), ...styleSources(html)]) {
+      assert.ok(!ref.startsWith('..') && !/^[a-z]+:/i.test(ref));
+      assert.ok(fs.existsSync(path.join(out, ref)), ref);
+    }
+  }
+  const bundle = fs.readFileSync(path.join(out, 'bundle.js'), 'utf8');
+  assert.match(bundle, /__PENTACLE_CONFIG__/);
+  assert.doesNotMatch(bundle, /function installWebCc|require\(["'](?:electron|fs|node:fs|child_process)["']\)/);
+  const scripts = scriptSources(fs.readFileSync(path.join(out, 'desktop.html'), 'utf8'));
+  assert.deepEqual(scripts, [...Object.values(EXTERNAL_SCRIPTS), 'bundle.js']);
+  const pkg = require('../package.json');
+  for (const name of ['prestart', 'build', 'build:win', 'build:linux']) assert.match(pkg.scripts[name], /build:desktop/);
+  assert.match(fs.readFileSync(path.join(__dirname, '../scripts/build-mac.js'), 'utf8'), /npm run build:desktop/);
+});

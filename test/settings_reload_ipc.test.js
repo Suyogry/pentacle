@@ -14,32 +14,13 @@ const { createRequire } = require('node:module');
 const root = path.resolve(__dirname, '..');
 const realRequire = createRequire(path.join(root, 'main.js'));
 
-function loadMainIpc() {
-  const handlers = new Map();
-  const app = { setName() {}, on() {}, whenReady: () => ({ then() {} }) };
-  const ipcMain = {
-    handle: (name, handler) => handlers.set(name, handler),
-    on: (name, handler) => handlers.set(name, handler),
-  };
-  const electron = { app, ipcMain, BrowserWindow: class { static getAllWindows() { return []; } }, shell: {} };
-  vm.runInNewContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), {
-    require(name) {
-      if (name === 'electron') return electron;
-      if (name === './main/chat_stream_client') return { init() {} };
-      if (name === './config-loader') return { loadConfig: () => ({ config: {} }) };
-      return realRequire(name);
-    },
-    __dirname: root, process: { ...process, env: {} }, console, Buffer, URL,
-  });
-  return handlers;
-}
-
 test('main registers an app:reload handler that reloads the requesting window', () => {
-  const handlers = loadMainIpc();
+  const { handlers, event } = require('./helpers/desktop_main').loadMain();
   const handler = handlers.get('app:reload');
   assert.equal(typeof handler, 'function', 'app:reload handler is registered');
   let reloaded = 0;
-  handler({ sender: { reload: () => { reloaded += 1; } } });
+  event.sender.reload = () => { reloaded += 1; };
+  handler(event);
   assert.equal(reloaded, 1, 'the sender webContents is reloaded from the main process');
 });
 
@@ -47,7 +28,7 @@ test('preload exposes window.cc.reloadApp that sends app:reload', () => {
   const sent = [];
   const ipcRenderer = { send: (channel, ...args) => sent.push([channel, ...args]), on() {}, invoke() {}, removeAllListeners() {} };
   const win = {};
-  vm.runInNewContext(fs.readFileSync(path.join(root, 'preload.js'), 'utf8'), {
+  require('./helpers/preload').run(fs.readFileSync(path.join(root, 'preload.js'), 'utf8'), {
     require(name) {
       if (name === 'electron') return { ipcRenderer };
       if (name === './config-loader') return { loadConfig: () => ({ config: {} }) };

@@ -55,7 +55,7 @@ function preloadCcKeys() {
     window: {},
     process,
   };
-  vm.runInNewContext(
+  require('./helpers/preload').run(
     fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8'),
     context,
     { filename: 'preload.js' },

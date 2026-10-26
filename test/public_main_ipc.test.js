@@ -7,18 +7,7 @@ const path = require('node:path');
 const { createRequire } = require('node:module');
 const root = path.resolve(__dirname, '..');
 const realRequire = createRequire(path.join(root, 'main.js'));
-function harness(client, config = {}) {
-  const handlers = new Map();
-  const app = { setName() {}, on() {}, whenReady: () => ({ then() {} }) };
-  const ipcMain = { handle: (name, handler) => { assert.ok(!handlers.has(name), name); handlers.set(name, handler); }, on() {} };
-  const electron = { app, ipcMain, BrowserWindow: class { static getAllWindows() { return []; } }, shell: {} };
-  vm.runInNewContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), {
-    require(name) { if (name === 'electron') return electron; if (name === './main/chat_stream_client') return { init() {}, ...client };
-      if (name === './config-loader') return { loadConfig: () => ({ config }) }; return realRequire(name); },
-    __dirname: root, process: { ...process, env: {} }, console, Buffer, URL,
-  });
-  return (name, ...args) => handlers.get(name)({ sender: { id: 1 } }, ...args);
-}
+function harness(client, config = {}) { return require('./helpers/desktop_main').loadMain(client, config).invoke; }
 test('real main IPC returns the renderer catalog and preserves spawn host and tuple', async () => {
   const calls = [];
   const catalog = { profiles: { desktop_manual: {} }, catalog_version: 'public-v1' };

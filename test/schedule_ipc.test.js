@@ -26,7 +26,7 @@ test('preload schedule API forwards renderer calls to schedule IPC channels', as
     window: {},
     process,
   };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8'), context, {
+  require('./helpers/preload').run(fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8'), context, {
     filename: 'preload.js',
   });
 

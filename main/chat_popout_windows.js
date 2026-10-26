@@ -1,4 +1,5 @@
 const path = require('path');
+const { desktopPolicy, desktopPreferences } = require('./desktop_security');
 
 function contextFromArgs(args = {}) {
   const streamId = String(args.stream_id || '').trim();
@@ -46,9 +47,7 @@ function createChatPopoutManager({ BrowserWindow, appRoot, preloadPath, getMainW
       title: context.title,
       backgroundColor,
       webPreferences: {
-        preload,
-        contextIsolation: false,
-        nodeIntegration: true,
+        ...desktopPreferences(preload),
         additionalArguments: [`--pentacle-chat-popout=${encodedContext}`],
       },
     });
@@ -57,7 +56,9 @@ function createChatPopoutManager({ BrowserWindow, appRoot, preloadPath, getMainW
     window.on?.('closed', () => {
       if (byStream.get(context.stream_id)?.window === window) byStream.delete(context.stream_id);
     });
-    window.loadFile(path.join(root, 'renderer', 'index.html'));
+    const page = path.join(root, 'renderer', 'dist', 'desktop', 'desktop.html');
+    desktopPolicy.own(window, page);
+    window.loadFile(page);
     return { ok: true, reused: false, windowId: window.id };
   }
 

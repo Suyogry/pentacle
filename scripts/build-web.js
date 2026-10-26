@@ -1,15 +1,9 @@
 #!/usr/bin/env node
 'use strict';
 
-// Builds the browser bundle for Pentacle web mode (lane 1 of
-// spec_pentacle__web_mode_2026_09).
-//
-//   node scripts/build-web.js            → renderer/dist/web/
-//
-// The page is DERIVED from renderer/index.html rather than hand-copied, so the
-// desktop and web pages cannot drift: the same markup, with the <script src>
-// tags replaced by the single bundle and the stylesheets rewritten to local
-// copies. Electron's file:// load path is untouched.
+// Shared browser build for the web host and isolated Electron desktop.
+//   node scripts/build-web.js [--desktop] [--minify]
+// Both pages derive from the same markup and classic-script ordering.
 
 const fs = require('fs');
 const path = require('path');
@@ -95,14 +89,14 @@ function buildAssetPopoutHtml(html) {
     .replace('</head>', '  <!--PENTACLE_CONFIG-->\n</head>');
 }
 
-function copyExternalScripts() {
+function copyExternalScripts(out = OUT) {
   for (const [src, local] of Object.entries(EXTERNAL_SCRIPTS)) {
-    fs.copyFileSync(path.resolve(RENDERER, src), path.join(OUT, local));
+    fs.copyFileSync(path.resolve(RENDERER, src), path.join(out, local));
   }
 }
 
 // Icons referenced from <link rel="icon"> / apple-touch-icon are copied next to the page.
-function copyIcons(html) {
+function copyIcons(html, out = OUT) {
   const refs = [];
   for (const m of html.matchAll(/<link[^>]+rel="(?:icon|apple-touch-icon|manifest)"[^>]+href="([^"]+)"/g)) refs.push(m[1]);
   // A web app manifest lists its own icons; ship those too so the page is installable.
@@ -112,17 +106,17 @@ function copyIcons(html) {
   }
   for (const m of refs.map((r) => [null, r])) {
     const from = path.resolve(RENDERER, m[1]);
-    const to = path.join(OUT, m[1]);
+    const to = path.join(out, m[1]);
     fs.mkdirSync(path.dirname(to), { recursive: true });
     fs.copyFileSync(from, to);
   }
 }
 
-function copyStyles(html) {
+function copyStyles(html, out = OUT) {
   for (const href of styleSources(html)) {
     const local = EXTERNAL_CSS[href] || href;
     const from = path.resolve(RENDERER, href);
-    const to = path.join(OUT, local);
+    const to = path.join(out, local);
     fs.mkdirSync(path.dirname(to), { recursive: true });
     fs.copyFileSync(from, to);
   }
@@ -149,18 +143,25 @@ async function buildPrereqBundles() {
   }
 }
 
-async function build({ minify = false } = {}) {
+const DESKTOP_CSP = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'";
+
+function desktopHtml(html) {
+  return html.replace('<!--PENTACLE_CONFIG-->', '').replace('<head>', `<head>\n  <meta http-equiv="Content-Security-Policy" content="${DESKTOP_CSP}">`);
+}
+
+async function build({ minify = false, desktop = false } = {}) {
+  const out = desktop ? path.join(RENDERER, 'dist', 'desktop') : OUT;
   await buildPrereqBundles();
-  fs.rmSync(OUT, { recursive: true, force: true });
-  fs.mkdirSync(OUT, { recursive: true });
+  fs.rmSync(out, { recursive: true, force: true });
+  fs.mkdirSync(out, { recursive: true });
 
   await esbuild.build({
-    entryPoints: [path.join(RENDERER, 'web_entry.js')],
+    entryPoints: [path.join(RENDERER, desktop ? 'app.js' : 'web_entry.js')],
     bundle: true,
     format: 'iife',
     target: 'chrome134',
     platform: 'browser',
-    outfile: path.join(OUT, 'bundle.js'),
+    outfile: path.join(out, 'bundle.js'),
     sourcemap: true,
     minify,
     // The renderer's only Node dependencies. Everything else it requires is
@@ -180,38 +181,39 @@ async function build({ minify = false } = {}) {
   });
 
   await esbuild.build({
-    entryPoints: [path.join(RENDERER, 'asset_popout_web_entry.js')],
+    entryPoints: [path.join(RENDERER, desktop ? 'asset_popout.js' : 'asset_popout_web_entry.js')],
     bundle: true,
     format: 'iife',
     target: 'chrome134',
     platform: 'browser',
-    outfile: path.join(OUT, 'asset-popout.bundle.js'),
+    outfile: path.join(out, 'asset-popout.bundle.js'),
     sourcemap: true,
     minify,
     logLevel: 'info',
   });
 
   const html = readIndexHtml();
-  fs.writeFileSync(path.join(OUT, 'web.html'), buildHtml(html));
-  fs.writeFileSync(path.join(OUT, 'asset-popout.html'), buildAssetPopoutHtml(
-    fs.readFileSync(path.join(RENDERER, 'asset_popout.html'), 'utf8')));
-  copyExternalScripts();
-  copyStyles(html);
-  copyIcons(html);
+  const transform = desktop ? desktopHtml : value => value;
+  fs.writeFileSync(path.join(out, desktop ? 'desktop.html' : 'web.html'), transform(buildHtml(html)));
+  fs.writeFileSync(path.join(out, 'asset-popout.html'), transform(buildAssetPopoutHtml(
+    fs.readFileSync(path.join(RENDERER, 'asset_popout.html'), 'utf8'))));
+  copyExternalScripts(out);
+  copyStyles(html, out);
+  copyIcons(html, out);
 
   // Fonts and images referenced from the copied stylesheets by relative URL.
   for (const dir of ['fonts', 'assets', 'img']) {
     const from = path.join(RENDERER, dir);
-    if (fs.existsSync(from)) fs.cpSync(from, path.join(OUT, dir), { recursive: true });
+    if (fs.existsSync(from)) fs.cpSync(from, path.join(out, dir), { recursive: true });
   }
 
-  console.log(`[build:web] wrote ${path.relative(ROOT, OUT)}`);
+  console.log(`[build:${desktop ? 'desktop' : 'web'}] wrote ${path.relative(ROOT, out)}`);
 }
 
-module.exports = { build, buildHtml, buildAssetPopoutHtml, scriptSources, styleSources, EXTERNAL_CSS, EXTERNAL_SCRIPTS, BUNDLE_ANCHOR, OUT, RENDERER, PREREQ_BUNDLES };
+module.exports = { DESKTOP_CSP, desktopHtml, build, buildHtml, buildAssetPopoutHtml, scriptSources, styleSources, EXTERNAL_CSS, EXTERNAL_SCRIPTS, BUNDLE_ANCHOR, OUT, RENDERER, PREREQ_BUNDLES };
 
 if (require.main === module) {
-  build({ minify: process.argv.includes('--minify') }).catch((e) => {
+  build({ minify: process.argv.includes('--minify'), desktop: process.argv.includes('--desktop') }).catch((e) => {
     console.error(e && e.stack ? e.stack : e);
     process.exit(1);
   });

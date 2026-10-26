@@ -1,10 +1,5 @@
-// With nodeIntegration enabled, preload just sets up IPC convenience functions
-// on window.cc for the renderer to use.
-
-const { ipcRenderer } = require('electron');
-const os = require('os');
-const path = require('path');
-const { loadConfig } = require('./config-loader');
+// Sandboxed preload: only named capabilities cross the isolated bridge.
+const { ipcRenderer, contextBridge } = require('electron');
 
 function chatPopoutContextFromArgv(argv = process.argv) {
   const prefix = '--pentacle-chat-popout=';
@@ -27,35 +22,13 @@ function chatPopoutContextFromArgv(argv = process.argv) {
 
 const chatPopoutContext = chatPopoutContextFromArgv();
 
-// Synchronous host metadata — available at script-eval time so dashboards
-// can self-register without waiting on an async getConfig() round-trip.
-// `isClient` matches the logic in main.js: CONFIG.remote present → CLIENT.
-let _isClient = false;
-let _hasRemote = false;
-let _hasDashboardHub = false;
-let _dashboardHubConfig = null;
-try {
-  const _cfg = loadConfig(__dirname).config;
-  _isClient = !!_cfg.remote;
-  _hasRemote = !!_cfg.remote;
-  _hasDashboardHub = !!(_cfg.dashboardHub && _cfg.dashboardHub.url);
-  // Expose the full dashboardHub config to the renderer so dashboards
-  // (e.g. pi-control.js) can read it via window.HOST without re-running
-  // require('./config-loader') from a <script src> context where __dirname /
-  // require resolution can vary by Electron version / asar packaging.
-  _dashboardHubConfig = (_cfg.dashboardHub && _cfg.dashboardHub.url) ? _cfg.dashboardHub : null;
-} catch { /* keep default false */ }
+// Available before classic dashboard scripts and the application bundle run.
+const bootstrap = ipcRenderer.sendSync('desktop:bootstrap');
+if (!bootstrap?.config || !bootstrap?.HOST) throw new Error('Desktop bootstrap denied');
+contextBridge.exposeInMainWorld('HOST', bootstrap.HOST);
+contextBridge.exposeInMainWorld('__PENTACLE_CONFIG__', bootstrap.config);
 
-window.HOST = {
-  hostname: os.hostname(),
-  platform: process.platform,
-  isClient: _isClient,
-  hasRemote: _hasRemote,
-  hasDashboardHub: _hasDashboardHub,
-  dashboardHubConfig: _dashboardHubConfig,
-};
-
-window.cc = {
+contextBridge.exposeInMainWorld('cc', {
   reloginHosts: () => ipcRenderer.invoke('provider-relogin:hosts'),
   reloginStart: (request) => ipcRenderer.invoke('provider-relogin:start', request),
   reloginCode: (id, code) => ipcRenderer.invoke('provider-relogin:code', id, code),
@@ -253,4 +226,4 @@ window.cc = {
     ipcRenderer.removeAllListeners('chat:popout-dock');
     ipcRenderer.on('chat:popout-dock', (_, payload) => callback(payload));
   },
-};
+});

@@ -5,6 +5,7 @@ const { EventEmitter } = require('node:events');
 const { createChatPopoutManager } = require('../main/chat_popout_windows');
 
 class FakeWebContents extends EventEmitter {
+  setWindowOpenHandler(handler) { this.windowOpenHandler = handler; }
   constructor() { super(); this.sent = []; }
   send(channel, payload) { this.sent.push({ channel, payload }); }
 }

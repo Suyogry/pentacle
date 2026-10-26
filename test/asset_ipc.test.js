@@ -26,7 +26,7 @@ test('preload asset API forwards renderer calls to asset IPC channels', async ()
     window: {},
     process,
   };
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8'), context, {
+  require('./helpers/preload').run(fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8'), context, {
     filename: 'preload.js',
   });
 

@@ -44,7 +44,7 @@ function preloadSurface() {
     process,
     console,
   };
-  vm.runInNewContext(
+  require('./helpers/preload').run(
     fs.readFileSync(path.join(__dirname, '..', 'preload.js'), 'utf8'),
     context,
     { filename: 'preload.js' },
@@ -172,7 +172,7 @@ test('every refusable channel records the mode preload actually uses', () => {
 
 test('main.js registers the native channels and nothing the shared module owns', () => {
   const main = fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8');
-  const registered = [...main.matchAll(/ipcMain\.(?:handle|on)\('([^']+)'/g)].map((m) => m[1]).sort();
+  const registered = [...main.matchAll(/ipcMain\.(?:handle|on)\('([^']+)'/g)].map((m) => m[1]).filter(c => c !== 'desktop:bootstrap').sort();
   const native = [...Object.keys(WEB_LOCAL), ...Object.keys(WEB_UNSUPPORTED)]
     .filter((c) => c !== 'clipboard:read-text' && c !== 'clipboard:write-text' && c !== 'context-menu')
     .sort();

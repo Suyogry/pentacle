@@ -18,10 +18,9 @@ try {
 } catch {}
 
 console.log(`Building ${appName}...`);
-// Build the renderer's shared chat-core bundle (esbuild) before packaging so
-// renderer/dist/chat_core.bundle.js exists for electron-builder to ship.
-console.log('Bundling renderer chat-core...');
-execSync('npm run build:renderer', { cwd: root, stdio: 'inherit' });
+// Package the same isolated browser assets that npm start loads.
+console.log('Bundling isolated desktop renderer...');
+execSync('npm run build:desktop', { cwd: root, stdio: 'inherit' });
 const buildSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
 execFileSync('electron-builder', ['--mac', `--config.extraMetadata.pentacleBuildSha=${buildSha}`], {
   cwd: root,

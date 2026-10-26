@@ -6,8 +6,10 @@
  * adapters; this file never contains credentials, fleet routing, or network
  * promotion logic.
  */
-const { app, BrowserWindow, ipcMain, shell, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain: rawIpcMain, shell, clipboard } = require('electron');
 const path = require('node:path');
+const { desktopPolicy, desktopPreferences } = require('./main/desktop_security');
+const ipcMain = desktopPolicy.guard(rawIpcMain);
 const { loadConfig } = require('./config-loader');
 
 const FALLBACK_CONFIG = {
@@ -55,6 +57,12 @@ async function openPublicUrl(value) {
 }
 
 function registerIpc() {
+  ipcMain.on('desktop:bootstrap', (event) => {
+    const config = ccHandlers.publicConfig();
+    event.returnValue = { config, HOST: { hostname: config.hostname, platform: config.platform,
+      isClient: config.isClient, hasRemote: !!config.remote, hasDashboardHub: !!config.dashboardHub?.url,
+      dashboardHubConfig: config.dashboardHub?.url ? config.dashboardHub : null } };
+  });
   require('./main/clipboard_ipc_bridge').registerClipboardIpc(ipcMain, clipboard);
   ipcMain.handle('open-external', (_event, url) => openPublicUrl(url));
   ipcMain.on('meeting:open', () => {});
@@ -83,31 +91,21 @@ async function createMainWindow() {
     minWidth: 720,
     minHeight: 480,
     show: false,
-    webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
-      sandbox: false,
-      preload: path.join(__dirname, 'preload.js'),
-    },
+    webPreferences: desktopPreferences(path.join(__dirname, 'preload.js')),
   });
   windows.add(window);
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  window.webContents.on('will-navigate', (event) => event.preventDefault());
+  const indexPath = path.join(__dirname, 'renderer', 'dist', 'desktop', 'desktop.html');
+  desktopPolicy.own(window, indexPath);
   window.once('ready-to-show', () => window.show());
   window.on('closed', () => windows.delete(window));
-  const indexPath = path.join(__dirname, 'renderer', 'index.html');
-  try {
-    await window.loadFile(indexPath);
-  } catch {
-    await window.loadURL('data:text/html,<h1>Pentacle</h1><p>Renderer not bundled.</p>');
-  }
+  await window.loadFile(indexPath);
   return window;
 }
 
 registerIpc();
 if (CONFIG.chatStream?.url) chatStreamClient.init(CONFIG, (frame) => {
   for (const window of BrowserWindow.getAllWindows()) {
-    if (!window.isDestroyed()) window.webContents.send('chat-stream:frame', frame);
+    if (!window.isDestroyed() && desktopPolicy.trusted(window.webContents)) window.webContents.send('chat-stream:frame', frame);
   }
 });
 app.on('before-quit', () => chatStreamClient.destroy());
