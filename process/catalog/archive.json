@@ -1,5 +1,26 @@
 [
   {
+    "id": "spec_daemon_auth",
+    "path": "work/completed/pentacle__daemon_auth/spec.md",
+    "title": "Require credentials for local daemon clients",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/completed/pentacle__daemon_auth/spec.md",
+    "tags": [
+      "security",
+      "daemon"
+    ],
+    "summary": "Remove anonymous localhost authority and migrate trusted clients to existing credentials.",
+    "related": [
+      "work_daemon_auth"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-26"
+  },
+  {
     "id": "spec_mic_api_auth",
     "path": "work/completed/pentacle__mic_api_auth/spec.md",
     "title": "Authenticate the microphone API and proxy browser clients",
@@ -14,6 +35,27 @@
     "summary": "Require private credentials and reject browser-origin access to the microphone backend.",
     "related": [
       "work_mic_api_auth"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-26"
+  },
+  {
+    "id": "work_daemon_auth",
+    "path": "work/completed/pentacle__daemon_auth/summary.md",
+    "title": "Require credentials for local daemon clients",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-10-26",
+    "source_path": "work/completed/pentacle__daemon_auth/summary.md",
+    "tags": [
+      "security",
+      "daemon"
+    ],
+    "summary": "Remove anonymous localhost authority and migrate trusted clients to existing credentials.",
+    "related": [
+      "spec_daemon_auth"
     ],
     "status": "completed",
     "machine": "local",
