@@ -2,11 +2,12 @@
 id: spec_upstream_sync_20261027
 title: Merge official Pentacle updates while preserving fork security fixes
 type: spec
-status: in_progress
+status: completed
 canonical: false
 created_at: '2026-10-27'
 updated_at: '2026-10-27'
-source_path: work/in_progress/pentacle__upstream_sync_20261027/spec.md
+completed_at: '2026-10-27'
+source_path: work/completed/pentacle__upstream_sync_20261027/spec.md
 machine: local
 owner: maintainer
 tags: [upstream, maintenance, security]
@@ -77,14 +78,25 @@ Raw receipts are private under upstream-sync-20261027 with public hash pointers.
 
 - [x] Official captured main is ancestor, fork hardening and local fixes preserved.
 - [x] Relevant broad gates and actual isolated desktop flows pass; independent QA accepts.
-- [ ] Local main and remote fork updated normally; metadata valid and tree clean.
+- [x] Local main and remote fork updated normally; metadata valid and tree clean.
 
-## Checkpoint
+## Closure
 
-Independent final QA ACCEPT on frozen source diff
-c626e25f8e06a31351bb02d39d40e9687ac2e98d21d5dca020b6034809aaeea6.
-All final full Node/CLI/affected-daemon gates, core/mic/gate checks, builds,
-audits, actual desktop rehearsal/final proof and owned cleanup pass.
+Shipped source update to the personal fork: normal merge 66bd92dd7ce5df4ca9096434a33609ae7dbf152e retains personal
+main50e53b5 and official30a8ace as parents, promoted by fast-forward and pushed
+to Suyogry/pentacle main. Remote SHA readback matched the merge. Reviewed source
+diff remainsc626e25f8e06a31351bb02d39d40e9687ac2e98d21d5dca020b6034809aaeea6.
+Independent plan/final QA ACCEPT; all final gates passed. Both personal checkout
+renderer artifacts rebuilt for the next launch. No running personal process was
+restarted or provider account touched. Closure metadata is committed/pushed as a
+follow-up, with final remote/clean readback retained privately.
 Evidence: [_artifacts/validation.md](_artifacts/validation.md).
-Next: normal merge commit, fast-forward personal main, authorized push and remote
-readback, then lifecycle closure. Personal runtime activation is outside scope.
+
+## Retro
+
+An upstream security fix can retain a trust assumption that this fork already
+removed. Merge policies explicitly instead of preferring a whole side. Give
+upstream fixtures the same private authentication and staging contracts as real
+clients; retain their no-effects assertions. Run installer dry-run checks with
+the documented explicit interpreter rather than assuming a platform's optional
+fixed-version discovery paths exist.

@@ -149,6 +149,28 @@
     "completed_at": "2026-10-26"
   },
   {
+    "id": "spec_upstream_sync_20261027",
+    "path": "work/completed/pentacle__upstream_sync_20261027/spec.md",
+    "title": "Merge official Pentacle updates while preserving fork security fixes",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-10-27",
+    "source_path": "work/completed/pentacle__upstream_sync_20261027/spec.md",
+    "tags": [
+      "upstream",
+      "maintenance",
+      "security"
+    ],
+    "summary": "Integrate official changes in isolation, preserve fork hardening, validate and push the personal fork.",
+    "related": [
+      "work_upstream_sync_20261027"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-27"
+  },
+  {
     "id": "work_daemon_auth",
     "path": "work/completed/pentacle__daemon_auth/summary.md",
     "title": "Require credentials for local daemon clients",
@@ -296,5 +318,27 @@
     "machine": "local",
     "owner": "maintainer",
     "completed_at": "2026-10-26"
+  },
+  {
+    "id": "work_upstream_sync_20261027",
+    "path": "work/completed/pentacle__upstream_sync_20261027/summary.md",
+    "title": "Merge official Pentacle updates while preserving fork security fixes",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-10-27",
+    "source_path": "work/completed/pentacle__upstream_sync_20261027/summary.md",
+    "tags": [
+      "upstream",
+      "maintenance",
+      "security"
+    ],
+    "summary": "Integrate official changes in isolation, preserve fork hardening, validate and push the personal fork.",
+    "related": [
+      "spec_upstream_sync_20261027"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-27"
   }
 ]

@@ -85,3 +85,8 @@ Source delivery/push to the personal fork is explicitly user-authorized.
 | qa-final.md | dabe29eab86b71d7b1c0528da9dbeeb5c17759fb309f0f123fbc7601a4a08eb1 |
 | audit-full.json | ea1aaf2c0b13798f93930b272683a759da8288ed74f14eb7c3b9b711be9c54e7 |
 | audit-production.json | ea1aaf2c0b13798f93930b272683a759da8288ed74f14eb7c3b9b711be9c54e7 |
+
+Source delivery: normal merge `66bd92dd7ce5df4ca9096434a33609ae7dbf152e` has personal50e53b5 and official30a8ace
+as parents. Personal main fast-forwarded and origin main push/readback matched.
+Both personal checkout renderer builds passed after promotion; no running
+personal service was restarted. Lifecycle closure follows as metadata only.

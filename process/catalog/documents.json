@@ -303,27 +303,6 @@
     "owner": "dot"
   },
   {
-    "id": "spec_upstream_sync_20261027",
-    "path": "work/in_progress/pentacle__upstream_sync_20261027/spec.md",
-    "title": "Merge official Pentacle updates while preserving fork security fixes",
-    "type": "spec",
-    "canonical": false,
-    "updated_at": "2026-10-27",
-    "source_path": "work/in_progress/pentacle__upstream_sync_20261027/spec.md",
-    "tags": [
-      "upstream",
-      "maintenance",
-      "security"
-    ],
-    "summary": "Integrate official changes in isolation, preserve fork hardening, validate and push the personal fork.",
-    "related": [
-      "work_upstream_sync_20261027"
-    ],
-    "status": "in_progress",
-    "machine": "local",
-    "owner": "maintainer"
-  },
-  {
     "id": "work_pentacle_th_h1_2026_10",
     "path": "work/in_progress/pentacle__th-h1-bounded-root-suite/summary.md",
     "title": "TH-H1 bounded root suite",
@@ -422,26 +401,5 @@
     "status": "in_progress",
     "machine": "shared",
     "owner": "dot"
-  },
-  {
-    "id": "work_upstream_sync_20261027",
-    "path": "work/in_progress/pentacle__upstream_sync_20261027/summary.md",
-    "title": "Merge official Pentacle updates while preserving fork security fixes",
-    "type": "work",
-    "canonical": false,
-    "updated_at": "2026-10-27",
-    "source_path": "work/in_progress/pentacle__upstream_sync_20261027/summary.md",
-    "tags": [
-      "upstream",
-      "maintenance",
-      "security"
-    ],
-    "summary": "Integrate official changes in isolation, preserve fork hardening, validate and push the personal fork.",
-    "related": [
-      "spec_upstream_sync_20261027"
-    ],
-    "status": "in_progress",
-    "machine": "local",
-    "owner": "maintainer"
   }
 ]
