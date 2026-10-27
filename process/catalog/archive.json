@@ -85,6 +85,27 @@
     "completed_at": "2026-10-26"
   },
   {
+    "id": "spec_settings_viewport_20261027",
+    "path": "work/completed/pentacle__settings_viewport_20261027/spec.md",
+    "title": "Keep Settings and provider sign-in inside the desktop viewport",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-10-27",
+    "source_path": "work/completed/pentacle__settings_viewport_20261027/spec.md",
+    "tags": [
+      "desktop",
+      "layout"
+    ],
+    "summary": "Bound Settings to the viewport and keep expanded provider sign-in controls reachable.",
+    "related": [
+      "work_settings_viewport_20261027"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-27"
+  },
+  {
     "id": "spec_upstream_sync_20261026",
     "path": "work/completed/pentacle__upstream_sync_20261026/spec.md",
     "title": "Pull official Pentacle main while preserving fork security fixes",
@@ -189,6 +210,27 @@
     "machine": "local",
     "owner": "maintainer",
     "completed_at": "2026-10-26"
+  },
+  {
+    "id": "work_settings_viewport_20261027",
+    "path": "work/completed/pentacle__settings_viewport_20261027/summary.md",
+    "title": "Keep Settings and provider sign-in inside the desktop viewport",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-10-27",
+    "source_path": "work/completed/pentacle__settings_viewport_20261027/summary.md",
+    "tags": [
+      "desktop",
+      "layout"
+    ],
+    "summary": "Bound Settings to the viewport and keep expanded provider sign-in controls reachable.",
+    "related": [
+      "spec_settings_viewport_20261027"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-27"
   },
   {
     "id": "work_upstream_sync_20261026",

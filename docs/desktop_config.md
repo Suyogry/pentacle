@@ -5,6 +5,10 @@ Start with [Local setup](../README.md#local-setup), copy
 `PENTACLE_CONFIG=/absolute/path/desktop.config.js`. A config is a JavaScript
 module exporting an object. Restart the desktop after changing it.
 
+Settings keeps its heading and footer inside the window. In shorter windows,
+scroll within the settings list to reach Provider sign-in and its expanded
+controls; the Done button stays visible. No display scaling change is needed.
+
 The loader tries the explicit `PENTACLE_CONFIG` path alone when set. Otherwise
 it tries `pentacle.config.js` beside the app, then the bundled example. An
 explicit path typo is an error, not permission to silently use another config.
