@@ -83,6 +83,43 @@ test('URL allowlist refuses spoofed domains, non-auth URLs and incomplete querie
     assert.equal(authorizationUrl(url+'\n','codex'),null);
   assert.equal(authorizationUrl(URLS.codex,'codex'),null);
 });
+test('Claude accepts its CLI prefix only on a complete validated authorization line',()=>{
+  const prefix = "If the browser didn't open, visit: ";
+  assert.equal(authorizationUrl(prefix + URLS.claude + '\n', 'claude'), URLS.claude);
+  assert.equal(authorizationUrl(prefix + URLS.claude, 'claude'), null);
+  assert.equal(authorizationUrl(prefix + URLS.codex + '\n', 'codex'), null);
+  assert.equal(authorizationUrl('Unrecognized prefix: ' + URLS.claude + '\n', 'claude'), null);
+  for (const url of [URLS.claude.replace('claude.ai/', 'claude.ai.evil.invalid/'),
+    URLS.claude.replace('https:', 'http:'), URLS.claude.replace('/oauth/authorize', '/login'),
+    URLS.claude.replace('code_challenge=abc', 'none=x'), URLS.claude + '#fragment',
+    URLS.claude.replace('https://', 'https://user@')]) {
+    assert.equal(authorizationUrl(prefix + url + '\n', 'claude'), null);
+  }
+});
+for (const terminator of ['\x07', '\x1b\\']) {
+  test(`Claude prefixed OSC8 output preserves the full visible URL across chunks (${terminator.length})`, t=>{
+    const h = harness(t); h.begin('claude');
+    const prefix = "Opening browser to sign in…\r\nIf the browser didn't open, visit: ";
+    const link = '\x1b]8;;' + URLS.claude + terminator + URLS.claude + '\x1b]8;;' + terminator + '\r\n';
+    const text = prefix + link;
+    for (const piece of [text.slice(0, prefix.length + 15), text.slice(prefix.length + 15, -1)]) h.processes[0].data(piece);
+    assert.equal(h.states().includes('awaiting_browser'), false);
+    h.processes[0].data(text.slice(-1));
+    assert.equal(h.s.events.at(-1).value.state, 'awaiting_browser');
+    assert.equal(h.s.events.at(-1).value.url, URLS.claude);
+    assert.equal(JSON.stringify(h.logs).includes('SENTINEL'), false);
+  });
+}
+test('Claude prefix never promotes hidden OSC metadata or a misleading hyperlink label',t=>{
+  const h=harness(t); h.begin('claude');
+  const prefix = "If the browser didn't open, visit: ";
+  h.processes[0].data(prefix + '\x1b]8;;' + URLS.claude + '\x07Click here\x1b]8;;\x07\n');
+  assert.equal(h.states().includes('awaiting_browser'),false);
+  h.processes[0].data(prefix + '\x1b]8;;' + URLS.claude + '\x07https://evil.invalid/oauth/authorize\x1b]8;;\x07\n');
+  assert.equal(h.states().includes('awaiting_browser'),false);
+  h.processes[0].data('\x1b]0;' + prefix + URLS.claude + '\x07ordinary output\n');
+  assert.equal(h.states().includes('awaiting_browser'),false);
+});
 for (const provider of ['claude', 'codex']) {
   for (const terminator of [String.fromCharCode(7), String.fromCharCode(27, 92)]) {
     test(`${provider}: ConPTY title before URL is discarded across chunks (${terminator.length})`, t => {

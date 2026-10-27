@@ -22,6 +22,11 @@ a successful login process and a separate CLI authentication check on the same
 host. Opening a browser alone is not success. The overall attempt is bounded to
 five minutes, with up to fifteen seconds for verification.
 
+Claude CLI output may place its URL after “If the browser didn't open, visit:”.
+Pentacle recognizes that complete line as well as a standalone URL, including
+the visible URL text of terminal hyperlinks. Hidden terminal metadata is ignored;
+the same provider URL checks still apply.
+
 Cancel, closing Settings, reloading, disconnecting, or quitting stops the owned
 attempt. **Could not confirm the provider stopped** means cleanup is uncertain;
 the same application server refuses further attempts for that host. Check the

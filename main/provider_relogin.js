@@ -27,7 +27,11 @@ function authorizationUrl(text, provider) {
   // Only complete output lines: a chunk boundary can split a query parameter.
   const lines = text.split('\n').slice(0, -1);
   for (const line of lines) {
-    const raw = line.trim();
+    let raw = line.trim();
+    // Claude auth login prefixes its visible OSC8 URL with this message.
+    // Metadata was stripped by terminalText; validate only the visible URL.
+    const claudePrefix = "If the browser didn't open, visit: ";
+    if (provider === 'claude' && raw.startsWith(claudePrefix)) raw = raw.slice(claudePrefix.length);
     if (!raw.startsWith('https://') || raw.length > 16384 || /\s/.test(raw)) continue;
     try {
       const url = new URL(raw);
