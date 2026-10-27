@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -26,12 +27,13 @@ def test_install_sh_help_exits_zero():
 
 def test_install_sh_dry_run_exits_zero():
     result = subprocess.run(
-        ["bash", str(INSTALL_SH), "--dry-run"],
+        ["bash", str(INSTALL_SH), "--dry-run", "--python", sys.executable],
         check=False,
         text=True,
         capture_output=True,
     )
 
     assert result.returncode == 0
+    assert f"Python: {sys.executable}" in result.stdout
     assert "install command:" in result.stdout
     assert "dry run: no install performed" in result.stdout

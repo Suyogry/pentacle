@@ -583,9 +583,13 @@ verification and does not require a forward preflight receipt or dependency
 bundle; retain its original interpreter, host mapping and rollback stamp.
 
 Dependency tar entries use canonical timestamps, ownership and modes and omit
-`__pycache__` subtrees already excluded from the dependency hash. Rebuilding the
-same source and dependency bytes under the pinned toolchain yields the same
-archive and manifest. Old releases built with nondeterministic metadata still
+`__pycache__` subtrees. The bundled `websockets` uses its pure-Python implementation:
+native accelerators and bytecode are excluded, along with install-specific
+`WHEEL`, `RECORD`, `INSTALLER`, `REQUESTED` and `direct_url.json` metadata. Upstream
+source, package metadata, entry points and licenses are retained. Dependency
+hashes cover these retained bytes, so the same source/version produces the same
+archive and manifest across host wheels; changed retained bytes or versions
+still change release identity. Old releases built with host-specific bytes still
 require their retained exact bundle or a distinct reviewed release SHA; never
 replace an existing immutable release to make a rebuilt archive fit.
 
@@ -1144,10 +1148,11 @@ and discarded. Put workflow-specific structured evidence under `extras` (for
 example `extras.qa_envelope_v1`) or narrative evidence under `details`.
 
 Terminal reports from a session whose daemon-owned `role` or `phase` is `qa`
-(case-insensitive) are QA-grade. Filing requires both
+(case-insensitive) are QA-grade. A `done` QA report requires both
 `qa_verdict:"accept"|"reject"` and `target_sha` as one full 40-hex Git SHA;
-missing or malformed fields are rejected before insertion. QA progress and
-non-QA reports are unchanged. `completion_kind` accepts only
+missing or malformed fields are rejected before insertion. An `aborted` or
+`error` QA report may omit both fields, though typed review-evidence flags
+still require `--target-sha`. QA progress and non-QA reports are unchanged. `completion_kind` accepts only
 `implementation_ready` (a batch-readiness claim) or `tracked` (a durable
 tracked-branch disposition), and either requires `status:"done"`. An
 implementation lead claiming batch readiness sets
@@ -1178,7 +1183,10 @@ the inline report.
 
 For commissioned QA report construction, use `--qa-reviewed-scope` and
 `--qa-gate-evidence-digest` with an explicit full `--target-sha` and
-`--qa-verdict`. Always pass the numeric `--msg-id` of the current commission,
+`--qa-verdict` for a `done` report. An `aborted` or `error` report may omit
+`--qa-verdict`; it still requires a reason and complete typed review evidence
+when those flags are used. No verdict is inferred. Always pass the numeric
+`--msg-id` of the current commission,
 including with `--terminate`: use `0` for the spawn commission and the numeric
 send message id for each re-read. A send request UUID is not a message id. If
 the commission id is unavailable, obtain it from the commissioning lead before
@@ -1407,8 +1415,8 @@ The CLI and daemon validate the inbox before sending and refuse with `inbox_inva
 | `details` | string \| object \| array \| null | Optional. Returned only with `--include-details`; blob-backed values are fetched through `fetch_blob`. Inline serialized cap 256 KiB. |
 | `extras` | object \| null | Optional. Returned only with `--include-extras`; blob-backed values are fetched through `fetch_blob`. Inline serialized cap 256 KiB. |
 | `reason` | string | Required for `status:"error"` and `status:"aborted"`. Inline cap 512 bytes. |
-| `qa_verdict` | string | Closed `accept`/`reject` enum; required for terminal QA-grade filings. |
-| `target_sha` | string | Full 40-hex Git SHA; required for terminal QA-grade filings and echoed from the durable row. |
+| `qa_verdict` | string | Closed `accept`/`reject` enum; required for done QA-grade filings. |
+| `target_sha` | string | Full 40-hex Git SHA; required for done QA-grade filings and whenever typed review evidence flags are used; echoed from the durable row. |
 
 `agent-orch await` returns `{ok, msg_id, status, report_id, ledger_row_id, summary, findings, next_action}` by default. For `error` and `aborted`, it also includes `error` and `reason`. Missing required `reason` is rejected as `missing_reason`; other required-field, type, and inline-size violations are rejected as `schema_error`. Historical/internal terminal rows with an invalid core add the degradation fields described above without changing status-based exit codes.
 

@@ -4,6 +4,10 @@ The public harness is provider-free and uses a disposable local daemon. It valid
 
 ## Supported entry: `scripts/gate_env.py`
 
+[Advisory test selection](TEST_SELECTION.md) reports affected boundaries and
+coverage gaps for an exact baseline and proposed head. It runs no tests and
+does not change required gates.
+
 QA briefs and fleet gates run the daemon and npm checks through one entrypoint instead of an ambient shell. It builds an owned venv (Python 3.13) and `npm ci` cache keyed by toolchain and lockfile hashes, gives the child its own `HOME`, a short `TMPDIR` and a UTF-8 locale, drops every other environment variable (including `TMUX`, `MAKEFLAGS` and credentials), and preflights the exact child context before the subject starts. Missing or wrong executables, denied `ps`, absent tmux/lsof/socket capabilities, dependency drift and nested HOME/evidence/basetemp paths are all reported together as a setup failure and never reach the tests.
 
 ```bash
@@ -12,6 +16,11 @@ python3 scripts/gate_env.py run --profile pentacle --workspace OWNED_ROOT --evid
 ```
 
 Targets are the closed list in `scripts/gate-env.json` (`v2-unit`, `v2-smoke`, `v2-merge`, `v2-merge-capacity`, `v2-pytest --select tests/test_x.py`, `npm-test --select test/x.test.js`); `prepare` (optionally with `--target`, to provision and preflight just that target) runs the same setup and never launches a subject or accepts `--select`; the focused `v2-pytest` target refuses to run without at least one `--select` (it never defaults to the full suite — use `v2-unit`/`v2-merge` for that). Every invocation writes append-only receipts under `EVIDENCE/attempts/<attempt_id>/` before any setup, so failures, cancellation and crashes stay visible; `EVIDENCE/test-attempts.v1.json` is a derived index. The daemon targets run `run_gate.py` under a finite `--deadline-seconds` envelope (tier limits, smoke preflight and reserve) and fold its `primary_outcome` and secondary outcomes into the receipt. A changed requirement, lockfile or profile selects a new prepared cache; a drifted cache is refused until `--rebuild` (which removes only that owned directory). Exit codes: 0 pass, 1 subject failure, 3 setup failure, 130 cancelled. Running `run_gate.py` or `pytest` directly remains possible but is not the supported route. Self-test: `python3 scripts/test_gate_env.py`.
+
+The gate owner manifest compares process start identities before recording or
+reaping children. On macOS, its `ps` probe uses `TZ=UTC0` and `LC_ALL=C`, so an
+empty parent `TZ` and an unset child `TZ` identify the same process. These values
+apply only to the probe; caller environments and ownership checks are preserved.
 
 Sandboxed seats use the same supported entry. Do not hand-build its venv with
 `--system-site-packages`: ambient user packages can disappear under the nested
@@ -33,6 +42,51 @@ the fixture speedup batches SQLite seed setup into one durable transaction per
 database without changing product synchronization or crash tests.
 
 ## Unit and protocol checks
+
+### Installed client seam
+
+`installed-client-seam` extends the existing web gate's isolated seeder and
+candidate daemon. It receives real summary snapshot/list, durable history,
+live ingested update/inventory and reconnect/replay frames through the web
+transport and renderer. Its MutationObserver checks intermediate DOM for
+duplicate preview flicker; missing/malformed/legacy optional-summary controls
+are explicitly synthetic model checks. It does not certify native rendering.
+
+Run the named scope through the supported entry:
+
+```bash
+PENTACLE_WEB_GATE_SCENARIOS=installed-client-seam \
+python3 scripts/gate_env.py run --profile pentacle --workspace OWNED_ROOT --evidence-dir EVIDENCE \
+  --target web-gate --pass-env PENTACLE_WEB_GATE_SCENARIOS \
+  --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
+```
+
+The comma-separated filter accepts registered names only. Unknown names fail;
+omitting it retains the full default web, interrupt and subsidiary gates.
+`node test/e2e/web_gate.js --scenario installed-client-seam` is the underlying
+focused browser entry. The supported wrapper also retains interrupt cleanup
+checks when filtering scenarios.
+
+To qualify an installed web version, additionally set
+`PENTACLE_WEB_GATE_CONSUMER_ROOT` to an isolated checkout at its evidence-backed
+source revision and pass `--pass-env PENTACLE_WEB_GATE_CONSUMER_ROOT`. Provision
+that checkout's locked dependencies and copy its exact deployed
+`renderer/dist/web` artifacts there; never rebuild a newer source and call it
+installed coverage. The candidate daemon stays in the invoking checkout.
+No configured root means candidate-only web coverage. Record actual deployment
+and mobile build/source receipts before selecting the finite support set;
+missing identities remain UNTESTED, not a main-branch substitution.
+
+Each scenario retains `client-seam-wire.json` with raw synthetic application
+frames, producer source hashes, producer/consumer Git SHAs and web asset hashes,
+plus browser DOM observations and PNGs. Authentication handshakes are excluded.
+The capture can feed the mobile repository's explicit Jest seam entry using
+its capture path, SHA256 and producer pin; bind both receipts in the same
+acceptance run. Mobile transport/model proof does not establish native UI
+behavior. Pin installed and candidate consumers separately, deduplicating only
+identical sources. A verified producer whitespace-flattening mutation must fail
+the before-history rendering assertion; retain mutation/preimage hashes, raw
+exit, failed predicate, restored-source identity and subsequent GREEN.
 
 Run the repository's normal unit gate first, through the supported entry above (`--target v2-unit`). The underlying tier runner is:
 
@@ -128,6 +182,16 @@ shared daemon. A chat *send-turn* round trip is intentionally not a CDP scenario
 (the public repo lacks the spawn/ingest fixture `tests/smoke/stub_cli.py`); the
 browser send path is covered by `test/web_cc.test.js` and daemon send/ingest by
 the `chat-stream-v2` python tests.
+
+The **optimistic-reload** scenario drives the real composer before and after a
+page reload, holding sends in a deterministic bridge while replaying a delayed
+pre-reload USER echo. With both different and identical message text, it checks
+that the new send stays visible and pending until its own echo arrives. This
+tests renderer/chat-core correlation against the isolated fixture daemon;
+provider delivery is outside this scenario. New ordinary and composite input
+IDs use 128 random bits via `crypto.getRandomValues`, including on HTTP hosts
+without `randomUUID`; retries and reconnect replays retain the stored ID. The
+daemon still receives an opaque string, with no wire-contract change.
 
 The **question-partial-send** scenario answers one of two owned durable cards and
 checks that its sibling stays open. **question-skip** clicks Skip, then verifies
@@ -303,8 +367,8 @@ cancellation, captured destination, room-mic isolation and Retry metadata.
 
 #### Full aggregate and evidence boundaries
 
-The current [scenario registry](../test/e2e/lib/web_scenarios.js) contains
-**29 named scenarios**:
+The [scenario registry](../test/e2e/lib/web_scenarios.js) is authoritative for
+the default gate, including the installed-client seam above. Core journeys include:
 
 1. `default-pane-assistant`
 2. `transport-and-config`

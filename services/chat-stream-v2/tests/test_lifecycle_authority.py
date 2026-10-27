@@ -27,6 +27,12 @@ OTHER_OPERATOR = {"operator_authenticated": True, "operator_principal": "operato
 
 
 class IdleTmux:
+    async def stage_text(self, path, data):
+        # The fake transport stages synthetic launch credentials in memory.
+        if not hasattr(self, "staged"):
+            self.staged = {}
+        self.staged[path] = data
+
     def __init__(self, working: set[str] | None = None) -> None:
         self.live: set[str] = set()
         self.working = working or set()

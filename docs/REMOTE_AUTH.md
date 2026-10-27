@@ -19,9 +19,11 @@ After a verified hello, the socket may omit repeated tokens; the daemon retains
 only the token hash and owner and revalidates the open seat on each RPC. Closed
 or replaced tokens fail. An explicitly invalid token cannot fall back to an
 earlier valid identity. Existing self/parent authorization checks still apply.
-By default a verified seat credential **cannot** remotely grant tokens, set
+By default a verified seat credential **cannot** grant tokens, set
 `role=nexus`, or freeze/unfreeze spawning — those privileged operator RPCs
-still require real operator/service authentication or the session's parent.
+require operator authority. Local-admin proof is reserved for the existing
+limited recovery routes; it cannot bootstrap a token grant or spawn-admission
+change. Setting `role=nexus` retains its separate parent/operator authorization.
 
 A headless/CLI installation, where agents are the only operator interface, may
 opt into **seat operator authority** by setting

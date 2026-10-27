@@ -46,6 +46,26 @@ def test_actual_loopback_requires_credentials(address):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("address", ["127.0.0.1", "::1", "::ffff:127.0.0.1"])
+@pytest.mark.parametrize("verb", ["spawn", "grant_token", "spawn_freeze", "spawn_unfreeze"])
+def test_loopback_requires_proof_before_handler(address, verb):
+    async def run():
+        daemon = Server()
+        calls = []
+        async def handler(msg):
+            calls.append(msg)
+            return {"type": f"{verb}.ok"}
+        daemon.handlers[verb] = handler
+        response = await daemon._dispatch(json.dumps({
+            "type": verb, "request_id": "denied", "client": "pentacle",
+            "from_stream_id": "local:claimed",
+            "_auth_context": {"operator_authenticated": True, "local_admin_verified": True},
+        }), websocket=Peer(address))
+        assert response == [{"type": f"{verb}.error", "error_code": "authentication_required", "request_id": "denied"}]
+        assert calls == []
+    asyncio.run(run())
+
+
 def test_unknown_peer_is_not_local_bootstrap():
     async def run():
         daemon = Server()

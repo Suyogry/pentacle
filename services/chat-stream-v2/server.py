@@ -44,6 +44,7 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 try:
     from websockets.asyncio.server import serve
@@ -521,6 +522,81 @@ def _event_frame_parts(
     return encoded[:prefix_end], b"]" + encoded[suffix_start:]
 
 
+def _oversized_event_preview(event: dict[str, Any], max_bytes: int) -> bytes:
+    """Bound a wire-only copy, retaining replay identity and visibility metadata."""
+    preview = dict(event)
+    if isinstance(event.get("raw"), dict):
+        preview["raw"] = dict(event["raw"])
+    raw = preview.get("raw")
+    peer_body = (
+        str(event.get("kind", "")).upper() == "TELL"
+        and isinstance(raw, dict)
+        and isinstance(raw.get("peer_payload"), str)
+        and bool(raw["peer_payload"])
+    )
+    text = raw["peer_payload"] if peer_body else str(event.get("text") or "")
+    suffix = "\n\n[Event truncated for backfill; original retained by daemon.]"
+
+    def encode(prefix: str) -> bytes:
+        preview["text"] = prefix + suffix
+        if peer_body:
+            # TELL renders peer_payload instead of text in existing clients.
+            raw["peer_payload"] = preview["text"]
+        return _json_bytes(preview)
+
+    encoded = encode("")
+    if len(encoded) > max_bytes:
+        # Remove payload members individually, never the raw identity container.
+        # Provenance tags must survive: losing them can change visibility/trust.
+        protected = {
+            "raw", "text", "daemon_seq", "stream_id", "kind", "timestamp",
+            "host", "provider", "session_id", "session_name", "event_id", "message_id",
+            "reply_to_message_id", "reply_to_question_id", "request_id", "receipt_id",
+            "optimistic_id", "correlatedDaemonSeq", "jsonl_record_uuid",
+            "jsonl_resolution_for_record_uuid", "client_origin", "lane_id", "publish_kind",
+            "routing_state", "accepted_sequence", "queue_sequence", "action_committed",
+            "message_envelope", "provider_wrapper",
+        }
+        protected_raw = {
+            "jsonl_record_uuid", "jsonl_event_index", "uuid", "jsonl_resolution_for_record_uuid",
+            "source", "transport", "sender", "tool_use_id", "tool_call_id", "parent_tool_use_id",
+            "tool_name", "is_sidechain", "is_error", "working", "subtype", "displayRule", "display_rule",
+            "parent_uuid", "optimistic_id", "request_id", "receipt_id", "client_origin",
+            "returned_to_prompt", "user_delivery_state", "daemon_notice",
+        }
+        if peer_body:
+            protected_raw.add("peer_payload")
+        candidates = [
+            (len(_json_bytes(value)), preview, key)
+            for key, value in preview.items() if key not in protected
+        ]
+        if isinstance(raw, dict):
+            candidates.extend(
+                (len(_json_bytes(value)), raw, key)
+                for key, value in raw.items() if key not in protected_raw
+            )
+        for _size, container, key in sorted(candidates, key=lambda item: item[0], reverse=True):
+            del container[key]
+            encoded = _json_bytes(preview)
+            if len(encoded) <= max_bytes:
+                break
+        if len(encoded) > max_bytes:
+            raise ValueError("request_stream_events event identity exceeds its frame byte budget")
+
+    # Search characters but measure full escaped UTF-8 JSON, including both TELL
+    # bodies. Slicing Python text cannot cut a multibyte character or JSON escape.
+    low, high = 0, min(len(text), max_bytes - len(encoded))
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = encode(text[:middle])
+        if len(candidate) <= max_bytes:
+            low, encoded = middle, candidate
+        else:
+            high = middle - 1
+    log.warning("subsystem=backfill bug_ref=oversized_single_event preview_bytes=%d", len(encoded))
+    return encoded
+
+
 def _assemble_event_frames(
     events: list[dict[str, Any]],
     *,
@@ -530,9 +606,9 @@ def _assemble_event_frames(
 ) -> list[_EncodedFrame]:
     """Encode one bounded page in one pass and return wire-ready frames.
 
-    Events are encoded once each. When the page is chunked, the newest chunk is
-    emitted first and each chunk itself remains oldest-first. The client can
-    therefore persist the minimum `daemon_seq` from any delivered chunk and
+    Ordinary events are encoded once each; oversized singletons get an explicit
+    bounded preview. The newest chunk is emitted first, each oldest-first. The
+    client can persist the minimum `daemon_seq` from any delivered chunk and
     resume with `before_daemon_seq` after a disconnect.
     """
     event_json = [_json_bytes(event) for event in events]
@@ -572,7 +648,11 @@ def _assemble_event_frames(
             raise RuntimeError("request_stream_events chunk exceeded its byte budget")
         frames.append(_EncodedFrame(chunk_type, payload.decode("utf-8")))
 
-    for encoded_event in reversed(event_json):
+    for event, encoded_event in zip(reversed(events), reversed(event_json)):
+        if base_size + len(encoded_event) > STREAM_EVENTS_FRAME_BUDGET_BYTES:
+            encoded_event = _oversized_event_preview(
+                event, STREAM_EVENTS_FRAME_BUDGET_BYTES - base_size,
+            )
         candidate_size = pending_size + len(encoded_event) + (1 if pending_newest_first else 0)
         if pending_newest_first and candidate_size > STREAM_EVENTS_FRAME_BUDGET_BYTES:
             emit_pending()
@@ -742,6 +822,9 @@ class Server:
         self._client_send_queues: dict[Any, asyncio.Queue] = {}
         self._client_writer_tasks: dict[Any, asyncio.Task] = {}
         self._client_send_locks: dict[Any, asyncio.Lock] = {}
+        # Only active keyed backend decisions retain locks. Keep the policy and
+        # forwarded send in one decision so a racing wake cannot pass a hold.
+        self._backend_send_locks: WeakValueDictionary[tuple[str, str], asyncio.Lock] = WeakValueDictionary()
         #: spec_example_2026_01:
         #: an accepted `send`'s injection must survive the SUBMITTING connection
         #: closing. Per-connection request tasks are cancelled on disconnect
@@ -2313,24 +2396,25 @@ class Server:
                     )]
             if handler is None:
                 return [self._unsupported(verb, request_id, caller=caller)]
+            auth = dispatch_msg["_auth_context"]
+            code = None
             if verb not in {"ping", "pong", "hello", "enroll", "event.push", "host.stats"}:
-                auth = dispatch_msg["_auth_context"]
-                code = None
                 if not any(auth.get(key) for key in (
                     "operator_authenticated", "token_verified", "service_authenticated",
                     "scoped_principal",
                 )) and not self._independent_recovery_admitted(verb, dispatch_msg, auth):
                     code = "authentication_required"
-                elif verb in {"grant_token", "spawn_freeze", "spawn_unfreeze"} and not (
-                    auth.get("operator_authenticated") or auth.get("service_authenticated")
-                ):
-                    code = "operator_auth_required"
-                if code:
-                    self._diag_auth_failure(websocket, code)
-                    denied = {"type": f"{verb}.error", "error_code": code}
-                    if request_id is not None:
-                        denied["request_id"] = request_id
-                    return [denied]
+            # Keep privileged admission behind mandatory authentication on every
+            # transport. Local-admin proof remains limited to recovery routes;
+            # it cannot mint credentials or change spawn admission.
+            if code is None and verb in {"grant_token", "spawn_freeze", "spawn_unfreeze"} and not auth.get("operator_authenticated"):
+                code = "operator_auth_required"
+            if code:
+                self._diag_auth_failure(websocket, code)
+                denied = {"type": f"{verb}.error", "error_code": code}
+                if request_id is not None:
+                    denied["request_id"] = request_id
+                return [denied]
             # External scoped ("Dot") connection enforcement. Keyed on the STICKY
             # connection marker (not the per-RPC dot_principal flag) and run for
             # EVERY verb incl. base-exempt ping/hello and even loopback — so a
@@ -4396,6 +4480,18 @@ class Server:
             (c for c in self._composites().values()
              if c is not None and c.is_backend_stream(stream_id)), None,
         )
+        request_key = str(direct_msg.get("request_id") or "").strip()
+        if backend_composite is not None and request_key:
+            lock = self._backend_send_locks.setdefault((stream_id, request_key), asyncio.Lock())
+            async with lock:
+                return await self._send_to_resolved_session(
+                    direct_msg, host, name, stream_id, backend_composite)
+        return await self._send_to_resolved_session(direct_msg, host, name, stream_id, backend_composite)
+
+    async def _send_to_resolved_session(
+        self, direct_msg: dict[str, Any], host: str, name: str, stream_id: str,
+        backend_composite: Any,
+    ) -> dict[str, Any]:
         if backend_composite is not None:
             suppressed = await backend_composite.suppress_routine_backend_ingress(
                 target_stream_id=stream_id, body=str(direct_msg.get("text") or direct_msg.get("message") or ""),
@@ -5044,11 +5140,22 @@ class Server:
         auth = msg.get("_auth_context") if isinstance(msg.get("_auth_context"), dict) else {}
         if auth.get("scoped_principal") and stream_id != auth.get("scope_stream"):
             raise VerbError(SCOPE_DENIED_CODE, "scoped credential may read only its own stream")
+        history_generation = msg.get("generation")
+        recovered_history = False
+        if history_generation is not None:
+            if (not isinstance(history_generation, str) or not history_generation
+                    or not auth.get("operator_authenticated") or auth.get("scoped_principal")
+                    or auth.get("dot_principal")
+                    or self._scoped_stream_for(msg.get("_client_websocket")) is not None):
+                raise VerbError(SCOPE_DENIED_CODE, "original transcript history requires operator authentication")
+            recovered_history = await self.store.chat_history_readable(stream_id, history_generation)
+            if not recovered_history and not await self._work_lane_history_readable(msg, stream_id, auth):
+                raise VerbError("unknown_session", "Unknown transcript generation")
         include_subagents, opened_by_host_ids, _excluded, _events_mode = self._subscription_for_message(msg)
         if not self._stream_is_visible_to_client(
             stream_id, include_subagents, opened_by_host_ids,
             self._assistant_composite_capable_for_message(msg),
-        ) and not await self._work_lane_history_readable(msg, stream_id, auth):
+        ) and not recovered_history and not await self._work_lane_history_readable(msg, stream_id, auth):
             raise VerbError("unknown_session", "Unknown or inactive session")
         raw_limit = msg.get("limit")
         try:
@@ -5081,6 +5188,7 @@ class Server:
             limit=effective_limit,
             before_daemon_seq=before_daemon_seq,
             page_size=page_size,
+            **({"generation": history_generation} if recovered_history else {}),
         )
 
     async def _work_lane_history_readable(self, msg: dict[str, Any], stream_id: str,
@@ -5108,6 +5216,7 @@ class Server:
         limit: int,
         before_daemon_seq: int | None,
         page_size: int,
+        generation: str | None = None,
     ) -> Any:
         """Walk a bounded cursor page at a time, yielding wire-ready frames."""
         remaining = limit
@@ -5121,6 +5230,7 @@ class Server:
                     stream_id,
                     before_daemon_seq=cursor,
                     limit=query_limit,
+                    **({"generation": generation} if generation is not None else {}),
                 )
                 has_more = remaining > page_size and len(rows) > page_size
                 page = rows[-page_size:] if has_more else rows[:page_size]

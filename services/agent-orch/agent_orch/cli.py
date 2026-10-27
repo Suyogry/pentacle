@@ -3720,23 +3720,8 @@ def reconcile_status(args: argparse.Namespace) -> int:
 
 
 def _local_admin_token(config) -> str:
-    from urllib.parse import urlparse
-    import ipaddress
-    import stat
-    hostname = urlparse(config.ws_url).hostname or ""
-    if hostname != "localhost":
-        try:
-            if not ipaddress.ip_address(hostname).is_loopback:
-                raise ValueError("local admin commands require a loopback endpoint")
-        except ValueError:
-            raise ValueError("local admin commands require a loopback endpoint") from None
-    path = Path.home() / ".config/pentacle-stream/local-admin.token"
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd) as source:
-        info = os.fstat(source.fileno())
-        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.getuid():
-            raise ValueError("unsafe local admin token file")
-        return source.read(256).strip()
+    from .config import local_admin_token
+    return local_admin_token(config)
 
 
 def consent_command(args: argparse.Namespace) -> int:
@@ -3945,7 +3930,7 @@ def await_command(args: argparse.Namespace) -> int:
     return 0 if response.get("ok") else 1
 
 
-def _merge_report_structured_flags(payload: dict[str, object], args: argparse.Namespace) -> None:
+def _merge_report_structured_flags(payload: dict[str, object], args: argparse.Namespace) -> bool:
     completion_kind = getattr(args, "completion_kind", None)
     qa_verdict = getattr(args, "qa_verdict", None)
     target_sha = getattr(args, "target_sha", None)
@@ -4022,11 +4007,6 @@ def _merge_report_structured_flags(payload: dict[str, object], args: argparse.Na
                 "field": "extras.qa_review", "code": "flag_payload_conflict",
                 "detail": "QA review flags conflict with extras.qa_review in --result or --result-file",
             })
-        if qa_verdict is None and payload.get("qa_verdict") is None:
-            violations.append({
-                "field": "qa_verdict", "code": "missing_field",
-                "detail": "QA review evidence requires an explicit --qa-verdict or payload qa_verdict",
-            })
     if attestation_stream_id is not None and "qa_attestation" in payload:
         violations.append({
             "field": "qa_attestation",
@@ -4056,6 +4036,8 @@ def _merge_report_structured_flags(payload: dict[str, object], args: argparse.Na
             "stream_id": attestation_stream_id,
             "report_id": attestation_report_id,
         }
+    # Let the shared validator apply the status-dependent QA verdict rule.
+    return qa_review_requested
 
 
 def _report_payload_from_args(args: argparse.Namespace) -> tuple[dict[str, object], bytes | None]:
@@ -4068,8 +4050,8 @@ def _report_payload_from_args(args: argparse.Namespace) -> tuple[dict[str, objec
             raise ValueError("schema_error: --result must be a JSON object")
         if args.reason is not None:
             payload["reason"] = args.reason
-        _merge_report_structured_flags(payload, args)
-        validate_report_payload(payload, args.status, enforce_inline_caps=True)
+        qa_grade = _merge_report_structured_flags(payload, args)
+        validate_report_payload(payload, args.status, enforce_inline_caps=True, qa_grade=qa_grade)
         return payload, None
     if args.result_file is not None:
         path = Path(args.result_file).expanduser()
@@ -4091,7 +4073,7 @@ def _report_payload_from_args(args: argparse.Namespace) -> tuple[dict[str, objec
             raise ValueError(f"schema_error: {exc}") from exc
         if not isinstance(payload, dict):
             raise ValueError("schema_error: result file must be a JSON object")
-        _merge_report_structured_flags(payload, args)
+        qa_grade = _merge_report_structured_flags(payload, args)
         if any(getattr(args, field, None) is not None for field in (
             "completion_kind", "qa_attestation_stream_id",
         )):
@@ -4107,15 +4089,15 @@ def _report_payload_from_args(args: argparse.Namespace) -> tuple[dict[str, objec
         if any(getattr(args, field, None) is not None for field in (
             "qa_verdict", "target_sha", "qa_reviewed_scope", "qa_gate_evidence_digest", "qa_commission_msg_id",
         )):
-            validate_report_payload(payload, args.status, enforce_inline_caps=True)
+            validate_report_payload(payload, args.status, enforce_inline_caps=True, qa_grade=qa_grade)
             return payload, None
         validate_report_payload(payload, args.status, enforce_inline_caps=False)
         return {}, data
     payload: dict[str, object] = {}
     if args.reason is not None:
         payload["reason"] = args.reason
-    _merge_report_structured_flags(payload, args)
-    validate_report_payload(payload, args.status, enforce_inline_caps=True)
+    qa_grade = _merge_report_structured_flags(payload, args)
+    validate_report_payload(payload, args.status, enforce_inline_caps=True, qa_grade=qa_grade)
     return payload, None
 
 
@@ -4829,10 +4811,13 @@ def report(args: argparse.Namespace) -> int:
 
 def grant_self_token(args: argparse.Namespace) -> int:
     """Bootstrap-once: ask chat_streamd to mint an AGENT_ORCH_STREAM_TOKEN for
-    this session's stream id and print the plaintext to stdout. Use as:
+    the target stream id and print the plaintext to stdout. From a fresh
+    operator shell with its provisioned v2 credential and no seat/service identity, use:
 
-        export AGENT_ORCH_STREAM_TOKEN=$(agent-orch grant-self-token)
+        agent-orch grant-self-token --stream node:session
 
+    Token-less env-seat bootstrap is refused. Authenticated seats need the
+    server's existing operator-authority opt-in for privileged token grants.
     Refused if the session already has a token (`token_already_set`). Typed
     exit codes mirror the other direct verbs: 0 ok, 1 grant_token.error,
     2 invalid stream id, 64 daemon unreachable, 67 timeout.
