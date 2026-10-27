@@ -1,8 +1,10 @@
 # Desktop configuration
 
 Start with [Local setup](../README.md#local-setup), copy
-`pentacle.config.example.js` to a private file, and select it with
-`PENTACLE_CONFIG=/absolute/path/desktop.config.js`. A config is a JavaScript
+`pentacle.config.example.js` to `~/.config/pentacle/pentacle.config.js`, or select
+another private file with `PENTACLE_CONFIG=/absolute/path/desktop.config.js`.
+The per-user location also works when opening the packaged app from Finder.
+A config is a JavaScript
 module exporting an object. Restart the desktop after changing it.
 
 Settings keeps its heading and footer inside the window. In shorter windows,
@@ -10,8 +12,10 @@ scroll within the settings list to reach Provider sign-in and its expanded
 controls; the Done button stays visible. No display scaling change is needed.
 
 The loader tries the explicit `PENTACLE_CONFIG` path alone when set. Otherwise
-it tries `pentacle.config.js` beside the app, then the bundled example. An
-explicit path typo is an error, not permission to silently use another config.
+it tries `pentacle.config.js` beside the app, then
+`~/.config/pentacle/pentacle.config.js`, then the bundled example. Existing
+local overlays retain priority. An explicit path typo or an error loading an
+existing config is an error, not permission to silently use another config.
 The loader only backfills missing `dark` and `terminal` objects from the example;
 it does not merge the rest of an overlay with the example. The tables distinguish
 example values from behavior when a key is omitted.
@@ -122,6 +126,20 @@ provider models and effort. See [daemon setup](../services/chat-stream-v2/README
 | `wakeWord` | String; absent | Text displayed in the sleeping mic state. Set it to the server's actual configured wake word. |
 | `machineStats` | Object; absent, ignored | Accepted compatibility key for old overlays. No fields in this object configure public desktop stats. |
 
+Quota bars require both `features.usage: true` in the host configuration and
+fresh collector data. Signing into a provider alone does not collect its quota.
+Run `services/chat-stream-v2/tools/collect_usage_state.py` with `--state` pointing
+to `usage_state.json` beside the daemon's `--db` file and `--shared-scripts`
+pointing to this checkout's `scripts` directory. Pin `PENTACLE_CLAUDE_BIN`,
+`PENTACLE_CODEX_BIN` and `PENTACLE_USAGE_TMUX_BIN` to absolute executable paths;
+set `PENTACLE_USAGE_CWD` to an already trusted Claude workspace. The collector
+reads Claude's `/usage` screen and Codex's quota RPC without running model
+inference. It never accepts a workspace trust dialog. Schedule it using the
+[collector deployment templates](../services/chat-stream-v2/deploy/com.pentacle.usage-state-collector.plist),
+adapting paths to your installation. Restart the desktop after enabling host
+usage subscriptions. A dash means no percentage has been received, not zero
+usage or a failed sign-in.
+
 The direct assistant target is a temporary browser entry route, not a daemon
 alias. It uses the target's existing transcript, draft, questions, attachments,
 receipts and copy-chat-ID, while the official entry keeps its assistant label
@@ -203,8 +221,10 @@ The web client updates on its public-code host. The upstream Electron app is
 deprecated; this fork retains its desktop isolation fix. Desktop packages must
 be rebuilt to consume source changes.
 
-Keep your private overlay outside the app/repository and keep selecting it with
-PENTACLE_CONFIG after replacing the package. Preserve hostNames, hostColors,
+Keep your private overlay outside the app/repository at
+`~/.config/pentacle/pentacle.config.js`; it survives package replacement and
+normal desktop launches. Other locations still require `PENTACLE_CONFIG` in
+the launch environment. Preserve hostNames, hostColors,
 localHostId, hostMap, mic/micServerUrl and your feature flags when those explicit
 choices differ from the defaults. A legacy machineStats object may remain but
 does not configure cards. Use config mappings for old local/remote aliases.

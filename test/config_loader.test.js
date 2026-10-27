@@ -72,14 +72,56 @@ test('machineKey normalizes a public hostname deterministically', () => {
   assert.equal(machineKey('Example Local'), 'example-local');
 });
 
-test('config candidates use the public local overlay and bundled example', () => {
+test('config candidates prefer explicit, local, user, then bundled configuration', (t) => {
+  const home = path.resolve('/private-home');
+  t.mock.method(require('node:os'), 'homedir', () => home);
   const paths = candidateConfigPaths('/repo/public-desktop', {}, 'example.local');
   const base = path.resolve('/repo/public-desktop');
   const privateConfig = path.join(path.parse(base).root, 'private', 'config.js');
   assert.deepEqual(candidateConfigPaths(base, { PENTACLE_CONFIG: privateConfig }), [privateConfig]);
 
   assert.equal(paths[0], path.join(base, 'pentacle.config.js'));
-  assert.equal(paths[1], path.join(base, 'pentacle.config.example.js'));
+  assert.equal(paths[1], path.join(home, '.config', 'pentacle', 'pentacle.config.js'));
+  assert.equal(paths[2], path.join(base, 'pentacle.config.example.js'));
+});
+
+test('normal launches load the private user profile without a shell environment', (t) => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pentacle-user-config-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const root = path.join(dir, 'app');
+  const home = path.join(dir, 'home');
+  const user = path.join(home, '.config', 'pentacle', 'pentacle.config.js');
+  fs.mkdirSync(root, { recursive: true });
+  fs.mkdirSync(path.dirname(user), { recursive: true });
+  t.mock.method(os, 'homedir', () => home);
+  const example = path.join(root, 'pentacle.config.example.js');
+  const local = path.join(root, 'pentacle.config.js');
+  fs.writeFileSync(example, 'module.exports = { features: { usage: false } };');
+  assert.equal(loadConfig(root, {}).path, example, 'absent user config retains example fallback');
+  fs.writeFileSync(user, 'module.exports = { features: { usage: true, mic: false } };');
+  const loaded = loadConfig(root, {});
+  assert.equal(loaded.path, user);
+  assert.equal(loaded.config.features.usage, true, 'main process subscribes to quota updates');
+  assert.equal(loaded.config.features.mic, false);
+  fs.writeFileSync(local, 'module.exports = { features: { usage: false } };');
+  assert.equal(loadConfig(root, {}).path, local, 'existing local overlays retain precedence');
+  assert.equal(loadConfig(root, { PENTACLE_CONFIG: user }).path, user, 'explicit path is authoritative');
+  assert.throws(() => loadConfig(root, { PENTACLE_CONFIG: path.join(dir, 'missing.js') }), /No Pentacle config found/);
+});
+
+test('a broken user profile fails visibly instead of silently using the example', (t) => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pentacle-broken-user-config-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const user = path.join(dir, '.config', 'pentacle', 'pentacle.config.js');
+  fs.mkdirSync(path.dirname(user), { recursive: true });
+  fs.writeFileSync(user, 'throw new Error("broken private profile");');
+  fs.writeFileSync(path.join(dir, 'pentacle.config.example.js'), 'module.exports = {};');
+  t.mock.method(os, 'homedir', () => dir);
+  assert.throws(() => loadConfig(dir, {}), /broken private profile/);
 });
 
 test('dashboards visibility and modeler settings are supported without exposing their values', () => {

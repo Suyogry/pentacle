@@ -13,7 +13,13 @@ function candidateConfigPaths(root = __dirname, env = process.env) {
   // A named private overlay is authoritative. A typo must be visible instead
   // of silently starting with a different topology.
   if (env.PENTACLE_CONFIG) return [path.resolve(env.PENTACLE_CONFIG)];
-  return [path.join(base, 'pentacle.config.js'), path.join(base, 'pentacle.config.example.js')];
+  return [
+    path.join(base, 'pentacle.config.js'),
+    // Finder/desktop launches do not inherit an interactive shell's environment.
+    // Keep the private profile outside the replaceable application bundle.
+    path.join(os.homedir(), '.config', 'pentacle', 'pentacle.config.js'),
+    path.join(base, 'pentacle.config.example.js'),
+  ];
 }
 
 // Theme blocks (dark/light/terminal) are read unconditionally at startup —
