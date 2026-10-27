@@ -50,3 +50,32 @@ unit-tested without reading your clipboard; no physical mic or paid provider is
 used. This is source validation on macOS, not Windows/Linux or hardware
 certification. The separate terminal interaction fixture retains Node access
 for source inspection and does not establish production-window isolation.
+
+## Runtime and tooling updates
+
+The desktop currently locks Electron 44.9.3 and requires at least that version
+within the 44.x series. This includes the upstream mitigation for compromised
+intermediate certificates ([official advisory](https://github.com/electron/electron/security/advisories/GHSA-jr5w-w6x2-84p9)).
+Electron is declared as a development dependency but is the desktop runtime;
+`npm audit --omit=dev` alone does not cover it.
+
+Install the exact checked-in dependency set with `npm ci`, then rebuild with
+`npm run build:desktop` or `npm run build:mac`. Electron's package downloads its
+matching executable on first use if needed. An existing packaged app keeps its
+old runtime until rebuilt/replaced; changing the lockfile does not patch a
+separate installed application. No task permission or approval setting changes.
+
+The dependency refresh also updates brace-expansion, undici, fast-uri and
+http-cache-semantics within their existing compatible ranges. The cache advisory
+is [disputed by its maintainer](https://github.com/kornelski/http-cache-semantics/issues/56):
+`Set-Cookie` alone does not make a response private. Version 4.3.0 leaves the
+reported audit range; this is not proof that its cache semantics changed.
+Pentacle's affected consumer is download tooling, not a shared application cache.
+Do not suppress findings or use forced major upgrades to obtain a clean audit.
+
+For dependency validation, run both `npm audit` and `npm audit --omit=dev`, both
+renderer builds, shared chat-core checks and the desktop smoke above. Run the
+root tests using a supported Python interpreter for their daemon probes, e.g.
+`PENTACLE_PYTHON="$(pwd)/.venv/bin/python" npm test -- --file-timeout-ms 120000`.
+The full/production audits reported zero advisories at this refresh; that is a
+time-bound dependency result, not a complete application or Python security audit.

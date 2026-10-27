@@ -21,6 +21,28 @@
     "completed_at": "2026-10-26"
   },
   {
+    "id": "spec_dependency_refresh_20261027",
+    "path": "work/completed/pentacle__dependency_refresh_20261027/spec.md",
+    "title": "Update vulnerable desktop runtime and tooling without workflow regressions",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-10-27",
+    "source_path": "work/completed/pentacle__dependency_refresh_20261027/spec.md",
+    "tags": [
+      "security",
+      "dependencies",
+      "electron"
+    ],
+    "summary": "Patch Electron and vulnerable tooling, rebuild and exercise existing desktop and agent workflows.",
+    "related": [
+      "work_dependency_refresh_20261027"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-27"
+  },
+  {
     "id": "spec_electron_isolation",
     "path": "work/completed/pentacle__electron_isolation/spec.md",
     "title": "Isolate Electron renderers while preserving desktop workflows",
@@ -103,6 +125,28 @@
     "machine": "local",
     "owner": "maintainer",
     "completed_at": "2026-10-26"
+  },
+  {
+    "id": "work_dependency_refresh_20261027",
+    "path": "work/completed/pentacle__dependency_refresh_20261027/summary.md",
+    "title": "Update vulnerable desktop runtime and tooling without workflow regressions",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-10-27",
+    "source_path": "work/completed/pentacle__dependency_refresh_20261027/summary.md",
+    "tags": [
+      "security",
+      "dependencies",
+      "electron"
+    ],
+    "summary": "Patch Electron and vulnerable tooling, rebuild and exercise existing desktop and agent workflows.",
+    "related": [
+      "spec_dependency_refresh_20261027"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-27"
   },
   {
     "id": "work_electron_isolation",
