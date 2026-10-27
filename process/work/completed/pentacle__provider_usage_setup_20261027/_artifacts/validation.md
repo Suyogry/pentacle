@@ -1,0 +1,11 @@
+# Scoped validation receipts
+
+Implementation/package: ac47ce1225cb6186778db8d4f3df671425c864e6.
+Raw receipts retained in the private usage-status-20261027 evidence bundle.
+No private configuration, account identity, readings or paths are distributed.
+
+- final-qa.md SHA256 44adf30efc9c88f5b22704e67cc9879f35b3b12a832b588c9c4136778739e243
+- gates.json SHA256 7f73040eb07a31d3a2cd5d855333ebc0b87940e48eaf8504aad4b5d20de6fdd3
+- candidate-readback.json SHA256 a26282733c95d52497d4bfdbc3ded94d8cf31f900076f16b20930fd3edabbc99
+- activation-readback.json SHA256 2cde613387c397ca5202b655b9ac8cfc5785e8d3a2cf2f91e3ac5b936b45d0f9
+- scheduled-success-state.json SHA256 0bb2a7cbb738c7a0fb67204e122a208accc5693e4cb944c65dc061740e3b2286
