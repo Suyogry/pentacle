@@ -297,6 +297,9 @@ original_registry=server.operator_auth.OperatorCredentialRegistry.__init__
 def registry_init(self, path=None): original_registry(self, root/'auth'/'registry.json')
 server.operator_auth.OperatorCredentialRegistry.__init__=registry_init
 registry=server.operator_auth.OperatorCredentialRegistry(); registry.initialize()
+_, envelope=registry.issue("pentacle")
+(root/"operator-token").write_text(envelope)
+(root/"operator-token").chmod(0o600)
 original_initialize=local_admin.initialize
 local_admin.initialize=lambda: original_initialize(root/'auth'/'local-admin.token')
 original_bind=main.Server.bind
@@ -356,8 +359,8 @@ raise SystemExit(main.main(args+['--disable-'+flag for flag in flags]))
             def rpc(kind):
                 with connect(f"ws://127.0.0.1:{ready['port']}", open_timeout=5) as socket:
                     welcome = json.loads(socket.recv(timeout=5))
-                    socket.send(json.dumps({'type':'hello','client':'public-smoke',
-                                            'subscribe':{'snapshot':False,'mode':'rpc'}}))
+                    from _shared.operator_client import operator_hello
+                    socket.send(json.dumps(operator_hello(welcome, token_path=root / 'operator-token')))
                     socket.send(json.dumps({'type':kind,'request_id':'managed-probe'}))
                     while True:
                         reply = json.loads(socket.recv(timeout=5))

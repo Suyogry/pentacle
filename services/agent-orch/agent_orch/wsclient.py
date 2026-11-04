@@ -1780,7 +1780,7 @@ async def screen_lease_once(config: Config, payload: dict[str, Any], *, timeout:
                                      from_stream_id=actor, identity_with_token=True)
     payload.setdefault("request_id", f"screen-{uuid.uuid4()}")
     identity = resolve_outbound_identity(actor)
-    if identity.kind not in {"service", "ambiguous"} and resolve_operator_token(config).form == "envelope":
+    if identity.kind == "operator" and resolve_operator_token(config).form == "envelope":
         return await _operator_envelope_rpc(config, payload, caller=actor, prefix=verb, timeout=timeout)
     return await _one_shot_rpc(config, payload, prefix=verb, timeout=timeout, from_stream_id=actor)
 
@@ -2909,7 +2909,12 @@ async def close_once(
     host, session_name = stream_id.split(":", 1)
     if not host or not session_name:
         raise ValueError("invalid_stream_id")
-    ws = await _connect_rpc_ready(config, from_stream_id=from_stream_id or caller_stream_id)
+    actor = from_stream_id or caller_stream_id
+    # A retired seat cannot authenticate a general-purpose hello. Close still
+    # verifies its token per request, with an existing narrow self-replay check.
+    # Keep live seats on the same path and never fall back to operator proof.
+    connection_options = {"independent_auth": True} if resolve_outbound_identity(actor).kind == "seat" else {}
+    ws = await _connect_rpc_ready(config, from_stream_id=actor, **connection_options)
     request_id = f"close-{uuid.uuid4()}"
     try:
         payload: dict[str, Any] = {

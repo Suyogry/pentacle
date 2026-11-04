@@ -25,6 +25,7 @@ def protocol(monkeypatch, tmp_path):
             self.frames = []
             self.queue = [{"type": "welcome", "auth": {"operator": challenge}}]
             self.ready = False
+            self.seat = False
             self.closed = False
             self.transport = self
 
@@ -33,14 +34,21 @@ def protocol(monkeypatch, tmp_path):
             self.frames.append(frame)
             assert envelope not in raw and "proof_key" not in raw
             if frame["type"] == "hello":
-                proof = frame.get("auth_v2", {}).get("proof")
-                expected = auth.encode_b64url(hmac.new(key, auth.proof_transcript(
-                    nonce, credential_id, "pentacle"), hashlib.sha256).digest())
-                assert proof == expected, "hello lacks valid challenge proof"
+                self.seat = frame.get("stream_token") == "synthetic-seat-token"
+                if self.seat:
+                    assert frame.get("from_stream_id") == "fixture:seat"
+                    assert "auth_v2" not in frame, "seat must not use operator credentials"
+                else:
+                    proof = frame.get("auth_v2", {}).get("proof")
+                    expected = auth.encode_b64url(hmac.new(key, auth.proof_transcript(
+                        nonce, credential_id, "pentacle"), hashlib.sha256).digest())
+                    assert proof == expected, "hello lacks valid challenge proof"
                 assert "token" not in frame
                 self.queue.extend([{"type": "ping"}, {"type": "ready"}])
             elif frame["type"] != "pong":
-                assert self.ready, "request sent before authenticated ready"
+                # The seat transport sends after its authenticated hello; the
+                # operator proof path additionally waits to consume ready.
+                assert self.seat or self.ready, "request sent before authenticated ready"
                 self.queue.extend([
                     {"type": frame["type"] + ".ok", "request_id": "unrelated"},
                     {"type": "unrelated.ok", "request_id": frame["request_id"]},
@@ -84,7 +92,7 @@ def test_mutation_identity(protocol, monkeypatch, verb, seat):
         monkeypatch.setenv("AGENT_ORCH_STREAM_ID", "fixture:seat")
         monkeypatch.setenv("AGENT_ORCH_STREAM_TOKEN", "synthetic-seat-token")
     asyncio.run(wsclient.screen_lease_once(cfg, {"type": "screen.lease." + verb}))
-    request = socket.frames[-1]
+    request = next(frame for frame in socket.frames if frame["type"] == "screen.lease." + verb)
     assert request.get("from_stream_id") == ("fixture:seat" if seat else None)
     assert request.get("stream_token") == ("synthetic-seat-token" if seat else None)
     assert sum(f["type"] == request["type"] for f in socket.frames) == 1
@@ -238,4 +246,21 @@ def test_working_state_stream_does_not_extend_readiness_deadline(protocol, monke
         asyncio.run(wsclient.screen_lease_once(cfg, {"type": "screen.lease.acquire"}, timeout=.03))
     assert time.monotonic() - started < .3
     assert [frame["type"] for frame in socket.frames] == ["hello"]
+    assert socket.closed
+
+
+@pytest.mark.parametrize('verb', ['status', 'acquire', 'renew', 'release'])
+def test_seat_screen_rpc_never_reads_operator_credentials(protocol, monkeypatch, verb):
+    cfg, socket = protocol
+    monkeypatch.setenv('AGENT_ORCH_STREAM_ID', 'fixture:seat')
+    monkeypatch.setenv('AGENT_ORCH_STREAM_TOKEN', 'synthetic-seat-token')
+    def forbidden(*args):
+        pytest.fail('seat RPC attempted to read operator credentials')
+    monkeypatch.setattr(wsclient, 'resolve_operator_token', forbidden)
+    monkeypatch.setattr('agent_orch.send_boundary.resolve_operator_token', forbidden)
+    result = asyncio.run(wsclient.screen_lease_once(cfg, {'type': 'screen.lease.' + verb}))
+    assert result['type'] == 'screen.lease.' + verb + '.ok'
+    hello = socket.frames[0]
+    assert hello['stream_token'] == 'synthetic-seat-token'
+    assert 'auth_v2' not in hello
     assert socket.closed

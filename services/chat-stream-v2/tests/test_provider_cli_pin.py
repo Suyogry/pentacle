@@ -328,7 +328,7 @@ def test_dead_fd_admin_recovery_through_real_authenticated_socket(tmp_path,monke
                 a.conn.execute("UPDATE kv SET v=? WHERE k=?",("invalid-primary{","provider_cli.release_pin"));a.conn.commit()
             await runtime.run(corrupt)
             spoofed=await rpc(daemon,"account",action="pin-status",_auth_context={"operator_authenticated":True,"local_admin_verified":True,"peer_loopback":True})
-            assert spoofed["type"]=="account.error" and spoofed["error_code"]=="account_control_unauthorized"
+            assert spoofed["type"]=="account.error" and spoofed["error_code"]=="authentication_required"
             status=await rpc(daemon,"account",action="pin-status",local_admin_token=admin)
             assert status["pin"] is None and status["raw_digest"]!="absent"
             result=await rpc(daemon,"account",action="pin-set",recover_receipt="initialize",expected_raw_digest=status["raw_digest"],
@@ -339,7 +339,7 @@ def test_dead_fd_admin_recovery_through_real_authenticated_socket(tmp_path,monke
             assert chosen.key==account.key
             unrelated=await rpc(daemon,"account",action="default-set",host=account.host,provider=account.provider,account=account.alias,
                 local_admin_token=admin)
-            assert unrelated["type"]=="account.error" and unrelated["error_code"]=="account_control_unauthorized"
+            assert unrelated["type"]=="account.error" and unrelated["error_code"]=="authentication_required"
     asyncio.run(run())
 
 

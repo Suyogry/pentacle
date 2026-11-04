@@ -79,5 +79,34 @@ cells without rerunning accepted unchanged coverage or weakening assertions.
 
 ## Checkpoint
 
-Merge conflicts resolved; focused sign-in/security70 and authentication38 pass.
-Next: broad gates, isolated smoke, independent review and normal promotion.
+Merge and bounded compatibility repairs implemented. JavaScript/core, builds,
+isolated native desktop rehearsal/final, mic/security and focused daemon checks
+pass. Final full CLI and corrected affected-daemon unit manifest are running.
+Next: freeze gate receipts, independent final review and normal promotion.
+
+## Compatibility fixture repairs
+
+The new screen lease operator path loads operator credentials only for an
+operator identity. Authenticated seats continue through their own transport;
+service and ambiguous identities cannot fall back to operator authority.
+Regression tests forbid both operator loaders for every seat lease action.
+
+New upstream daemon tests are adapted to the fork's mandatory-auth contract:
+maintenance and log probes prove disposable operator credentials, inventory
+fanout fixtures establish verified trust, seat exchange uses one identity per
+socket, and fake spawn transports implement private token staging. Anonymous,
+forged-context and local-admin-only privilege negatives remain denied. These
+are fixture changes, without restoring the removed localhost exemption.
+
+The initial daemon file selection incorrectly included two long soak files.
+The interrupted result is retained as failed evidence. The corrected unit
+manifest excludes that directory as the official unit gate does. Default
+release-selection toolchain prerequisites are installed separately; this does
+not qualify an entire default-toolchain or fleet run.
+
+The real close/restart journey exposed an additional client seam: retired seat
+credentials cannot establish a general hello before replaying their close.
+Seat close uses existing independent per-request authentication; the server's
+existing token-hash/closed-target/generation checks remain authoritative.
+The native fixture verifies exactly one termination, durable close replay after
+restart, and rejection when that retired seat targets another live seat.

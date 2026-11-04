@@ -31,6 +31,10 @@ class PaneTmux:
     def __init__(self):
         self.live = set()
         self.created = 0
+        self.staged = {}
+
+    async def stage_text(self, path, data):
+        self.staged[path] = data
 
     async def has_session(self, name):
         return name in self.live
@@ -444,7 +448,8 @@ def test_approved_spawn_waits_for_independent_host_freeze_then_creates_one_pane(
                 "session_generation": advisor["session_generation"]}})
             assert approved["state"] == "approved" and tmux.created == 0
             assert await store.get_spawn_admission_hold("fixture-chat") is not None
-            await server._on_spawn_unfreeze({"host": "fixture-chat"})
+            await server._on_spawn_unfreeze({"host": "fixture-chat",
+                "_auth_context": {"operator_authenticated": True, "operator_principal": "operator:fixture"}})
             assert tmux.created == 1
             assert (await server.lane_rulings._fetch(pending["ruling_request_id"]))["state"] == "done"
             await server.lane_rulings.tick()

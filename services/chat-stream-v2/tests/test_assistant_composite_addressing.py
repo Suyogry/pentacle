@@ -540,10 +540,10 @@ def test_alias_through_outer_dispatch_auth_and_private_field_stripping(tmp_path)
         h.server._register_client(fresh)
         anonymous = await call(via=fresh, type="send", request_id="request-example-2", to_stream_id=ALIAS, text=BODY,
                                msg_id=102, **forged)
-        assert anonymous["error_code"] == "assistant_send_unauthorized"
+        assert anonymous["error_code"] == "authentication_required"
         spoofed = await call(type="send", request_id="request-example-3", to_stream_id=ALIAS, text=BODY,
                              msg_id=103, from_stream_id=SEAT_B, stream_token=token)
-        assert spoofed["error_code"] == "assistant_send_unauthorized"
+        assert spoofed["error_code"] == "authentication_required"
         # Supplied token without a sender claim, then the connection's cached
         # token binding without a claim: both refused for tell and send.
         for extra in ({"stream_token": token}, {}):

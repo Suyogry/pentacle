@@ -17,6 +17,7 @@ import asyncio
 import json
 
 from server import Server
+from _shared import operator_auth
 
 
 class _FakeWebSocket:
@@ -26,8 +27,9 @@ class _FakeWebSocket:
 
     remote_address = ("127.0.0.1", 54321)
 
-    def __init__(self, frames: list[str], *, hold: asyncio.Event | None = None) -> None:
+    def __init__(self, frames: list[str], *, credential: dict, hold: asyncio.Event | None = None) -> None:
         self._frames = list(frames)
+        self._credential = credential
         self._hold = hold
         self.sent: list[str] = []
         self.result_received = asyncio.Event()
@@ -43,6 +45,14 @@ class _FakeWebSocket:
         raise StopAsyncIteration
 
     async def send(self, data: str) -> None:
+        frame = json.loads(data)
+        if frame.get("type") == "welcome":
+            c = self._credential
+            self._frames.insert(0, json.dumps({"type": "hello", "client": c["client_kind"],
+                "subscribe": {"snapshot": False, "mode": "rpc"},
+                "auth_v2": {"scheme": operator_auth.AUTH_SCHEME, "credential_id": c["credential_id"],
+                    "proof": operator_auth.make_proof(c["proof_key"], frame["auth"]["operator"]["nonce"],
+                                                     c["credential_id"], c["client_kind"])}}))
         self.sent.append(data)
         if json.loads(data).get("type") == "send.result":
             self.result_received.set()
@@ -72,11 +82,14 @@ def _send_frame(index: int) -> str:
     )
 
 
-def test_send_survives_submitter_disconnect_v2() -> None:
+def test_send_survives_submitter_disconnect_v2(tmp_path) -> None:
     """Several accepted sends complete after the client disconnects."""
 
     async def go() -> None:
         server = Server()
+        server.operator_credential_registry = operator_auth.OperatorCredentialRegistry(tmp_path / "operators.json")
+        _, envelope = server.operator_credential_registry.issue("pentacle")
+        credential = operator_auth.decode_envelope(envelope)
         completed: list[str] = []
         entered = asyncio.Event()
         release = asyncio.Event()
@@ -96,7 +109,7 @@ def test_send_survives_submitter_disconnect_v2() -> None:
             }
 
         server.handlers["send"] = fake_send
-        ws = _FakeWebSocket([_send_frame(i) for i in range(3)], hold=disconnect)
+        ws = _FakeWebSocket([_send_frame(i) for i in range(3)], credential=credential, hold=disconnect)
         client = asyncio.create_task(server._handle_client(ws))
         try:
             await asyncio.wait_for(entered.wait(), 2)
@@ -121,7 +134,7 @@ def test_send_survives_submitter_disconnect_v2() -> None:
     asyncio.run(go())
 
 
-def test_held_connection_send_still_delivers_result_v2() -> None:
+def test_held_connection_send_still_delivers_result_v2(tmp_path) -> None:
     """AC3 regression: on a still-open connection a send's result is produced
     and enqueued to the client — detaching the task must not drop delivery for
     the connected case. (v2 runs sends concurrently and orders pastes via
@@ -130,6 +143,9 @@ def test_held_connection_send_still_delivers_result_v2() -> None:
 
     async def go() -> None:
         server = Server()
+        server.operator_credential_registry = operator_auth.OperatorCredentialRegistry(tmp_path / "operators.json")
+        _, envelope = server.operator_credential_registry.issue("pentacle")
+        credential = operator_auth.decode_envelope(envelope)
 
         handler_completed = asyncio.Event()
 
@@ -143,7 +159,7 @@ def test_held_connection_send_still_delivers_result_v2() -> None:
 
         server.handlers["send"] = fake_send
         hold = asyncio.Event()
-        ws = _FakeWebSocket([_send_frame(0)], hold=hold)
+        ws = _FakeWebSocket([_send_frame(0)], credential=credential, hold=hold)
         client_task = asyncio.create_task(server._handle_client(ws))
         try:
             await asyncio.wait_for(handler_completed.wait(), 2)

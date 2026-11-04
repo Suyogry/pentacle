@@ -10,7 +10,14 @@ import local_admin
 from account_runtime import AccountRuntime
 from provider_accounts import AccountError
 from test_account_rotation import binding, observation, NOW
-from test_loopback_privileged_rpc import scratch_daemon, rpc
+from test_loopback_privileged_rpc import scratch_daemon, rpc as raw_rpc
+from _shared import operator_auth
+
+
+async def rpc(daemon, verb, **fields):
+    if verb in {"spawn_freeze", "spawn_unfreeze"}:
+        fields["credential"] = daemon._maintenance_test_credential
+    return await raw_rpc(daemon, verb, **fields)
 
 
 @asynccontextmanager
@@ -25,6 +32,9 @@ async def ready_daemon(tmp_path,monkeypatch,*,serving_seat=False,provider="codex
     ctl=SpawnCtl(store,runtime.sessions)
     daemon=Server(port=0,store=store,sessions=runtime.sessions,spawnctl=ctl,
         local_host=selected.host,seat_operator_authority=False)
+    daemon.operator_credential_registry = operator_auth.OperatorCredentialRegistry(tmp_path / "operator-credentials.json")
+    _, envelope = daemon.operator_credential_registry.issue("pentacle")
+    daemon._maintenance_test_credential = operator_auth.decode_envelope(envelope)
     runtime.attach(daemon,ctl,SimpleNamespace())
     await daemon.bind()
     request={"host":selected.host,"reason":"scoped maintenance","ttl_s":60,
@@ -354,8 +364,11 @@ def test_scope_and_authority_refusals_do_not_overwrite_a_hold_or_create_a_slot(t
                     expected_hold_digest="absent",local_admin_token=request["local_admin_token"])
                 assert result["type"]=="spawn_unfreeze.error"
             else:
-                result=await rpc(daemon,"spawn_freeze",**request)
+                transport = raw_rpc if case == "anonymous" else rpc
+                result=await transport(daemon,"spawn_freeze",**request)
                 assert result["type"]=="spawn_freeze.error"
+                if case == "anonymous":
+                    assert result["error_code"] == "authentication_required"
             assert await runtime.run(lambda a:slot(a,selected.host)) is None
             assert await store.get_spawn_admission_hold(selected.host)==before
     asyncio.run(run())
@@ -456,6 +469,8 @@ def test_ui_interrupt_cannot_send_escape_through_a_scoped_input_fence(tmp_path,m
 def test_authenticated_freeze_stops_only_derived_home_and_survives_expiry(tmp_path, monkeypatch):
     async def run():
         async with scratch_daemon(tmp_path, monkeypatch) as (daemon, store, ctl, token):
+            _, envelope = daemon.operator_credential_registry.issue("pentacle")
+            daemon._maintenance_test_credential = operator_auth.decode_envelope(envelope)
             runtime=AccountRuntime(store,daemon.sessions,policy={"enabled":True},clock=lambda:NOW)
             runtime.attach(daemon,ctl,SimpleNamespace())
             selected=binding(host="fixture-host")

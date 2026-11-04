@@ -8,6 +8,7 @@ import pytest
 
 from assistant_composite import AssistantComposite, AssistantCompositeConfig
 from server import Server
+from _shared.operator_auth import OperatorCredentialRegistry, ConnectionTrust
 from sessions import Sessions
 from store import Store
 
@@ -73,7 +74,7 @@ def test_daff_projection_uses_configured_local_role_and_loaded_generation(monkey
 
 
 @pytest.mark.parametrize("frame_type", ["chat.event", "working.state", "completion.report", "session.died"])
-def test_default_visible_daff_backend_fanout_matches_hidden_seat_policy(monkeypatch, frame_type):
+def test_default_visible_daff_backend_fanout_matches_hidden_seat_policy(tmp_path, monkeypatch, frame_type):
     class Peer:
         remote_address = ("127.0.0.1", 12345)
 
@@ -81,6 +82,10 @@ def test_default_visible_daff_backend_fanout_matches_hidden_seat_policy(monkeypa
         store, sessions, server, daff, current = await _fixture(monkeypatch)
         try:
             peer = Peer()
+            server.operator_credential_registry = OperatorCredentialRegistry(tmp_path / "operators.json")
+            credential_id, _ = server.operator_credential_registry.issue("pentacle")
+            server._connection_trust[peer] = ConnectionTrust(
+                transport="v2", client_kind="pentacle", operator_trusted=True, credential_id=credential_id)
             server._client_assistant_composite_v1[peer] = True
             frame = {"type": frame_type, "stream_id": BACKEND}
             if frame_type == "chat.event":

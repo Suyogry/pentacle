@@ -90,6 +90,10 @@ class LiveTmux(GoneTmux):
     def __init__(self):
         self.live = set()
         self.created = 0
+        self.staged = {}
+
+    async def stage_text(self, path, data):
+        self.staged[path] = data
     async def has_session(self, name):
         return name in self.live
     async def new_session(self, name, command, cwd=None, env=None):

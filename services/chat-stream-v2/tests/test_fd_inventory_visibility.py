@@ -5,6 +5,7 @@ import asyncio
 
 from assistant_composite import AssistantComposite, AssistantCompositeConfig
 from server import Server
+from _shared.operator_auth import OperatorCredentialRegistry, ConnectionTrust
 from sessions import Sessions
 from store import Store
 
@@ -60,7 +61,7 @@ def test_bound_front_desk_is_projected_hidden_and_row_is_untouched(monkeypatch):
     asyncio.run(run())
 
 
-def test_bound_front_desk_events_are_withheld_from_ordinary_clients(monkeypatch):
+def test_bound_front_desk_events_are_withheld_from_ordinary_clients(tmp_path, monkeypatch):
     class Peer:
         remote_address = ("127.0.0.1", 12345)
 
@@ -68,6 +69,10 @@ def test_bound_front_desk_events_are_withheld_from_ordinary_clients(monkeypatch)
         store, sessions, server, holder = await _fixture(monkeypatch)
         try:
             peer = Peer()
+            server.operator_credential_registry = OperatorCredentialRegistry(tmp_path / "operators.json")
+            credential_id, _ = server.operator_credential_registry.issue("pentacle")
+            server._connection_trust[peer] = ConnectionTrust(
+                transport="v2", client_kind="pentacle", operator_trusted=True, credential_id=credential_id)
             server._client_include_subagents[peer] = False
             for frame_type in ("working.state", "session.died"):
                 assert server._frame_for_client(peer, frame_type, {"type": frame_type, "stream_id": f"{HOST}:holder"}) is None

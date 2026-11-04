@@ -25,6 +25,13 @@ require operator authority. Local-admin proof is reserved for the existing
 limited recovery routes; it cannot bootstrap a token grant or spawn-admission
 change. Setting `role=nexus` retains its separate parent/operator authorization.
 
+Seat `close` requests authenticate their token on the request without opening a
+general-purpose hello session. This also lets a retired seat replay its own
+completed close after a reconnect or daemon restart. The daemon rechecks the
+actual token hash and closed target; this exception grants no subscription or
+operator authority and cannot close another seat. Generation fencing still
+applies to prevent a stale cleanup request from closing a replacement.
+
 The account `pin-status` and `pin-set` recovery actions also accept verified
 daemon-user local-admin proof on an actual native loopback connection. Their
 CLI path bypasses stale seat identity and the ordinary hello, using the same

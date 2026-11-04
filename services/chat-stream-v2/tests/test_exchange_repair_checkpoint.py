@@ -668,41 +668,40 @@ def test_socket_restart_keeps_replay_identity_and_never_redelivers(tmp_path):
                 daemon = Server(port=0, store=store, sessions=sessions, spawnctl=ctl,
                                 comms=comms, ledger=ledger, local_host="test-host")
                 port = await daemon.bind()
-                async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
-                    assert json.loads(await ws.recv())["type"] == "welcome"
-                    async def rpc(payload):
+                async def rpc(payload):
+                    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+                        assert json.loads(await ws.recv())["type"] == "welcome"
                         await ws.send(json.dumps(payload))
-                        # The fake pane has no native USER proof; Comms owns a 4 s
-                        # bounded proof wait before its truthful pending receipt.
+                        # Comms waits for bounded native USER proof before its pending receipt.
                         async with asyncio.timeout(10):
                             while True:
                                 frame = json.loads(await ws.recv())
                                 assert frame.get("type") != "error", frame
                                 if frame.get("request_id") == payload["request_id"] or frame.get("type", "").startswith(payload["type"] + "."):
                                     return frame
-                    tell = dict(type="tell", request_id="tell-request", tell_id="socket-tell",
-                                stream_id="test-host:child", from_stream_id="test-host:parent",
-                                stream_token="parent-token", message="Synthetic retained message")
-                    told = await rpc(tell)
-                    assert told["type"] == "tell.ok", told
-                    if not boot:
-                        first_tell = told
-                    else:
-                        assert told["duplicate"] and told["ledger_row_id"] == first_tell["ledger_row_id"]
-                    report = await rpc(dict(type="report", request_id="report-request", report_id="socket-report",
-                                            from_stream_id="test-host:child", stream_token="child-token",
-                                            msg_id=0, status="progress", summary="Synthetic progress", findings=[], next_action="continue"))
-                    assert report["type"] == "report.ok", report
-                    page = await rpc(dict(type="thread.read", request_id="thread-request", child_stream_id="test-host:child",
-                                          stream_token="parent-token"))
-                    assert page["type"] == "thread.read.ok", page
-                    if not boot:
-                        first_page = page["rows"]
-                        assert {row["kind"] for row in first_page} == {"tell", "report"}
-                        await store.submit(lambda c: (c.execute("DELETE FROM v2_child_exchange"), c.commit()))
-                    else:
-                        assert page["rows"] == first_page
-                        assert tmux.pastes == 1
+                tell = dict(type="tell", request_id="tell-request", tell_id="socket-tell",
+                            stream_id="test-host:child", from_stream_id="test-host:parent",
+                            stream_token="parent-token", message="Synthetic retained message")
+                told = await rpc(tell)
+                assert told["type"] == "tell.ok", told
+                if not boot:
+                    first_tell = told
+                else:
+                    assert told["duplicate"] and told["ledger_row_id"] == first_tell["ledger_row_id"]
+                report = await rpc(dict(type="report", request_id="report-request", report_id="socket-report",
+                                        from_stream_id="test-host:child", stream_token="child-token",
+                                        msg_id=0, status="progress", summary="Synthetic progress", findings=[], next_action="continue"))
+                assert report["type"] == "report.ok", report
+                page = await rpc(dict(type="thread.read", request_id="thread-request", child_stream_id="test-host:child",
+                                      from_stream_id="test-host:parent", stream_token="parent-token"))
+                assert page["type"] == "thread.read.ok", page
+                if not boot:
+                    first_page = page["rows"]
+                    assert {row["kind"] for row in first_page} == {"tell", "report"}
+                    await store.submit(lambda c: (c.execute("DELETE FROM v2_child_exchange"), c.commit()))
+                else:
+                    assert page["rows"] == first_page
+                    assert tmux.pastes == 1
             finally:
                 if daemon:
                     await daemon.close()

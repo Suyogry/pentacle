@@ -82,9 +82,31 @@ def _closed_audits(cell, name):
     return cell.sql("SELECT * FROM v2_close_audit WHERE session_name=? AND disposition='closed'", (name,))
 
 
-def test_owned_close_refuses_foreign_identity_and_replays_across_restart(tmp_path):
+def test_owned_close_refuses_foreign_identity_and_replays_across_restart(tmp_path, monkeypatch):
     owned, foreign = "g2-owned", "g2-foreign"
     with rm.cell_env(tmp_path / "cell", tmp_path / "evidence") as cell:
+        from _shared.operator_auth import OperatorCredentialRegistry
+        from _shared.operator_client import operator_hello
+        registry = OperatorCredentialRegistry(cell.daemon.home / ".config/pentacle-stream/operator-credentials.json")
+        _, envelope = registry.issue("pentacle")
+        token_path = cell.root / "operator-token"
+        token_path.write_text(envelope)
+        token_path.chmod(0o600)
+
+        def authenticated_rpc(url, payload, *, timeout=10):
+            from websockets.sync.client import connect
+            payload = {"request_id": "restart-fixture", **payload}
+            with connect(url, open_timeout=5, max_size=None) as ws:
+                welcome = json.loads(ws.recv(timeout=5))
+                ws.send(json.dumps(operator_hello(welcome, token_path=token_path)))
+                ws.send(json.dumps(payload))
+                import time
+                deadline = time.monotonic() + timeout
+                while True:
+                    frame = json.loads(ws.recv(timeout=max(.01, deadline - time.monotonic())))
+                    if frame.get("request_id") == payload["request_id"]:
+                        return frame
+        monkeypatch.setattr(rm, "rpc", authenticated_rpc)
         events = _record_termination(cell)
         cell.daemon.start()
         rm.seed_seats(cell, owned, foreign)
@@ -147,6 +169,9 @@ def test_owned_close_refuses_foreign_identity_and_replays_across_restart(tmp_pat
         for _ in range(2):
             rc, repeated = _close(cell, owned, owned, generation)
             assert rc == 0 and repeated["type"] == "close.already_closed", repeated
+        rc, refused = _close(cell, owned, foreign, before[foreign][0]["session_generation"])
+        assert rc == 1 and refused["type"] == "close.error", refused
+        assert refused["error_code"] == "close_unauthorized", refused
         assert _row(cell, owned)["status"] == "closed"
         assert _row(cell, owned)["session_generation"] == generation
         assert not cell.panes(owned)
