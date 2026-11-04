@@ -2910,10 +2910,13 @@ async def close_once(
     if not host or not session_name:
         raise ValueError("invalid_stream_id")
     actor = from_stream_id or caller_stream_id
+    identity = resolve_outbound_identity(actor)
+    if identity.kind == "seat":
+        from_stream_id = actor = identity.stream_id
     # A retired seat cannot authenticate a general-purpose hello. Close still
     # verifies its token per request, with an existing narrow self-replay check.
     # Keep live seats on the same path and never fall back to operator proof.
-    connection_options = {"independent_auth": True} if resolve_outbound_identity(actor).kind == "seat" else {}
+    connection_options = {"independent_auth": True} if identity.kind == "seat" else {}
     ws = await _connect_rpc_ready(config, from_stream_id=actor, **connection_options)
     request_id = f"close-{uuid.uuid4()}"
     try:
@@ -2940,7 +2943,8 @@ async def close_once(
             payload["disposition_waived_reason"] = disposition_waived_reason
         if expected_generation is not None:
             payload["expected_generation"] = expected_generation
-        payload = defer_stream_token(payload, enabled=bool((from_stream_id or caller_stream_id)), keep=False)
+        payload = defer_stream_token(payload, enabled=bool((from_stream_id or caller_stream_id)), keep=False,
+                                     require=identity.kind == "seat")
         await send_frame(ws, payload, config=config, explicit_from_stream_id=from_stream_id)
         deadline = time.monotonic() + timeout
         return await _read_rpc_response(ws, request_id, prefix="close", deadline=deadline)

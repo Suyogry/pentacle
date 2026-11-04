@@ -27,6 +27,20 @@ def test_base_wire_parity(key, expected):
         assert frames[0]["token"] == "OPERATOR-sentinel"
         assert "from_stream_id" not in frames[0] and "stream_token" not in frames[0]
         assert actual["closed"] and actual["error"] is None
+    elif identity == "SEAT" and path == "close":
+        # Close authenticates on its request so retired seats can replay their
+        # own closed result without establishing a general hello session.
+        frames = [json.loads(raw) for group in actual["frames"] for raw in group]
+        token = {"F1": "FILE-sentinel", "F6": "LEGACY-sentinel"}.get(state)
+        if token:
+            assert len(frames) == 1 and frames[0]["type"] == "close"
+            assert frames[0]["from_stream_id"] == "fixture:seat"
+            assert frames[0]["stream_token"] == token
+            assert "token" not in frames[0] and "auth_v2" not in frames[0]
+            assert actual["error"] is None
+        else:
+            assert not frames and actual["error"] == "SeatCredentialUnavailable"
+        assert actual["closed"]
     elif identity == "SEAT" or (identity == "OP" and path == "status"):
         # Local authentication intentionally retires the old ambient operator
         # token on seat hellos. Preserve the golden contract on other cells;
