@@ -85,6 +85,46 @@
     "completed_at": "2026-10-26"
   },
   {
+    "id": "spec_pentacle__provider_usage_setup_20261027",
+    "path": "work/completed/pentacle__provider_usage_setup_20261027/spec.md",
+    "title": "Restore provider quota updates across desktop launches",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-10-27",
+    "source_path": "work/completed/pentacle__provider_usage_setup_20261027/spec.md",
+    "tags": [
+      "pentacle"
+    ],
+    "summary": "Discover the private user profile and document external quota collection for packaged desktop launches.",
+    "related": [
+      "work_pentacle__provider_usage_setup_20261027"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-27"
+  },
+  {
+    "id": "spec_pentacle__upstream_sync_20261104",
+    "path": "work/completed/pentacle__upstream_sync_20261104/spec.md",
+    "title": "Integrate official updates while preserving fork workflows",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-11-04",
+    "source_path": "work/completed/pentacle__upstream_sync_20261104/spec.md",
+    "tags": [
+      "pentacle"
+    ],
+    "summary": "Merge captured official main into the personal fork, retaining authentication hardening and supported desktop sign-in.",
+    "related": [
+      "work_pentacle__upstream_sync_20261104"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-11-04"
+  },
+  {
     "id": "spec_provider_signin_format_20261027",
     "path": "work/completed/pentacle__provider_signin_format_20261027/spec.md",
     "title": "Recognize the installed Claude CLI authorization URL format",
@@ -254,6 +294,46 @@
     "machine": "local",
     "owner": "maintainer",
     "completed_at": "2026-10-26"
+  },
+  {
+    "id": "work_pentacle__provider_usage_setup_20261027",
+    "path": "work/completed/pentacle__provider_usage_setup_20261027/summary.md",
+    "title": "Restore provider quota updates across desktop launches",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-10-27",
+    "source_path": "work/completed/pentacle__provider_usage_setup_20261027/summary.md",
+    "tags": [
+      "pentacle"
+    ],
+    "summary": "Discover the private user profile and document external quota collection for packaged desktop launches.",
+    "related": [
+      "spec_pentacle__provider_usage_setup_20261027"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-10-27"
+  },
+  {
+    "id": "work_pentacle__upstream_sync_20261104",
+    "path": "work/completed/pentacle__upstream_sync_20261104/summary.md",
+    "title": "Integrate official updates while preserving fork workflows",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-11-04",
+    "source_path": "work/completed/pentacle__upstream_sync_20261104/summary.md",
+    "tags": [
+      "pentacle"
+    ],
+    "summary": "Merge captured official main into the personal fork, retaining authentication hardening and supported desktop sign-in.",
+    "related": [
+      "spec_pentacle__upstream_sync_20261104"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-11-04"
   },
   {
     "id": "work_provider_signin_format_20261027",

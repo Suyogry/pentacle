@@ -2,11 +2,12 @@
 id: spec_pentacle__upstream_sync_20261104
 title: Integrate official updates while preserving fork workflows
 type: spec
-status: in_progress
+status: completed
 canonical: false
 created_at: '2026-11-04'
 updated_at: '2026-11-04'
-source_path: work/in_progress/pentacle__upstream_sync_20261104/spec.md
+completed_at: '2026-11-04'
+source_path: work/completed/pentacle__upstream_sync_20261104/spec.md
 machine: local
 owner: maintainer
 tags:
@@ -73,16 +74,27 @@ cells without rerunning accepted unchanged coverage or weakening assertions.
 ## Acceptance
 
 - [x] Scope, identity, requirements and independent plan review established.
-- [ ] Captured upstream main is ancestor; supported fork behavior preserved.
-- [ ] Relevant gates and isolated native workflows pass; final QA accepts.
-- [ ] Personal main and remote fork updated normally with clean readback.
+- [x] Captured upstream main is ancestor; supported fork behavior preserved.
+- [x] Relevant gates and isolated native workflows pass; final QA accepts.
+- [x] Personal main and remote fork updated normally with clean readback.
 
-## Checkpoint
+## Closure — shipped
 
-Merge and bounded compatibility repairs implemented. JavaScript/core, builds,
-isolated native desktop rehearsal/final, mic/security and focused daemon checks
-pass. Final full CLI and corrected affected-daemon unit manifest are running.
-Next: freeze gate receipts, independent final review and normal promotion.
+Independent final QA accepted source candidate
+`8df132e1ade2b4995cde4c22011333b82239b39b`. Personal main was fast-forwarded
+and pushed normally to origin/main. All acceptance criteria are satisfied.
+Validation and bounded recovery details are in `_artifacts/validation.md`;
+private receipt names and hashes are indexed in `_artifacts/evidence.json`.
+No personal runtime activation was part of this source delivery.
+
+## Retro
+
+Preserving the fork's stronger authentication requires composing new upstream
+clients and test fixtures with real proof. Exercise restart/idempotency paths
+as well as initial login. Select unit files with the official directory exclusions,
+keep original failed evidence, and reuse unchanged passing coverage within its
+actual input bounds. Independent review caught credential-loader and ambient-seat
+edge cases before promotion.
 
 ## Compatibility fixture repairs
 
