@@ -70,7 +70,12 @@ remain in the transcript. `last_event_at` still advances for other durable
 activity, so its timestamp can be newer than the preview message.
 
 Visible messages are ordered by event timestamp, then durable `daemon_seq`.
-The live inventory preserves that result across metadata refreshes and clears
+The assistant composite stream's rows reach the store without a provider ingest
+event, so `AssistantComposite` advances its registry preview itself after each
+committed row: reply publication, work-lane publication, operator input
+admission, the mirror/turn-final projection and the authority-unavailable
+ruling status line. The composite's `last_text`
+therefore tracks its latest visible message without a daemon restart. The live inventory preserves that result across metadata refreshes and clears
 it when a session generation changes. Startup reconstructs each open session's
 preview from at most its newest 500 lifecycle-matched durable events, using the
 same projection as live ingest. Existing chats therefore gain previews without
@@ -87,7 +92,8 @@ the fallback even outside the visible page. A genuinely repeated message gains
 its own row when its transcript event arrives. Returned-to-prompt, optimistic,
 image-wrapper, working-state and tool suppression rules still apply.
 
-The web sidebar's one-line row preview is plain text: `sanitizeSidebarDetail`
+The web sidebar's one-line row preview comes from `last_text` only; the tmux pane
+line in a session's presence `preview` never appears in a row. It is plain text: `sanitizeSidebarDetail`
 in `renderer/chat_ui_state.js` drops emphasis, code-span ticks, link syntax and
 heading, list, quote and fence markers, keeping the words, and joins lines. The
 `sidebar-preview-plain-text` web gate scenario checks it against a seeded
@@ -95,7 +101,9 @@ Markdown message. The chat view keeps full Markdown.
 
 The captured synthetic provider-ingestion fixture is
 `pentacle-chat-core/tests/fixtures/summary-fallback-frames.json`. Core tests replay
-it before and after backfill; the `summary-fallback-formatting` web gate scenario
+it before and after backfill; `composite-summary-fallback-frames.json` holds real
+composite rows (operator input, reply publication, mirror) for the same check
+against the composite's now-live `last_text`; the `summary-fallback-formatting` web gate scenario
 also records DOM mutations across idle/working inventory updates, checking both
 Markdown structure and the absence of a transient duplicate bubble.
 
@@ -173,7 +181,15 @@ household store. The daemon keeps no household state, cache or broadcast.
 
 ## Session interrupt
 
-The web/desktop composer uses ordinary `send` for every message. A provider-queued row's Send now action uses the existing generation-fenced `send.interrupt`; it does not resend the already-queued message. Native queue order and combined release remain provider-owned, and the row stays Queued until normal receipt/USER reconciliation confirms processing. The lower-level `send.urgent` field remains available to callers that explicitly request Escape before a new message; the composer does not use it. The composite send path ignores that field and exposes no queued-row interrupt action.
+The operator web/desktop composer uses ordinary `send` for Send, Enter and Alt+Enter; Shift+Enter inserts a newline. The operator-only `chat-stream:send` IPC handler drops urgency, including stale-tab `reply.urgent=true`. Intentional lower-level agent sends/tells and scheduled urgent wakes retain their existing urgency. Explicit Stop remains generation-fenced and cancels pending queued continuations.
+
+Qualified provider-queued rows offer **Send now**, without a permanent warning. The separate `chat-stream:queued-send-now` IPC sends `send.interrupt` with `queued_send_now: { original_request_id, optimistic_id }` and `expected_session_generation`; it never repastes the original body. The daemon validates the authenticated operator, durable receipt, queue ownership, generation and installed provider/executable identity. Native intake already proved means no keypress. A durable control record in the existing `kv` store begins when ordinary intake observes provider queue ownership under the lifecycle/input locks; legacy rows without this generation binding fail closed.
+
+For qualified Claude, the daemon sends one native Ctrl+X Ctrl+S. Native queue-and-draft semantics apply: backgroundable work can continue, other work may interrupt. A nonempty or unproven native draft refuses the action; web drafts remain untouched. For qualified Codex, it sends one Escape bound to the active native turn. Only a matching authenticated native `turn_aborted` with reason `interrupted`, after the operation watermark, plus the selected original's durable native intake, authorizes one ordinary daemon `continue`. Explicit Stop, external Escape, agent urgency, typed interruption text and historical events never arm this policy. Continuation requests use permanent same-ID send dedupe; key-dispatch uncertainty never replays a key. Receipt/native intake does not assert model completion.
+
+Supported identities are held by the daemon's qualified provider/version/executable pins and advertised as `capabilities.queued_send_now`. Remote/unqualified versions keep provider queue behavior with no new key fallback. Repeated clicks, lost ACK and reconnect reconcile the same control operation. The queued-action RPC has a bounded 15-second acknowledgement wait; retry retains the original identities.
+
+Old cached queued-row controls still call generic interrupt, indistinguishable from Stop. Host urgency stripping protects stale new-message urgency only. The existing build-change icon prompts a click to reload; it neither auto-reloads nor blocks an old tab. A deployment requires its authorized operator-tab refresh/closure disposition before a live claim.
 
 `send.interrupt` names a session with `host` and `session_name`. For a configured
 remote host, updated web and desktop clients also send the selected open row's
@@ -394,7 +410,18 @@ is not a playback control. Pending bars are 2.5 px wide with 2 px gaps, height
 `max(2, round(l * 22))` and opacity `0.4 + 0.6 * l`; a take without samples uses
 30 fallback levels of 0.2. The pending spinner respects reduced motion too.
 
-The path remains **upload_blob → transcribe_blob → ordinary send**. The browser
+When the daemon advertises `outbound_commit_v1`, the chat composer commits the
+take before uploading it (`chat-stream:outbound-commit`, see
+[committed-outbound-send.md](../services/chat-stream-v2/docs/committed-outbound-send.md)):
+the daemon transcribes and sends once the audio arrives, even if the page is
+reloaded or closed. The take polls `chat-stream:outbound-get` until the send
+commits. A server failure shows its reason; Retry then takes the client path
+below with the committed request and optimistic ids, so receipts coalesce.
+Discard calls `chat-stream:outbound-cancel`, which never implies the message
+landed. A definite commit refusal (no capability, older daemon, invalid
+mandate) uses the client path directly; voice answers always do.
+
+The client path is **upload_blob → transcribe_blob → ordinary send**. The browser
 uses `chat-stream:upload-blob`, then the authenticated
 `chat-stream:transcribe-blob` bridge to the daemon's existing `transcribe_blob`
 verb. It does not introduce a second backend. A nonempty trimmed transcript

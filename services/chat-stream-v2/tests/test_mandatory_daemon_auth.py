@@ -273,3 +273,52 @@ def test_private_credential_loader_rejects_unsafe_sources(tmp_path, kind):
         path = Path("relative.token")
     with pytest.raises(PermissionError, match="unavailable or unsafe"):
         read_private_token(path)
+
+
+@pytest.mark.parametrize('action', ['pin-status', 'pin-set'])
+def test_account_pin_recovery_uses_only_verified_local_admin_authority(tmp_path, monkeypatch, action):
+    import local_admin
+    path = tmp_path / 'local-admin.token'
+    path.write_text('a' * 64)
+    path.chmod(0o600)
+    monkeypatch.setattr(local_admin.verify, '__defaults__', (path,))
+    monkeypatch.setenv('AGENT_ORCH_STREAM_ID', 'fixture:missing-seat')
+
+    async def run():
+        daemon = Server(host='127.0.0.1', port=0, local_host='fixture')
+        calls = []
+        async def account(message):
+            auth = message['_auth_context']
+            assert auth['local_admin_verified'] and auth['peer_loopback']
+            assert not auth['operator_authenticated']
+            assert message['action'] == action
+            calls.append(message)
+            return {'type': 'account.ok', 'recovery': True}
+        daemon.handlers['account'] = account
+        try:
+            port = await daemon.bind()
+            config = Config(f'ws://127.0.0.1:{port}', 'pentacle-auth-v2:INVALID', 'fixture', tmp_path)
+            result = await wsclient.account_once(config, {
+                'type': 'account', 'action': action, 'local_admin_token': 'a' * 64,
+                'from_stream_id': 'fixture:dead-seat', 'stream_token': 'stale-seat-proof',
+            }, timeout=2)
+            assert result['type'] == 'account.ok' and result['recovery']
+            assert len(calls) == 1
+            async with websockets.connect(config.ws_url) as socket:
+                await socket.recv()
+                for verb, fields in (
+                    ('account', {'action': action, 'local_admin_token': 'b' * 64}),
+                    ('account', {'action': 'status', 'local_admin_token': 'a' * 64}),
+                    ('account', {'action': 'relogin', 'local_admin_token': 'a' * 64}),
+                    ('spawn', {'command': 'must-not-run', 'local_admin_token': 'a' * 64}),
+                    ('list_sessions', {'local_admin_token': 'a' * 64}),
+                ):
+                    await socket.send(json.dumps({'type': verb, **fields}))
+                    assert json.loads(await socket.recv())['error_code'] == 'authentication_required'
+            assert len(calls) == 1
+            assert not daemon._independent_recovery_admitted('account', {'action': action}, {
+                'local_admin_verified': True, 'peer_loopback': False,
+            })
+        finally:
+            await daemon.close()
+    asyncio.run(run())

@@ -27,6 +27,8 @@ expired; backoff on failure; kill switch `--disable-notification-expiry`.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import qa_dispatch
 
 import asyncio
@@ -470,7 +472,8 @@ class Comms:
                     current_pane = await tmux.capture(name)
                     if (claude_command_exactly_in_active_draft(current_pane, command)
                             and await tmux.input_mode_clear(name)):
-                        await tmux.send_enter_compact(name)
+                        async with self._account_input_guard(stream_id,phase="enter_failed"):
+                            await tmux.send_enter_compact(name)
                         proof = await self._durable_submission_evidence(
                             stream_id, command, watermark=watermark,
                         )
@@ -483,7 +486,8 @@ class Comms:
                     return {"outcome": "pending_input", "reason": type(exc).__name__}
 
             try:
-                await tmux.paste_compact(name, command)
+                async with self._account_input_guard(stream_id):
+                    await tmux.paste_compact(name, command)
             except VerbError as exc:
                 phase = str(exc.extra.get("phase") or "body_maybe_pasted")
                 if phase == "not_started":
@@ -585,6 +589,11 @@ class Comms:
         prior = await self.store.get_tell_delivery(tell_id)
         if prior is not None:
             self._assert_same_payload(tell_id, digest, prior)
+            async with self._pane_input_lock(str(route["final_target"])):
+                prior = await self.store.get_tell_delivery(tell_id)
+                self._assert_same_payload(tell_id, digest, prior)
+                prior = (await self.store.promote_tell_delivery(
+                    tell_id, digest, reconcile=True)) or prior
             return {**prior["reply"], "duplicate": True}
         pending = self._inflight.get(tell_id)
         if pending is not None:
@@ -852,8 +861,14 @@ class Comms:
     ) -> dict[str, Any]:
         """Inject once, then durably record the provider's truth boundary."""
         binding = await self.store.exchange_binding(str(msg.get("from_stream_id") or msg.get("actor_stream_id") or ""), str(route["final_target"]))
+        original = await self.store.fetch_session(*self.sessions.split(str(route["final_target"]))) or {}
+        prepared = False
+        async def before_paste(watermark):
+            nonlocal prepared
+            await self._prepare_tell_input(msg, tell_id, route, body, digest, original, watermark)
+            prepared = True
         confirmed, attempts, provider, active_draft, proof, watermark = await self._attempt_delivery(
-            msg, route, body,
+            msg, route, body, before_paste=before_paste,
         )
         if msg.get("_notification_answer_generation"):
             prior = await self.reconcile_notification_answer(
@@ -909,8 +924,10 @@ class Comms:
             "delivered_at": enqueued_at if delivery_status == "delivered" else None,
             "delivery_ack_at": ack_at,
             "request_payload_hash": digest,
-            **(watermark_fields(watermark) if durable_notice else {}),
-            **(proof.audit_fields() if durable_notice else {}),
+            **watermark_fields(watermark),
+            **proof.audit_fields(),
+            "proof_generation": original.get("session_generation"),
+            "proof_session_created_at": original.get("created_at"),
             **(
                 {
                     key: reply[key]
@@ -925,10 +942,36 @@ class Comms:
         }
         from store_exchange import source
         delivery["exchange"] = source(binding, "tell", tell_id, strip_peer_delivery_envelope(body), enqueued_at)
-        reply["ledger_row_id"] = await self.store.put_tell_delivery(
-            tell_id, {"payload_digest": digest, "reply": reply, "delivery": delivery}
-        )
+        envelope = {"payload_digest": digest, "reply": reply, "delivery": delivery}
+        if prepared:
+            finalized = await self.store.promote_tell_delivery(tell_id, digest, prepared_result=envelope)
+            if finalized is None:
+                # A stale/corrupt completion cannot overwrite original custody.
+                finalized = await self.store.get_tell_delivery(tell_id)
+                self._assert_same_payload(tell_id, digest, finalized)
+            # Ingest may have recorded proof while this was still a preparation
+            # row. Finalize its route/exchange metadata before reconciling it.
+            if finalized["reply"].get("delivery_status") == COMMITTED_PENDING_PROOF:
+                finalized = (await self.store.promote_tell_delivery(tell_id, digest, reconcile=True)) or finalized
+            return finalized["reply"]
+        reply["ledger_row_id"] = await self.store.put_tell_delivery(tell_id, envelope)
         return reply
+
+    async def _prepare_tell_input(self, msg, tell_id, route, body, digest, original, watermark):
+        """Existing tell receipt custody, before input, never a claim of delivery."""
+        reply = self._tell_reply(tell_id, route, submission_confirmed=False,
+            delivery_status="proof_unavailable", submission_attempts=0, reason="input_outcome_unknown")
+        reply.update(action_status="indeterminate", action_committed=False,
+                     confirmation_pending=True, confirmation_status="pending", do_not_resubmit=True,
+                     reconcile="tell_id_evidence_only", **watermark_fields(watermark))
+        delivery = {"tell_id":tell_id, "to_stream_id":str(route["final_target"]), "text":body,
+            "from_stream_id":str(msg.get("from_stream_id") or msg.get("actor_stream_id") or ""),
+            "delivery_status":"proof_unavailable", "submission_confirmed":False, "submission_attempts":0,
+            "delivered_at":None, "request_payload_hash":digest,
+            "proof_generation":original.get("session_generation"),
+            "proof_session_created_at":original.get("created_at"), **watermark_fields(watermark)}
+        await self.store.put_tell_delivery(tell_id,
+            {"payload_digest":digest, "reply":reply, "delivery":delivery})
 
     def _tell_reply(
         self,
@@ -1002,6 +1045,12 @@ class Comms:
         row = await self.store.fetch_session(host, name)
         if row is None:
             row = self.sessions.get(target)
+        runtime=getattr(self,"account_runtime",None)
+        if runtime is not None and row is not None:
+            from provider_accounts import AccountError
+            try:await runtime.maintenance_input(row)
+            except AccountError as exc:
+                raise VerbError(str(exc),str(exc),**exc.context) from None
         if row is not None and str(row.get("status") or "") == "open":
             raw_body = msg.get("message") if "message" in msg else msg.get("text")
             await self._assert_codex_input_allowed(
@@ -1297,6 +1346,7 @@ class Comms:
 
     async def _attempt_delivery(
         self, msg: dict[str, Any], route: dict[str, Any], body: str,
+        *, before_paste=None,
     ) -> tuple[bool, int, str, bool, EventProof, EventWatermark]:
         """Deliver ``body`` and return proof, attempts, provider, and active-draft evidence."""
         target = str(route["final_target"])
@@ -1308,14 +1358,18 @@ class Comms:
         if msg.get("_notification_answer_generation") and provider not in SUBMIT_PREDICATES:
             raise VerbError("bad_request", "answer delivery requires a supported USER-proof provider")
         tmux = self.hosts.tmux_for(host) if self.hosts is not None else self.spawnctl.tmux
+        async def prepare(watermark):
+            if msg.get("_notification_answer_generation"):
+                await self._prepare_answer_input(msg, route, body, watermark)
+            else:
+                if msg.get("_assistant_authority_request_generation"):
+                    await self._validate_assistant_request_target(msg, route)
+                if before_paste is not None:
+                    await before_paste(watermark)
         confirmed, attempts, active_draft, proof, watermark = await self._inject_body(
             tmux, name, body, provider, bool(msg.get("urgent")), target,
             durable_proof=msg.get("_durable_notice_proof") is True,
-            before_paste=(
-                lambda watermark: self._prepare_answer_input(msg, route, body, watermark)
-            ) if msg.get("_notification_answer_generation") else (
-                lambda watermark: self._validate_assistant_request_target(msg, route)
-            ) if msg.get("_assistant_authority_request_generation") else None,
+            before_paste=prepare,
         )
         return confirmed, attempts, provider, active_draft, proof, watermark
 
@@ -1360,14 +1414,16 @@ class Comms:
             before = await tmux.capture(name)
             await self._assert_codex_pane_input_safe(stream_id, before)
         if urgent:
-            await tmux.run("send-keys", "-t", f"={name}:", "Escape")
+            async with self._account_input_guard(stream_id):
+                await tmux.run("send-keys", "-t", f"={name}:", "Escape")
             before = None
             if provider == "codex":
                 before = await tmux.capture(name)
                 await self._assert_codex_pane_input_safe(stream_id, before)
         if provider not in SUBMIT_PREDICATES:
             before = before if before is not None else await tmux.capture(name)
-            await tmux.paste(name, body)
+            async with self._account_input_guard(stream_id):
+                await tmux.paste(name, body)
             confirmed = await self.spawnctl._await_marker(
                 name, receipt_needle(body), RECEIPT_TIMEOUT_S, since=before, tmux=tmux,
             )
@@ -1375,14 +1431,11 @@ class Comms:
             proof = EventProof("proven" if confirmed else "pending", stream_id, 0)
             return confirmed, 1, False, proof, watermark
         before = before if before is not None else await tmux.capture(name)
-        if durable_proof:
-            watermark = await self._watermark_before_action(stream_id)
-        else:
-            legacy_watermark = await self._submission_watermark(stream_id) if provider == "codex" else 0
-            watermark = EventWatermark(stream_id, legacy_watermark, "reachable")
-        if before_paste is not None:
-            await before_paste(watermark)
-        await tmux.paste(name, body)
+        watermark = await self._watermark_before_action(stream_id)
+        async with self._account_input_guard(stream_id):
+            if before_paste is not None:
+                await before_paste(watermark)
+            await tmux.paste(name, body)
         if durable_proof:
             proof = await self._durable_submission_evidence(
                 stream_id, body, watermark=watermark,
@@ -1411,7 +1464,15 @@ class Comms:
         )
         if not in_draft:
             return False, 1, False, proof, watermark
-        await self._send_enter(tmux, name)
+        try:
+            async with self._account_input_guard(stream_id,phase="enter_failed"):
+                await self._send_enter(tmux, name)
+        except VerbError as exc:
+            if exc.code!="provider_cli_input_maintenance":raise
+            # The first paste is durable input custody. Record its pending
+            # truth so a same-ID retry can never paste the body a second time.
+            return False,1,True,EventProof("pending",stream_id,watermark.daemon_seq,
+                reason="provider_cli_input_maintenance"),watermark
         if durable_proof:
             proof = await self._durable_submission_evidence(
                 stream_id, body, watermark=watermark,
@@ -1662,6 +1723,23 @@ class Comms:
         except Exception as exc:  # noqa: BLE001 - public send error is stable
             raise VerbError("paste_failed", str(exc), phase="enter_failed") from exc
 
+    @asynccontextmanager
+    async def _account_input_guard(self,target,*,phase="not_started"):
+        runtime=getattr(self,"account_runtime",None)
+        if runtime is None:
+            yield
+            return
+        from provider_accounts import AccountError
+        host,name=self.sessions.split(target)
+        try:
+            async with runtime.input_guard(await self.store.fetch_session(host,name) or {}):
+                yield
+        except AccountError as exc:
+            if str(exc)=="provider_cli_input_maintenance" and phase!="not_started":
+                exc.context.update(delivery="pasted_unsubmitted",attempts=1,action_committed=True,
+                                   confirmation_pending=True,do_not_resubmit=True)
+            raise VerbError(str(exc),str(exc),phase=phase,**exc.context) from None
+
     async def _attempt_send_delivery(self, plan: SendPlan) -> tuple[bool, int, bool, str, str | None]:
         """Submit one prepared plan: one paste, then at most one Enter retry."""
         target = str(plan.route["final_target"])
@@ -1674,7 +1752,8 @@ class Comms:
             before = await tmux.capture(name)
             await self._assert_codex_pane_input_safe(target, before)
         if plan.message.get("urgent"):
-            await tmux.run("send-keys", "-t", f"={name}:", "Escape")
+            async with self._account_input_guard(target):
+                await tmux.run("send-keys", "-t", f"={name}:", "Escape")
             before = None
             if provider == "codex":
                 before = await tmux.capture(name)
@@ -1682,13 +1761,15 @@ class Comms:
 
         if provider not in SUBMIT_PREDICATES:
             before = before if before is not None else await tmux.capture(name)
-            pane_mode_reason = await tmux.paste(name, plan.wire_text)
+            async with self._account_input_guard(target):
+                pane_mode_reason = await tmux.paste(name, plan.wire_text)
             confirmed = await self.spawnctl._await_marker(
                 name, receipt_needle(plan.wire_text), RECEIPT_TIMEOUT_S, since=before, tmux=tmux,
             )
             if confirmed:
                 return True, 1, False, provider, None
-            enter_mode_reason = await self._send_enter(tmux, name)
+            async with self._account_input_guard(target,phase="enter_failed"):
+                enter_mode_reason = await self._send_enter(tmux, name)
             confirmed = await self.spawnctl._await_marker(
                 name, receipt_needle(plan.wire_text), RECEIPT_TIMEOUT_S, since=before, tmux=tmux,
             )
@@ -1696,7 +1777,8 @@ class Comms:
 
         before = before if before is not None else await tmux.capture(name)
         watermark = await self._submission_watermark(target) if provider in ("codex", "claude") else 0
-        pane_mode_reason = await tmux.paste(name, plan.wire_text)
+        async with self._account_input_guard(target):
+            pane_mode_reason = await tmux.paste(name, plan.wire_text)
         confirmed = await self._submission_evidence(
             tmux, name, plan.wire_text, provider, baseline=before,
             stream_id=target, watermark=watermark,
@@ -1707,7 +1789,8 @@ class Comms:
             pane = await tmux.capture(name)
             if not claude_prompt_in_active_draft(pane, plan.wire_text):
                 return False, 1, False, provider, self._claude_commit_mode(pane, pane_mode_reason)
-            enter_mode_reason = await self._send_enter(tmux, name)
+            async with self._account_input_guard(target,phase="enter_failed"):
+                enter_mode_reason = await self._send_enter(tmux, name)
             confirmed = await self._submission_evidence(
                 tmux, name, plan.wire_text, provider, baseline=before,
                 stream_id=target, watermark=watermark,
@@ -1721,7 +1804,8 @@ class Comms:
                 mode = self._claude_commit_mode(pane, mode)
             return False, 2, in_draft, provider, mode
         if provider != "codex":
-            enter_mode_reason = await self._send_enter(tmux, name)
+            async with self._account_input_guard(target,phase="enter_failed"):
+                enter_mode_reason = await self._send_enter(tmux, name)
             confirmed = await self._submission_evidence(
                 tmux, name, plan.wire_text, provider, baseline=before,
             )
@@ -1734,7 +1818,8 @@ class Comms:
         pane = await tmux.capture(name)
         if not codex_prompt_in_active_draft(pane, plan.wire_text, exact=True):
             return False, 1, False, provider, pane_mode_reason
-        enter_mode_reason = await self._send_enter(tmux, name)
+        async with self._account_input_guard(target,phase="enter_failed"):
+            enter_mode_reason = await self._send_enter(tmux, name)
         confirmed = await self._submission_evidence(
             tmux, name, plan.wire_text, provider, baseline=before,
             stream_id=target, watermark=watermark,
@@ -1858,13 +1943,23 @@ class Comms:
         try:
             host, name = self.sessions.split(target)
             row = await self.store.fetch_session(host, name)
+            queued_operation = plan.message.get("_queued_send_now_operation")
+            queued_binding = (getattr(self, "queued_send_now", None) is not None
+                and (plan.message.get("_auth_context") or {}).get("operator_authenticated"))
             lifecycle = (
                 self.sessions._lifecycle_lock(host, name)
                 if qa_generation is not None or assistant_generation is not None or voice_generation is not None
+                or queued_operation is not None or queued_binding
                 or (row or {}).get("provider") == "claude" else nullcontext()
             )
             # Match bootstrap publishers: lifecycle before pane input, never the reverse.
             async with lifecycle, self._pane_input_lock(target):
+                if queued_operation is not None:
+                    policy = getattr(self, "queued_send_now", None)
+                    current = await self.store.fetch_session(host, name) or {}
+                    if (policy is None or not await policy.validate_continue_locked(
+                            queued_operation, target, current.get("session_generation"), request_id)):
+                        raise VerbError("queued_continue_cancelled", "Queued continuation was cancelled", phase="not_started")
                 if voice_generation is not None:
                     current = await self.store.fetch_session(host, name) or {}
                     if current.get("status") != "open" or current.get("session_generation") != voice_generation:
@@ -1893,10 +1988,9 @@ class Comms:
                 account_runtime = getattr(self, "account_runtime", None)
                 if account_runtime is not None:
                     from provider_accounts import AccountError
-                    try:
-                        await account_runtime.before_input(await self.store.fetch_session(host, name) or {})
+                    try: await account_runtime.before_input(await self.store.fetch_session(host,name) or {})
                     except AccountError as exc:
-                        raise VerbError(str(exc), str(exc), phase="not_started") from None
+                        raise VerbError(str(exc),str(exc),phase="not_started",**exc.context) from None
                 if self.capacity_retry is not None:
                     await self.capacity_retry.cancel_input(target)
                 confirmed, attempts, active_draft, provider, pane_mode_reason = await self._attempt_send_delivery(plan)
@@ -1904,6 +1998,11 @@ class Comms:
                     not active_draft and pane_mode_reason is None
                     and await self._prompt_in_native_queue(target, provider, plan.wire_text)
                 )
+                queued_policy = getattr(self, "queued_send_now", None)
+                if (provider_queued and queued_policy is not None
+                        and (plan.message.get("_auth_context") or {}).get("operator_authenticated")):
+                    current = await self.store.fetch_session(host, name) or {}
+                    await queued_policy.bind_receipt_locked(target, current.get("session_generation"), request_id, receipt_id)
         except VerbError as exc:
             phase = str(exc.extra.get("phase") or "body_maybe_pasted")
             if phase == "not_started":

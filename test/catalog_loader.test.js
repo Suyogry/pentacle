@@ -179,6 +179,7 @@ function hostedViewer(h, timers) {
  const vm = require('node:vm'); h.root.DashboardCatalogLoader = api;
  h.root.fetch = async () => ({ ok: true, json: async () => ({ hostedDashboardAuthMode: 'identity' }) });
  h.root.hostedDashboardPolicy = cases.hosted_policy;
+ h.root.cc = { ...h.cc, getChatStreamState: async () => ({ connected: true, hostedDashboardPolicy: cases.hosted_policy }) };
  let serial = 0;
  const context = vm.createContext({ window: h.root, module: { exports: {} }, URL,
   setTimeout: timers ? fn => { timers.set(++serial, fn); return serial; } : setTimeout,
@@ -193,7 +194,7 @@ test('hosted entries use current policy/auth and leave profile configuration unc
  const config = { dashboards: { modeler3d: { url: 'https://example.test/original' } } }, container = h.root.document.querySelector('main');
  const refs = board.mount(container, { config }); await new Promise(r => setImmediate(r));
  const frame = container.querySelector('iframe');
- assert.equal(frame.getAttribute('src'), c.boards[0].hosted.url); assert.equal(frame.getAttribute('sandbox'), 'allow-scripts allow-same-origin'); assert.equal(frame.getAttribute('referrerpolicy'), 'no-referrer');
+ assert.equal(frame.getAttribute('src'), c.boards[0].hosted.url); assert.equal(frame.getAttribute('sandbox'), 'allow-scripts allow-same-origin allow-popups'); assert.equal(frame.getAttribute('referrerpolicy'), 'no-referrer');
  assert.equal(container.querySelector('h1').textContent, c.boards[0].name); assert.equal(config.dashboards.modeler3d.url, 'https://example.test/original'); board.unmount(refs); assert.equal(container.querySelector('iframe'), null); h.root.close();
 });
 test('app/build wiring loads optional catalog on view entry, preserves startup isolation and external scripts', () => {

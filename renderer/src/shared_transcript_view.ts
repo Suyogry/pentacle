@@ -383,7 +383,7 @@ function renderChatBody(text: string, options: TranscriptRenderOptions = {}): st
 const ACTIONABLE_ASSISTANT_STATES = new Set(['waiting_for_operator', 'waiting_for_dependency', 'uncertain', 'failed', 'cancelled']);
 
 function renderUserSendStatus(sendState: PentacleSendState | 'sent', optimisticId?: string, streamId?: string, allowSendNow = false): string {
-  const label = sendState === 'sent' ? 'Sent' : sendState === 'queued'
+  const label = sendState === 'indeterminate' ? 'Delivery uncertain' : sendState === 'sent' ? 'Sent' : sendState === 'queued'
     ? 'Queued'
     : sendState === 'sending'
       ? 'sending…'
@@ -394,7 +394,7 @@ function renderUserSendStatus(sendState: PentacleSendState | 'sent', optimisticI
     ? `<button type="button" class="slot-chat-send-retry" data-optimistic-id="${escapeHtml(optimisticId)}">Retry</button>`
     : '';
   const sendNow = sendState === 'queued' && allowSendNow && optimisticId && streamId
-    ? `<button type="button" class="slot-chat-send-now" data-stream-id="${escapeHtml(streamId)}" data-optimistic-id="${escapeHtml(optimisticId)}" title="Interrupt the current turn and run the queued messages">Send now</button>` : '';
+    ? `<button type="button" class="slot-chat-send-now" data-stream-id="${escapeHtml(streamId)}" data-optimistic-id="${escapeHtml(optimisticId)}">Send now</button>` : '';
   return `<div class="slot-chat-send-status is-${sendState}">${label}${retry}${sendNow}</div>`;
 }
 

@@ -10,6 +10,7 @@ const { runGridSplit } = require('./grid_split_scenario');
 const { publicChatRendererContracts } = require('./public_chat_renderer_contracts');
 const { micPanelAnswerWindow } = require('./mic_panel_scenario');
 const { webVoice } = require('./web_voice_scenario');
+const { webVoiceReloadAfterCommit } = require('./web_voice_reload_scenario');
 const { micSourceSelector } = require('./mic_source_scenario');
 const { chatFileDelivery } = require('./chat_file_delivery_scenario');
 const { webDashboardsRevamp, reloadDashboardPage } = require('./dashboard_scenario');
@@ -20,10 +21,13 @@ const { defaultPaneAssistant, paneCountSelector, chatFirstStyle } = require('./w
 const { branding } = require('./branding_scenario');
 const { agentChatSendDefaultQueueState } = require('./send_default_queue_state_scenario');
 const { optimisticReload } = require('./optimistic_reload_scenario');
+const { composerDraftPerChat } = require('./composer_draft_per_chat_scenario');
+const { composerDraftRetire, composerDraftPendingSend } = require('./composer_draft_lifecycle_scenario');
 const { scheduledSection } = require('./scheduled_section_scenario');
 const { providerVisibility } = require('./provider_visibility_scenario');
 const { summaryFallbackFormatting } = require('./summary_fallback_scenario');
 const { installedClientSeam } = require('./installed_client_seam_scenario');
+const { wrapPasteProof } = require('./wrap_paste_scenario');
 const { sidebarPreviewPlainText } = require('./sidebar_preview_scenario');
 
 // Named web-mode E2E scenario functions, driven over CDP against the served
@@ -528,8 +532,52 @@ async function settingsVersionLine(ctx) {
   const title = await session.eval(`(document.getElementById('settings-version-line') || {}).title || ''`);
   report.ok('the full SHAs are available on hover', title.includes(build) && title.includes(runtime), { title });
 
+  // This fork retains the corrected provider sign-in flow for existing users.
+  const relogin = await session.eval(`({
+    section: document.querySelector('.provider-relogin') !== null,
+    buttons: document.querySelectorAll('#settings-overlay [data-provider]').length,
+  })`);
+  report.ok('Settings retains provider sign-in controls', relogin.section === true && relogin.buttons === 2, relogin);
+
   // Leave the modal closed so later scenarios see a clean page.
   await session.eval(`document.getElementById('settings-close').click()`);
+}
+
+// Match the saved session name, not its UI host alias: a composite stream's
+// prefix can differ from the daemon host and focusStreamId can use a local alias.
+function advisorProbeSlot(bindings, sessionName) {
+  const slots = (bindings || []).map((binding, index) => binding && binding.name === sessionName ? index : -1).filter(index => index >= 0);
+  if (slots.length > 1) throw new Error('ambiguous probe session in workspace');
+  return slots.length ? slots[0] : -1;
+}
+
+// External-daemon proof: the probe body must include its exact question ID.
+async function advisorQuestionRendered({ session, report, fixture, timeoutMs, cdp }) {
+  if (fixture) { report.note('live advisor question probe excluded from fixture run'); return; }
+  const questionId = process.env.PENTACLE_CARD_PROBE_ID;
+  const screenshot = process.env.PENTACLE_CARD_PROBE_SCREENSHOT;
+  const stream = process.env.PENTACLE_CARD_PROBE_STREAM;
+  const host = process.env.PENTACLE_CARD_PROBE_HOST;
+  if (!questionId || !screenshot || !stream || !host) throw new Error('PENTACLE_CARD_PROBE_ID, PENTACLE_CARD_PROBE_SCREENSHOT, PENTACLE_CARD_PROBE_STREAM and PENTACLE_CARD_PROBE_HOST are required');
+  await session.waitFor("document.readyState === 'complete' && typeof window.focusStreamId === 'function'", { timeoutMs });
+  await session.waitFor(`window.focusStreamId(${JSON.stringify(stream)}) === true`, { timeoutMs });
+  const slot = await waitForValue(session, cdp,
+    `window.cc.getChatStreamState().then(s => { const target=(s.sessions || []).find(item => item.stream_id === ${JSON.stringify(stream)}); const saved=JSON.parse(localStorage.getItem('pentacle.workspace.v1') || '{}'); return target ? (${advisorProbeSlot.toString()})(saved.bindings, target.session_name || target.name) : -1; })`, (value) => Number.isInteger(value) && value >= 0,
+    { timeoutMs, label: 'assistant stream bound to a slot' });
+  await session.click(`#header-${slot} [data-mode="chat"]`);
+  await session.waitFor(`!!document.querySelector('#cell-${slot} .slot-chat-question-open')`, { timeoutMs });
+  await session.click(`#cell-${slot} .slot-chat-question-open`);
+  const portal = `#desktop-question-portal-${stream.replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+  await session.waitFor(`!!document.querySelector(${JSON.stringify(portal + ' [data-notification-id]')})`, { timeoutMs });
+  const expression = `Array.from(document.querySelectorAll(${JSON.stringify(portal + ' [data-notification-id]')})).some(el => el.getClientRects().length && el.innerText.includes(${JSON.stringify(questionId)}))`;
+  const count = await session.eval(`document.querySelectorAll(${JSON.stringify(portal + ' .desktop-question-dot')}).length`);
+  let found = await session.eval(expression);
+  for (let index = 0; !found && index < count; index++) {
+    await session.click(`${portal} .desktop-question-dot:nth-child(${index + 1})`);
+    found = await session.eval(expression);
+  }
+  report.ok('probe question ID rendered in assistant card', found, { questionId });
+  await session.screenshot(screenshot);
 }
 
 const SCENARIOS = [
@@ -551,7 +599,9 @@ const SCENARIOS = [
   ['summary-fallback-formatting', summaryFallbackFormatting],
   ['installed-client-seam', installedClientSeam],
   ['chat-file-delivery', chatFileDelivery],
+  ['web-wrap-paste', wrapPasteProof],
   ['web-chat-voice', webVoice],
+  ['web-voice-reload-after-commit', webVoiceReloadAfterCommit],
   ['public-chat-renderer-contracts', publicChatRendererContracts],
   // Self-contained: appends and removes its own probe node; renders the shipped
   // mic-state view model against status fixtures (answer window + silent toggle).
@@ -563,6 +613,7 @@ const SCENARIOS = [
   // the page at both ends, so it neither depends on nor disturbs its neighbours.
   ['slot-survives-cc-reconnect', slotSurvivesCcReconnect],
   ['slot-column-split', runGridSplit],
+  ['advisor-question-rendered', advisorQuestionRendered],
   ['question-free-text', questionFreeText],
   ['question-partial-send', questionPartialSend],
   ['question-skip', questionSkip],
@@ -577,14 +628,20 @@ const SCENARIOS = [
   ['chat-first-style', chatFirstStyle],
   ['agent-chat-send-default-queue-state', agentChatSendDefaultQueueState],
   ['optimistic-reload', optimisticReload],
+  ['composer-draft-per-chat', composerDraftPerChat],
+  ['composer-draft-pending-send', composerDraftPendingSend],
+  ['composer-draft-retire', composerDraftRetire],
   ['closed-chat-slot', closedChatSlot],
   // Host-restart walk runs LAST: it tears the host process (and briefly the
   // daemon) down, so it must not disturb the deterministic scenarios above.
+  ['reliability-viewport-fixture', require('./reliability_fixtures').viewportReliability],
+  ['reliability-capture-fixture', require('./reliability_fixtures').captureReliability],
   ['host-restart-restores-input', hostRestartRestoresInput],
 ];
 
 module.exports = {
   waitForValue,
+  advisorProbeSlot,
   pollUntil,
   transportAndConfig,
   settingsVersionLine,

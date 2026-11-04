@@ -25,6 +25,7 @@ import desk_stamp
 import wmi_brief_producer
 
 import asyncio
+import screen_monitor_principal
 import errno
 import functools
 import hmac
@@ -308,6 +309,11 @@ DOT_SCOPE_DENIED_CODE = "dot_scope_denied"
 # current binding, recognized only by the tell/send entry branches (contract 3).
 ASSISTANT_ALIAS = primary_assistant_name()
 _ASSISTANT_ALIAS_TARGET_MEMBERS = ("stream_id", "host", "session_name")
+
+
+def _is_primary_alias(target: object) -> bool:
+    # Stable callers need not inherit the daemon's configured display name.
+    return target in ("assistant", ASSISTANT_ALIAS)
 #: Deny-by-default verb allowlist for a stream-scoped credential (the Cosmo
 #: client).  Every other registered handler denies with `scope_denied`.  Outbound
 #: server frames (welcome/snapshot/pong/chat.event/working.state/notification/
@@ -792,6 +798,7 @@ class Server:
         self.reconciler = reconciler
         #: Owner of the primary composite's bound-seat restore (wired by main).
         self.assistant_restore: Any = None
+        self.authority_restore: Any = None
         #: Assigned by `main.py` after construction — the ledger needs
         #: `broadcast`, which only exists once the server does.
         self.ledger = ledger
@@ -849,6 +856,7 @@ class Server:
         self._client_opened_by_host_ids: dict[Any, frozenset[str] | None] = {}
         self._client_exclude_event_types: dict[Any, frozenset[str]] = {}
         self._client_events_mode: dict[Any, str] = {}
+        self._client_snapshot_requested: dict[Any, bool] = {}
         self._client_assistant_composite_v1: dict[Any, bool] = {}
         self._client_work_lanes_v1: dict[Any, bool] = {}
         #: Per-client last-sent digest, keyed by coalescing key, of the most
@@ -1920,6 +1928,9 @@ class Server:
     async def broadcast(self, frame: dict[str, Any]) -> None:
         """Project a top-level frame for each connected client before enqueue."""
         frame_type = str(frame.get("type") or "")
+        queued_policy = getattr(self, "queued_send_now", None)
+        if queued_policy is not None and frame_type == "chat.event":
+            queued_policy.request_tick()
         if frame_type == 'notification' and str((frame.get('notification') or {}).get('producer') or '').startswith('consent.'):
             await self._publish_consent()
             return
@@ -2017,6 +2028,7 @@ class Server:
         self._client_opened_by_host_ids.pop(websocket, None)
         self._client_exclude_event_types.pop(websocket, None)
         self._client_events_mode.pop(websocket, None)
+        self._client_snapshot_requested.pop(websocket, None)
         self._client_assistant_composite_v1.pop(websocket, None)
         self._client_work_lanes_v1.pop(websocket, None)
         self._client_last_sent_digest.pop(websocket, None)
@@ -2244,6 +2256,18 @@ class Server:
                                 await websocket.send(payload)
                     else:
                         for frame in ((frames,) if isinstance(frames, str) else frames):
+                            # Snapshot assembly can await storage while the finisher
+                            # starts. Resolve its capabilities under the same send
+                            # lock as the refresh so an older greeting cannot undo it.
+                            if (isinstance(frame, dict) and frame.get("type") == "snapshot"
+                                    and self.error_alerts is not None
+                                    and self.error_alerts.finisher is not None
+                                    and self._operator_authenticated(websocket)
+                                    and websocket not in self._client_authenticated_streams):
+                                frame = {**frame, "capabilities": {
+                                    **frame.get("capabilities", {}),
+                                    "error_alerts_v1": True, "outbound_commit_v1": True,
+                                }, "error_reporting_credential_id": self._connection_trust[websocket].credential_id}
                             payload = frame if isinstance(frame, str) else _encode_frame(frame)
                             with self._diag_send(websocket, payload, self._diag_frame_type(frame)):
                                 await websocket.send(payload)
@@ -2348,6 +2372,20 @@ class Server:
                       and self.account_runtime.watcher_authorized(service_auth, msg.get("host"))
                       and msg.get("action") in {"probe", "observe-failure", "observation"}):
                     pass  # Typed payload and generation checks are in AccountRuntime.
+                elif service_auth["service_actor"] == screen_monitor_principal.ACTOR:
+                    if verb=='tell':
+                        target=screen_monitor_principal.composite()
+                        if not screen_monitor_principal.valid_tell(msg) or self._composite_for(target) is None:
+                            return [self._auth_error_frame(verb, request_id, "system_producer_payload_invalid")]
+                        actor=screen_monitor_principal.ACTOR
+                        dispatch_msg['from_stream_id']=actor
+                        dispatch_msg['_wmi_brief_ingress_body']=sanitize_injectable(msg['text'])
+                        dispatch_msg['text']=f"[from {actor}] [tell:{msg['tell_id']}]\n"+dispatch_msg['_wmi_brief_ingress_body']
+                    elif verb in screen_monitor_principal.VERBS:
+                        if not screen_monitor_principal.valid_request(msg):
+                            return [self._auth_error_frame(verb, request_id, "system_producer_payload_invalid")]
+                    else:
+                        return [self._auth_error_frame(verb, request_id, "system_producer_forbidden")]
                 elif service_auth["service_actor"] == WORK_REPORT_READER:
                     if verb != "work.report.get":
                         return [self._auth_error_frame(verb, request_id, "system_producer_forbidden")]
@@ -2831,6 +2869,7 @@ class Server:
         """Fixed principals whose credential is a user-owned 0600 token file,
         re-read on every RPC (removal/rotation revokes bound sockets too)."""
         sources = {
+            screen_monitor_principal.ACTOR: os.environ.get(screen_monitor_principal.TOKEN_FILE_ENV),
             WORK_REPORT_READER: os.environ.get(WORK_REPORT_READER_TOKEN_FILE_ENV),
             WMI_BACKUP_PRODUCER_STREAM_ID: os.environ.get(WMI_BACKUP_STREAM_TOKEN_FILE_ENV),
             BOT_MESSAGING_PRODUCER_STREAM_ID: os.environ.get(BOT_MESSAGING_STREAM_TOKEN_FILE_ENV),
@@ -3150,8 +3189,11 @@ class Server:
         include_subagents: bool,
         opened_by_host_ids: frozenset[str] | None,
         include_assistant_composite: bool = False,
+        *, project_visibility: bool = False,
     ) -> bool:
         session = self.sessions.get(stream_id) if self.sessions is not None and stream_id else None
+        if project_visibility and session is not None:
+            session = self._project_assistant_composite_session(session)
         return self._session_is_visible_to_client(
             session, include_subagents, opened_by_host_ids, include_assistant_composite,
         )
@@ -3164,13 +3206,15 @@ class Server:
         include_assistant_composite: bool = False,
         scoped_stream_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        return [
+        projected = (
             self._project_assistant_composite_session(session)
-            for session in sessions
-            if isinstance(session, dict)
+            for session in sessions if isinstance(session, dict)
+        )
+        return [
+            session for session in projected
             # Daff is listed only for its authenticated Cosmo scope. Keep this
             # inventory policy out of the shared direct-access visibility checks.
-            and not (
+            if not (
                 session.get("provider") == "composite"
                 and session.get("stream_id") == "daff:assistant"
                 and scoped_stream_id != "daff:assistant"
@@ -3219,7 +3263,32 @@ class Server:
         composite = self._composite_for(session.get("stream_id"))
         if composite is not None:
             return composite.project_session(session)
-        return dict(session)
+        projected = dict(session)
+        policy = getattr(getattr(self, "sessions", None), "assistant", None)
+        daff = self._composites().get("daff")
+        config = getattr(daff, "config", None)
+        bound_daff = bool(
+            getattr(daff, "enabled", False) and config is not None and config.direct_primary
+            and session.get("stream_id") == config.direct_primary_stream_id
+            and session.get("session_generation") == config.direct_primary_generation
+        )
+        primary = getattr(self, "assistant_composite", None)
+        primary_config = getattr(primary, "config", None)
+        bound_front_desk = bool(
+            getattr(primary, "enabled", False) and primary_config is not None and primary_config.direct_primary
+            and session.get("stream_id") == primary_config.direct_primary_stream_id
+            and session.get("session_generation") == primary_config.direct_primary_generation
+        )
+        if bound_daff or bound_front_desk or (policy is not None and policy.is_daff_backend(session)):
+            # Reuse hidden-seat presentation, including legacy persisted defaults.
+            # Diagnostic inventories retain these rows; direct access is unchanged.
+            projected["visibility"] = "hidden"
+        if getattr(self, "queued_send_now", None) is not None:
+            from queued_send_now import route_for
+            projected["capabilities"] = {**(session.get("capabilities") or {}),
+                "queued_send_now": bool(route_for(session, self.local_host,
+                    getattr(getattr(self, "hosts", None), "peers", None)))}
+        return projected
 
     @staticmethod
     def _client_wants_assistant_composite(msg: dict[str, Any]) -> bool:
@@ -3386,6 +3455,7 @@ class Server:
             if not self._stream_is_visible_to_client(
                 str(event.get("stream_id") or ""), include_subagents, opened_by_host_ids,
                 bool(self._client_assistant_composite_v1.get(websocket, False)),
+                project_visibility=True,
             ):
                 return None
         if frame_type in {"working.state", "completion.report", "session.died"}:
@@ -3393,6 +3463,7 @@ class Server:
             if stream_id and not self._stream_is_visible_to_client(
                 stream_id, include_subagents, opened_by_host_ids,
                 bool(self._client_assistant_composite_v1.get(websocket, False)),
+                project_visibility=True,
             ):
                 return None
         if frame_type == "work_lanes.inventory" and not self._client_work_lanes_v1.get(websocket, False):
@@ -3440,6 +3511,8 @@ class Server:
         # These handlers independently verify their narrow recovery authority
         # before any effect. Never promote a local-admin secret to an operator.
         if auth.get("peer_loopback") and auth.get("local_admin_verified"):
+            if verb == "account" and msg.get("action") in {"pin-status", "pin-set"}:
+                return True
             if verb in {"consent_key.offer", "consent_key.devices", "consent_key.host_status",
                         "consent_key.cancel", "consent_key.list", "consent_key.revoke",
                         "assistant.transfer"}:
@@ -3593,7 +3666,7 @@ class Server:
             self._diag_auth_finish(decision)
             _CONN_AUTH.reset(token)
 
-    async def _on_hello_inner(self, msg: dict[str, Any]) -> list[dict[str, Any]]:
+    async def _on_hello_inner(self, msg: dict[str, Any], *, refresh: bool = False) -> list[dict[str, Any]]:
         """Apply hello.subscribe before constructing the connection's frames."""
         subscribe = msg.get("subscribe") if isinstance(msg.get("subscribe"), dict) else {}
         try:
@@ -3614,7 +3687,7 @@ class Server:
         ).lower() != "rpc"
         websocket = msg.get("_client_websocket")
         consent_ready = True
-        if websocket is not None:
+        if websocket is not None and not refresh:
             auth_started = _monotonic() if websocket in self._connection_diagnostics else None
             error_code = self._authenticate_operator_hello(websocket, msg)
             decision = _CONN_AUTH.get()
@@ -3641,6 +3714,7 @@ class Server:
             self._client_opened_by_host_ids[websocket] = opened_by_host_ids
             self._client_exclude_event_types[websocket] = exclude_event_types
             self._client_events_mode[websocket] = events_mode
+            self._client_snapshot_requested[websocket] = snapshot_requested
             self._client_assistant_composite_v1[websocket] = self._client_wants_assistant_composite(msg)
             self._client_work_lanes_v1[websocket] = self._client_wants_work_lanes(msg)
             self._diag_admitted(websocket, msg, events_mode, snapshot_requested)
@@ -3728,7 +3802,9 @@ class Server:
             # target after a reconnect. Old daemons simply omit this field.
             "capabilities": {
                 "close_expected_generation": True,
-                **({"error_alerts_v1": True} if self.error_alerts is not None
+                **({"error_alerts_v1": True,
+                    **({"outbound_commit_v1": True} if self.error_alerts.finisher is not None else {})}
+                   if self.error_alerts is not None
                    and self._operator_authenticated(websocket)
                    and not (msg.get("_auth_context") or {}).get("token_verified") else {}),
                 **({"consent_enrollment_offer_v1": True, "consent_open_v1": True} if (
@@ -3757,6 +3833,7 @@ class Server:
                 and self._stream_is_visible_to_client(
                     stream_id, include_subagents, opened_by_host_ids,
                     self._assistant_composite_capable_for_message(msg),
+                    project_visibility=True,
                 )
             },
         }
@@ -3948,6 +4025,9 @@ class Server:
             "existing_report": existing_report,
             "close_audit": close_audit,
             "lane_ruling": (await self.lane_rulings.latest_for_target(stream_id)) if self.lane_rulings else None,
+            "restore": (await self.authority_restore.status()) if (
+                self.authority_restore and self.assistant_composite and
+                stream_id == self.assistant_composite.config.direct_primary_stream_id) else None,
             "deferred_reap": await self.store.get_deferred_reap(stream_id),
             "usage_provenance": usage_provenance,
         }
@@ -4017,6 +4097,17 @@ class Server:
 
     async def _on_spawn_freeze(self, msg: dict[str, Any]) -> dict[str, Any]:
         host = str(msg.get("host") or self.local_host).strip()
+        runtime=getattr(self,"account_runtime",None)
+        from provider_cli_maintenance import FIELDS,freeze,legacy
+        if FIELDS & msg.keys():
+            if runtime is None:raise VerbError("provider_cli_maintenance_unavailable","account runtime required")
+            from provider_accounts import AccountError
+            try:return await freeze(runtime,msg,host)
+            except AccountError as exc:raise VerbError(str(exc),str(exc),**exc.context) from None
+        if runtime is not None:
+            from provider_accounts import AccountError
+            try:return await legacy(runtime,host,reason=str(msg.get("reason") or ""),ttl=float(msg.get("ttl_s") or 900))
+            except AccountError as exc:raise VerbError(str(exc),str(exc),**exc.context) from None
         return await self.spawnctl.set_spawn_freeze(
             host, reason=str(msg.get("reason") or ""),
             ttl_s=float(msg.get("ttl_s") or 900.0),
@@ -4024,7 +4115,18 @@ class Server:
 
     async def _on_spawn_unfreeze(self, msg: dict[str, Any]) -> dict[str, Any]:
         host = str(msg.get("host") or self.local_host).strip()
-        receipt = await self.spawnctl.clear_spawn_freeze(host)
+        runtime=getattr(self,"account_runtime",None)
+        if runtime is not None:
+            from provider_cli_maintenance import slot,unfreeze,legacy
+            from provider_accounts import AccountError
+            try:
+                scoped=any(k in msg for k in ("maintenance_id","expected_maintenance_digest","expected_hold_digest")) or await runtime.run(lambda a:slot(a,host)) is not None
+                receipt=await unfreeze(runtime,msg,host) if scoped else await legacy(runtime,host,clear=True)
+            except AccountError as exc:raise VerbError(str(exc),str(exc),**exc.context) from None
+        else:
+            if any(k in msg for k in ("maintenance_id","expected_maintenance_digest","expected_hold_digest","recover_expired_maintenance")):
+                raise VerbError("provider_cli_maintenance_unavailable","account runtime required")
+            receipt = await self.spawnctl.clear_spawn_freeze(host)
         if self.lane_rulings is not None:
             await self.lane_rulings.tick()
         return receipt
@@ -4150,7 +4252,7 @@ class Server:
         }
 
     async def _on_tell(self, msg: dict[str, Any]) -> dict[str, Any]:
-        if msg.get("to_stream_id") == ASSISTANT_ALIAS:
+        if _is_primary_alias(msg.get("to_stream_id")):
             return await self._alias_tell(msg)
         host, name = await self.sessions.resolve(msg)
         target_stream_id = f"{host}:{name}"
@@ -4331,7 +4433,7 @@ class Server:
         if any(key in msg for key in _ASSISTANT_ALIAS_TARGET_MEMBERS):
             raise VerbError("bad_request", "the assistant alias takes no other target member")
         if "inbox" in msg and (
-            not isinstance(msg.get("inbox"), dict) or msg["inbox"].get("to") != ASSISTANT_ALIAS
+            not isinstance(msg.get("inbox"), dict) or msg["inbox"].get("to") != msg.get("to_stream_id")
         ):
             raise VerbError("bad_request", "inbox.to must match the assistant alias target")
         auth = msg.get("_auth_context") if isinstance(msg.get("_auth_context"), dict) else {}
@@ -4400,7 +4502,7 @@ class Server:
         try: reject_overrides(msg)
         except AccountError as exc: raise VerbError(str(exc), str(exc), **exc.context) from None
         msg = desk_stamp.stamp_message(msg)
-        if msg.get("to_stream_id") == ASSISTANT_ALIAS:
+        if _is_primary_alias(msg.get("to_stream_id")):
             return await self._alias_send(msg)
         host, name = await self.sessions.resolve(msg)
         stream_id = f"{host}:{name}"
@@ -4468,6 +4570,13 @@ class Server:
         # A scoped client may send ONLY to its own scope stream (the composite).
         if auth.get("scoped_principal"):
             raise VerbError(SCOPE_DENIED_CODE, "scoped client may send only to its own stream")
+        if self.lane_rulings is not None:
+            try:
+                pending = await self.lane_rulings.request_send(msg, target=stream_id)
+            except ValueError as exc:
+                raise VerbError(str(exc), str(exc)) from exc
+            if pending is not None:
+                return pending
         # Wire callers cannot suppress ordinary QA/progress admission with the
         # private daemon-only backend marker.  Only main's composite dispatcher
         # reaches ``Comms.send_assistant_backend`` directly.
@@ -4708,6 +4817,33 @@ class Server:
                     code = str(exc) if str(exc) in {"operator_required", "credential_revoked", "invalid_request", "operation_forbidden", "blob_forbidden", "origin_mismatch", "event_conflict"} else "invalid_request"
                     raise VerbError(code, code) from None
             self.handlers[verb] = wrapped
+        from outbound_finisher import OutboundFinisher
+        # Composed after the wrapped send so server-owned sends bind receipts.
+        self.error_alerts.finisher = OutboundFinisher(self, self.error_alerts)
+        await self.error_alerts.finisher.start()
+        # bind/bootstrap precedes this composition. Refresh the same authenticated
+        # snapshot consumers once, preserving their existing projection/subscription.
+        for websocket in tuple(self._clients):
+            if not self._operator_authenticated(websocket) or not self._client_snapshot_requested.get(websocket):
+                continue
+            if websocket in self._client_authenticated_streams:
+                continue
+            opened = self._client_opened_by_host_ids.get(websocket)
+            frames = await self._on_hello_inner({
+                "_client_websocket": websocket,
+                "_auth_context": await self._auth_context(websocket, {}),
+                "subscribe": {
+                    "events_mode": self._client_events_mode.get(websocket, "full"),
+                    "include_subagents": self._client_include_subagents.get(websocket, False),
+                    **({"opened_by_host_ids": sorted(opened)} if opened is not None else {}),
+                    "exclude_event_types": sorted(self._client_exclude_event_types.get(websocket, ())),
+                },
+                "capabilities": {
+                    "assistant_composite_v1": self._client_assistant_composite_v1.get(websocket, False),
+                    "work_lanes_v1": self._client_work_lanes_v1.get(websocket, False),
+                },
+            }, refresh=True)
+            await self._send_direct(websocket, [frame for frame in frames if frame.get("type") == "snapshot"])
 
     async def _on_transcribe_blob(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Transcribe an uploaded audio blob on the managed mic backend.
@@ -5009,15 +5145,25 @@ class Server:
         action = str(msg.get("action") or "read")
         try:
             if action == "read":
-                return {"type": "assistant.authority.ok", **await self.lane_rulings.binding()}
+                return {"type": "assistant.authority.ok", **await self.lane_rulings.binding(),
+                        "shape": await self.authority_restore.shape() if self.authority_restore else None,
+                        "restore": await self.authority_restore.status() if self.authority_restore else None}
+            if action in {"restore", "retry"}:
+                composite = self.assistant_composite
+                if (not auth.get("token_verified") or not composite or not self.authority_restore or
+                    (auth.get("stream_id"), auth.get("session_generation")) !=
+                    (composite.config.direct_primary_stream_id, composite.config.direct_primary_generation)):
+                    raise ValueError("assistant_authority_unauthorized")
+                return {"type": "assistant.authority.ok", "restore": await self.authority_restore.manual(action, brief_file=msg.get("brief_file"))}
             if action != "set" or not auth.get("token_verified"):
                 raise ValueError("assistant_authority_unauthorized")
             return await self.lane_rulings.configure(
                 str(msg.get("value") or ""), actor_stream_id=str(auth.get("stream_id") or ""),
                 actor_generation=str(auth.get("session_generation") or ""),
+                brief_file=msg.get("brief_file"),
             )
         except ValueError as exc:
-            raise VerbError(str(exc), str(exc)) from exc
+            raise VerbError(str(exc).split(':', 1)[0], str(exc)) from exc
 
     async def _on_assistant_ruling(self, msg: dict[str, Any]) -> dict[str, Any]:
         auth = msg.get("_auth_context") if isinstance(msg.get("_auth_context"), dict) else {}
@@ -5410,6 +5556,7 @@ class Server:
         close_kind = "session_close"
         coordinator_authorized = False
         manager_generation: str | None = None
+        fd_generation: str | None = None
         ruling_manager_close = (
             self.lane_rulings is not None
             and msg.get("_ruling_release") is self.lane_rulings
@@ -5437,6 +5584,15 @@ class Server:
                     # is re-checked under the lifecycle lock before any kill.
                     manager_generation = expected_generation or self._manager_target_generation(target)
                     close_kind = "manager_close"
+                elif await self._fd_close_caller(auth):
+                    fd_generation = expected_generation or self._manager_target_generation(target)
+                    try:
+                        await self._fd_close_fences(msg, auth, target_stream_id, target, fd_generation)
+                    except Exception as exc:
+                        await self._fd_close_audit(msg, auth, target_stream_id, fd_generation,
+                                                   "refused" if isinstance(exc, VerbError) else "failed",
+                                                   getattr(exc, "code", "fd_close_failed"))
+                        raise
                 else:
                     # A seat token proves only that seat's identity. Visibility
                     # and a caller-supplied confirmation bit do not promote it
@@ -5468,7 +5624,12 @@ class Server:
         if self.lane_rulings is not None and msg.get("_ruling_release") is not self.lane_rulings:
             target_row = await self.store.fetch_session(host, name)
             target_generation = str((target_row or {}).get("session_generation") or "")
-            if target_generation and manager_generation is not None and target_generation != manager_generation:
+            pinned_generation = manager_generation or fd_generation
+            if target_generation and pinned_generation is not None and target_generation != pinned_generation:
+                if fd_generation is not None:
+                    await self._fd_close_audit(msg, auth, target_stream_id, fd_generation,
+                                               "refused", "lifecycle_generation_mismatch")
+                    raise VerbError("lifecycle_generation_mismatch", "FD target generation changed before ruling")
                 await self._manager_audit("close", msg, auth, target_stream_id, target_generation,
                                           result="refused", refusal_code="lifecycle_generation_mismatch")
                 raise VerbError("lifecycle_generation_mismatch", "manager target generation changed before ruling")
@@ -5479,8 +5640,14 @@ class Server:
                         target_generation=target_generation, auth=auth,
                     )
                 except ValueError as exc:
+                    if fd_generation is not None:
+                        await self._fd_close_audit(msg, auth, target_stream_id, fd_generation,
+                                                   "refused", str(exc))
                     raise VerbError(str(exc), str(exc)) from exc
                 if ruling_hold is not None:
+                    if fd_generation is not None:
+                        await self._fd_close_audit(msg, auth, target_stream_id, fd_generation,
+                                                   "refused", "close_pending_ruling")
                     return ruling_hold
         defer_if_working = bool(msg.get("defer_if_working"))
         if expired_self_close:
@@ -5489,6 +5656,8 @@ class Server:
             actor_kind, auth_kind = "operator", "operator_authenticated"
         elif close_kind == "manager_close":
             actor_kind, auth_kind = "manager", "token_verified"
+        elif fd_generation is not None:
+            actor_kind, auth_kind = "front_desk", "token_verified"
         elif coordinator_authorized:
             actor_kind, auth_kind = "parent", "token_verified"
         else:
@@ -5505,10 +5674,10 @@ class Server:
             "request_id": str(msg.get("request_id") or ""),
             "defer_if_working": defer_if_working,
         }
-        if manager_generation is not None:
+        if manager_generation is not None or fd_generation is not None:
             # Live panes require fresh idle proof. Initially offline peers may
             # record a generation-fenced retirement intent, never claimed death.
-            expected_generation = manager_generation
+            expected_generation = manager_generation or fd_generation
             defer_if_working = False
             attribution["defer_if_working"] = False
         close = functools.partial(
@@ -5518,21 +5687,28 @@ class Server:
             str(msg.get("reason") or ""),
             expected_generation=expected_generation,
             close_kind=close_kind,
-            requires_idle=bool(msg.get("requires_idle") or msg.get("reap")) or manager_generation is not None,
+            requires_idle=bool(msg.get("requires_idle") or msg.get("reap"))
+            or manager_generation is not None or fd_generation is not None,
             operator_override=bool(msg.get("operator_override"))
             and (operator_authenticated or coordinator_authorized)
-            and manager_generation is None,
-            operator_confirm=msg.get("operator_confirm") is True and manager_generation is None,
+            and manager_generation is None and fd_generation is None,
+            operator_confirm=msg.get("operator_confirm") is True
+            and manager_generation is None and fd_generation is None,
             defer_if_working=defer_if_working,
             attribution=attribution,
             admission_guard=(
+                (lambda row: self._fd_close_admission(msg, auth, target_stream_id, row, fd_generation))
+                if fd_generation is not None else
                 (lambda row: self._seat_close_admission(auth, caller_stream_id, target_stream_id, row))
                 if manager_generation is None and auth.get('token_verified')
                 else None if manager_generation is None
                 else lambda row: self._manager_close_admission(msg, host, name, row, manager_generation, auth)
             ),
         )
-        if manager_generation is None:
+        if fd_generation is not None:
+            result = await _finish_despite_cancel(
+                self._fd_close_locked(close, msg, auth, target_stream_id, fd_generation))
+        elif manager_generation is None:
             result = await close()
         else:
             # The grant cannot change between the manager's admission, the kill
@@ -5574,6 +5750,76 @@ class Server:
             "reap_status": result.get("reap_status", "unknown"),
             **_claim_wire_fields(claim_verified, claim_mismatch),
         }
+
+    async def _fd_close_caller(self, auth: dict[str, Any]) -> bool:
+        """The effective primary FD binding, at its verified open generation."""
+        composite = self.assistant_composite
+        if (auth.get("token_verified") is not True or composite is None
+                or not composite.enabled or not composite.env_config.direct_primary):
+            return False
+        try:
+            binding = await self.store.get_assistant_binding(
+                env_binding=composite._env_binding(), name=composite.env_config.name)
+            if (auth.get("stream_id"), auth.get("session_generation")) != (
+                    binding.get("stream_id"), binding.get("generation")) or not binding.get("generation"):
+                return False
+            actor = await self.store.fetch_session(*self.sessions.split(binding["stream_id"]))
+            return bool(actor and actor.get("status") == "open"
+                        and actor.get("session_generation") == binding["generation"])
+        except Exception:  # unreadable authority grants nothing
+            return False
+
+    async def _fd_close_fences(self, msg, auth, target, row, generation):
+        if not await self._fd_close_caller(auth):
+            raise VerbError("fd_close_authority_required", "current bound FD generation required")
+        if code := self.sessions.assistant.manager_request_code(msg):
+            raise VerbError(code, "FD close requires an explicit directive reason and request id")
+        if str((row or {}).get("session_generation") or "") != generation:
+            raise VerbError("lifecycle_generation_mismatch", "FD target generation changed")
+        if row.get("status") == "closed":
+            return  # Receipt only; Sessions preserves generation-fenced repeat semantics.
+        self.sessions.assistant.guard_close(row, "session_close")
+        if (row.get("status") != "open" or row.get("parent_stream_id")
+                or row.get("handoff_from_stream_id")
+                or (row.get("visibility") or "default") not in {"default", "visible"}):
+            raise VerbError("close_unauthorized",
+                            "close requires a verified self, direct-parent, or authenticated operator")
+        # All ownership mutations share Sessions' graph fence. An unavailable
+        # authoritative read propagates before admission; it cannot grant close.
+        for lane in await self.store.work_lane_rows():
+            if lane.get("owner_kind") == "operator" and target in {
+                    lane.get("bound_stream_id"), lane.get("visible_chat_stream_id")}:
+                raise VerbError("close_operator_lane_protected", "open operator-owned lane requires its own close confirmation")
+
+    async def _fd_close_admission(self, msg, auth, target, row, generation):
+        # Runs under lifecycle + graph locks, held through the existing kill
+        # ladder. Rebind, transfer and lane mutations cannot cross this fence.
+        await self._fd_close_fences(msg, auth, target, row, generation)
+        if row.get("status") != "closed":
+            await self._fd_close_audit(msg, auth, target, generation, "admitted")
+
+    async def _fd_close_audit(self, msg, auth, target, generation, result, code=None):
+        revision = (await self.store.lifecycle_authority_current())["revision"]
+        await self.store.lifecycle_authority_audit(
+            action="fd_close", actor_kind="front_desk", actor_identity=auth.get("stream_id"),
+            actor_generation=auth.get("session_generation"), target_stream_id=target,
+            target_generation=generation, old_revision=revision, new_revision=revision,
+            reason=msg.get("reason"), request_id=msg.get("request_id"), result=result, refusal_code=code)
+
+    async def _fd_close_locked(self, close, msg, auth, target, generation):
+        try:
+            result = await close()
+        except Exception as exc:
+            await self._fd_close_audit(msg, auth, target, generation,
+                                       "refused" if isinstance(exc, VerbError) else "failed",
+                                       getattr(exc, "code", "fd_close_failed"))
+            raise
+        applied = not (result.get("failed") or result.get("deferred")
+                       or result.get("already_closed") or result.get("stale_generation"))
+        await self._fd_close_audit(msg, auth, target, generation,
+                                   "applied" if applied else "failed" if result.get("failed") else "refused",
+                                   None if applied else str(result.get("reason") or "close_not_applied")[:200])
+        return result
 
     async def _seat_close_admission(self, auth, caller, target, row):
         # Runs after acquiring the target lifecycle and graph locks, directly

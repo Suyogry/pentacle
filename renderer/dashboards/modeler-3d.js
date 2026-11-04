@@ -3,7 +3,10 @@
   'use strict';
   const urls = root.DashboardCatalogLoader || require('./catalog_loader');
   const INVALIDATE = 'pentacle:hosted-dashboard-invalidate';
-  function mount(container, { hostedUrl, name = 'Dashboard', getHostedPolicy = () => root.hostedDashboardPolicy } = {}) {
+  function mount(container, { hostedUrl, name = 'Dashboard', getHostedPolicy = async () => {
+    const state = await root.cc?.getChatStreamState?.();
+    return state?.connected === true ? state.hostedDashboardPolicy : null;
+  } } = {}) {
     const doc = container.ownerDocument;
     const shell = doc.createElement('section'); shell.className = 'modeler-3d';
     const header = doc.createElement('header'); header.className = 'modeler-header';
@@ -44,7 +47,10 @@
       if (refs.disposed || refs.generation !== generation) return null;
       publishMode(config?.hostedDashboardAuthMode === 'identity' ? 'identity' : 'unknown');
       if (config?.hostedDashboardAuthMode !== 'identity') { clearFrame(); setState('unavailable', denied); return null; }
-      const url = urls.admitHostedUrl(hostedUrl, getHostedPolicy());
+      let policy = null;
+      try { policy = await getHostedPolicy(); } catch {}
+      if (refs.disposed || refs.generation !== generation) return null;
+      const url = urls.admitHostedUrl(hostedUrl, policy);
       if (!url) { clearFrame(); setState('unavailable', 'Dashboard unavailable: hosted URL policy is unconfigured or refuses this URL.'); return null; }
       return url;
     }
@@ -54,7 +60,7 @@
       const generation = refs.generation;
       const url = await admission(generation); if (!url) return;
       const frame = doc.createElement('iframe'); frame.title = `${name} viewer`;
-      frame.setAttribute('sandbox', 'allow-scripts allow-same-origin'); frame.setAttribute('referrerpolicy', 'no-referrer');
+      frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups'); frame.setAttribute('referrerpolicy', 'no-referrer');
       frame.setAttribute('allow', 'xr-spatial-tracking; fullscreen'); frame.setAttribute('loading', 'lazy');
       function finish(state, message) {
         if (refs.disposed || refs.generation !== generation || shell.dataset.modelerState !== 'loading') return;

@@ -14,7 +14,7 @@ for (const keep of [false, true]) {
     test('actual gate isolates initial/restart paths, keep=' + keep + ', failure=' + failure, async () => {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), 'th-h3-gate-unit-'));
       const env = { PENTACLE_RUNTIME_DIR: '/synthetic/caller-runtime' };
-      const observations = []; const children = []; const openFds = [];
+      const observations = []; const children = []; const openFds = []; let drainCalls = 0;
       const filename = path.resolve(__dirname, 'e2e/web_gate.js');
       const realRequire = createRequire(filename);
       const fakeNet = {
@@ -39,9 +39,14 @@ for (const keep of [false, true]) {
       };
       fakeFs.openSync = (...args) => { const fd = fs.openSync(...args); openFds.push(fd); return fd; };
       const quiet = { log() {}, error() {} };
-      // The gate registers signal handlers and signals its Chrome group; the synthetic group is always empty.
+      // The synthetic Chrome group exists until its child receives the group signal.
       const syntheticProcess = { env, execPath: process.execPath, on() {}, removeListener() {}, listeners: () => [],
-        kill() { throw Object.assign(new Error('no such process'), { code: 'ESRCH' }); } };
+        kill(pid, signal = 0) {
+          const child = children.find(p => p.pid === -pid && p.exitCode === null && p.signalCode === null);
+          if (!child) throw Object.assign(new Error('no such process'), { code: 'ESRCH' });
+          if (signal !== 0) child.kill(signal);
+          return true;
+        } };
       const context = { module: { exports: {} }, __dirname: path.join(root, 'e2e'), process: syntheticProcess,
         console: quiet, Buffer, Date, setTimeout, clearTimeout,
         require(name) {
@@ -57,7 +62,7 @@ for (const keep of [false, true]) {
             if (failure === 'setup') throw new Error('synthetic setup failure');
             return { port: 42420, close: async () => {} };
           } };
-          if (name === './lib/cdp') return { connect: async () => ({ consoleLines: [], close() {} }), sleep: async () => {} };
+          if (name === './lib/cdp') return { connect: async () => ({ consoleLines: [], async eval() { return {width:1600,height:1000}; }, async drainConsole() { drainCalls++; }, close() {} }), sleep: async () => {} };
           if (name === './lib/web_scenarios') return { SCENARIOS: [['synthetic-restart', async ctx => {
             await ctx.restartHost();
             if (failure === 'scenario') throw new Error('synthetic scenario failure');
@@ -70,6 +75,7 @@ for (const keep of [false, true]) {
         vm.runInNewContext(fs.readFileSync(filename, 'utf8'), context, { filename });
         const code = await context.module.exports.run({ profile: '/synthetic/profile', keep, timeoutMs: 100, cdpPort: 42422 });
         assert.equal(code, failure ? 1 : 0);
+        assert.equal(drainCalls, failure === 'setup' ? 0 : 1);
         assert.equal(observations.length, failure === 'setup' ? 1 : 2);
         assert.ok(observations.every(dir => dir === observations[0]));
         assert.notEqual(observations[0], '/synthetic/caller-runtime');

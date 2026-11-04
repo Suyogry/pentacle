@@ -15,7 +15,8 @@ const { headlessChromeArgs } = require('./lib/chrome_launch.cjs');
 // touches only a local `ptest-web-*` tmux session; nothing is spawned, closed,
 // or sent on any shared/production daemon.
 //
-// Exit 0 = every scenario passed. Non-zero = a scenario failed or setup broke.
+// --keep retains debug files only; every run still stops its owned browser.
+// Exit 0 = every scenario passed and required cleanup completed.
 
 const fs = require('fs');
 const net = require('net');
@@ -27,6 +28,7 @@ const { spawn, execFileSync } = require('child_process');
 const cdp = require('./lib/cdp');
 const { daemonLogTail } = require('./lib/daemon_log_tail');
 const scenarios = require('./lib/web_scenarios');
+const { dispatchScenario } = require('./lib/scenario_dispatch');
 const { REBIND_HOST } = require('./lib/cross_origin_scenario');
 
 // Chrome honours only the last --host-resolver-rules flag, so fold the
@@ -160,15 +162,35 @@ async function stopOwnedProcess(proc, graceMs = 3000) {
   return { pid: proc.pid, exited: true, forced, exit_code: proc.exitCode, signal: proc.signalCode };
 }
 
-function groupAlive(pgid) {
-  try { process.kill(-pgid, 0); return true; } catch { return false; }
+function groupAlive(pgid, inspection) {
+  try { process.kill(-pgid, 0); return true; } catch (error) {
+    if (error.code === 'ESRCH') return false;
+    if (error.code === 'EPERM') {
+      const observed = { pgid, probe_error: { code: error.code, message: error.message }, probe_observed_at: new Date().toISOString() };
+      // Darwin's existing bounded inspector must parse the COMPLETE table. This
+      // is observation only: any member (including Z) or scan error still fails.
+      // No witness authorizes another signal or reconstructs historical absence.
+      if (process.platform === 'darwin') {
+        observed.scan_started_at = new Date().toISOString();
+        try { observed.members = require('../../scripts/lib/test-runner').groupMembers(pgid); }
+        catch (scanError) { observed.scan_error = scanError.message; }
+        observed.scan_finished_at = new Date().toISOString();
+      }
+      inspection.push(observed);
+      if (Array.isArray(observed.members) && observed.members.length === 0) return false;
+    }
+    const failure = new Error(`CLEANUP_FAIL: cannot inspect owned process group ${pgid}: ${error.message}`);
+    failure.inspection = inspection;
+    throw failure;
+  }
 }
 
-async function groupEmpty(pgid, timeoutMs) {
+async function groupEmpty(pgid, timeoutMs, inspection) {
   const deadline = Date.now() + timeoutMs;
-  while (groupAlive(pgid)) {
-    if (Date.now() > deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+  while (groupAlive(pgid, inspection)) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)));
   }
   return true;
 }
@@ -179,17 +201,24 @@ async function groupEmpty(pgid, timeoutMs) {
 async function stopOwnedGroup(proc, graceMs = 3000) {
   if (!proc || !proc.pid) return { pid: null, exited: true, forced: false };
   const pgid = proc.pid;
-  let forced = false;
-  if (groupAlive(pgid)) {
+  const inspection = [];
+  let forced = false, childExited;
+  if (groupAlive(pgid, inspection)) {
+    let deadline = Date.now() + graceMs;
     try { process.kill(-pgid, 'SIGTERM'); } catch { /* verified below */ }
-    if (!await groupEmpty(pgid, graceMs)) {
+    childExited = await onceExit(proc, Math.max(0, deadline - Date.now()));
+    if (!await groupEmpty(pgid, Math.max(0, deadline - Date.now()), inspection)) {
       forced = true;
+      deadline = Date.now() + graceMs;
       try { process.kill(-pgid, 'SIGKILL'); } catch { /* verified below */ }
-      if (!await groupEmpty(pgid, graceMs)) throw new Error(`CLEANUP_FAIL: owned process group ${pgid} survived SIGKILL`);
+      childExited = await onceExit(proc, Math.max(0, deadline - Date.now()));
+      if (!await groupEmpty(pgid, Math.max(0, deadline - Date.now()), inspection)) throw new Error(`CLEANUP_FAIL: owned process group ${pgid} survived SIGKILL`);
     }
+  } else {
+    childExited = await onceExit(proc, graceMs);
   }
-  await onceExit(proc, graceMs);
-  return { pid: pgid, exited: true, forced };
+  if (!childExited) throw new Error(`CLEANUP_FAIL: owned child ${pgid} exit was not observed`);
+  return { pid: pgid, exited: true, forced, ...(inspection.length ? { inspection } : {}) };
 }
 
 // server/index.js main() installs SIGINT/SIGTERM listeners that process.exit(0) and are never
@@ -212,13 +241,17 @@ function assertNotStopping(runtime) {
 }
 
 class Report {
-  constructor(dir) { this.dir = dir; this.steps = []; fs.mkdirSync(dir, { recursive: true }); }
+  constructor(dir) { this.dir = dir; this.steps = []; this.diagnostics = []; fs.mkdirSync(dir, { recursive: true }); }
   ok(name, passed, detail = null) {
     this.steps.push({ name, ok: !!passed, detail });
     console.log(`   ${passed ? '✓' : '✗'} ${name}${passed ? '' : `  ${JSON.stringify(detail)}`}`);
     if (!passed) throw new Error(`assertion failed: ${name}`);
   }
   note(text) { console.log(`   · ${text}`); }
+  diagnostic(name, detail) {
+    this.diagnostics.push({ name, detail });
+    console.log(`   · ${name}: ${JSON.stringify(detail)}`);
+  }
   write(extra = {}) {
     const failedScenarios = extra.failedScenarios || 0;
     // A setup/teardown error (the catch path) is a FAIL even though no scenario
@@ -227,7 +260,7 @@ class Report {
     const verdict = {
       scenario: 'web_gate', at: new Date().toISOString(),
       status,
-      steps: this.steps, ...extra,
+      steps: this.steps, diagnostics: this.diagnostics, ...extra,
     };
     fs.writeFileSync(path.join(this.dir, 'verdict.json'), JSON.stringify(verdict, null, 2));
     return verdict;
@@ -271,11 +304,14 @@ async function startDaemon(args, scratch, runtime, fixtures = [
   { host: 'local', sessionName: 'web-gate-survivor', streamId: 'local:web-gate-survivor' },
   { host: 'local2', sessionName: 'web-gate-second-host', streamId: 'local2:web-gate-second-host' },
   { host: 'local', sessionName: 'web-gate-seam', streamId: 'local:web-gate-seam' },
+  { host: 'local', sessionName: 'web-gate-wrap-paste', streamId: 'local:web-gate-wrap-paste' },
 ]) {
   const db = path.join(scratch, 'sessions.db');
   execFileSync(args.python, [DAEMON, scratch, '--issue'], { cwd: ROOT });
   runtime.fixtureOperatorTokenPath = path.join(scratch, 'operator-auth', 'token');
   runtime.fixtureScratch = scratch;
+  // Hermetic ASR: the daemon never reaches a real mic backend (web_gate_daemon.py).
+  fs.writeFileSync(path.join(scratch, 'asr-stub.json'), JSON.stringify({ text: 'Hermetic server transcript' }));
   // Seed BEFORE boot: the daemon rebuilds its inventory purely from this DB.
   runtime.fixtureTokens = {};
   const seed = fixtures.map(fixture => {
@@ -297,6 +333,7 @@ async function startDaemon(args, scratch, runtime, fixtures = [
     assertNotStopping(runtime);
     const port = await freePort();
     assertNotStopping(runtime);
+    const startupLogOffset = fs.fstatSync(daemonLog).size;
     const proc = spawn(args.python, [DAEMON, scratch,
       '--host', '127.0.0.1', '--port', String(port), '--local-host', 'local',
       '--db', db,
@@ -314,6 +351,17 @@ async function startDaemon(args, scratch, runtime, fixtures = [
     proc.once('exit', () => { dead = true; });
     try {
       await waitForListen(port, args.timeoutMs, () => dead);
+      // Bind-first bootstrap can serve a snapshot before error-alerts/finisher
+      // setup. This fixture needs the committed path, not the legacy fallback.
+      // The existing startup line follows configure_error_alerts; the byte
+      // offset prevents a previous owned process's log from satisfying readiness.
+      const readyDeadline = Date.now() + args.timeoutMs;
+      while (!fs.readFileSync(path.join(scratch, 'daemon.log')).subarray(startupLogOffset)
+        .includes(Buffer.from('awaiter-resolution: every'))) {
+        if (dead) throw new Error('owned daemon exited before outbound setup');
+        if (Date.now() >= readyDeadline) throw new Error('owned daemon outbound setup timed out');
+        await cdp.sleep(50);
+      }
       return { proc, port, seed: seed.trim() };
     } catch (e) {
       lastErr = e;
@@ -343,7 +391,7 @@ async function runIsolated(args, runtimeDir, cleanupRuntime) {
   const runtime = {};
   const chromeLog = [];
   let daemon = null; let host = null; let chrome = null; let session = null;
-  const fixture = args.profile ? null : FIXTURE;
+  const fixture = args.profile || args.servedUrl ? null : FIXTURE;
   let hostPort = null;
   let hostAuthArgs = [];
 
@@ -353,7 +401,11 @@ async function runIsolated(args, runtimeDir, cleanupRuntime) {
     const generatedCount = fs.existsSync(registryPath) ? Object.keys(JSON.parse(fs.readFileSync(registryPath, 'utf8')).credentials || {}).length : 0;
     try { if (session) session.close(); } catch {}
     let chromeCleanupError = null;
-    try { if (chrome && !args.keep) runtime.chromeCleanup = await stopOwnedGroup(chrome); } catch (e) { chromeCleanupError = e; }
+    try { runtime.chromeCleanup = await stopOwnedGroup(chrome); } catch (e) {
+      chromeCleanupError = e;
+      runtime.chromeCleanup = { pid: chrome && chrome.pid, exited: false, error: e.message,
+        ...(e.inspection?.length ? { inspection: e.inspection } : {}) };
+    }
     try { if (runtime.tmuxSession) tmux(['kill-session', '-t', `=${runtime.tmuxSession}`], { stdio: 'ignore' }); } catch {}
     try { if (runtime.freezeTmux) tmux(['kill-session', '-t', `=${runtime.freezeTmux}`], { stdio: 'ignore' }); } catch {}
     try { if (host) await host.close(); } catch {}
@@ -410,6 +462,8 @@ async function runIsolated(args, runtimeDir, cleanupRuntime) {
     const verdict = JSON.parse(fs.readFileSync(verdictPath, 'utf8'));
     verdict.fixture_auth_cleanup = runtime.fixtureAuthCleanup;
     verdict.daemon_cleanup = runtime.daemonCleanup;
+    verdict.chrome_cleanup = runtime.chromeCleanup;
+    verdict.debug_files_retained = args.keep;
     if (cleanupError) { verdict.status = 'FAIL'; verdict.cleanup_error = String(cleanupError && cleanupError.message ? cleanupError.message : cleanupError); }
     if (!args.keep && (!runtime.fixtureAuthCleanup?.registry_removed || !runtime.fixtureAuthCleanup?.token_removed)) { verdict.status = 'FAIL'; verdict.cleanup_error = 'CLEANUP_FAIL'; }
     fs.writeFileSync(verdictPath, JSON.stringify(verdict, null, 2));
@@ -438,7 +492,7 @@ async function runIsolated(args, runtimeDir, cleanupRuntime) {
   try {
     hostPort = await freePort();
     let profile = args.profile;
-    if (!profile) {
+    if (!profile && !args.servedUrl) {
       runtime.fakeCosmo = await startFakeCosmo();
       runtime.modelerFixture = await startHostedModelerFixture(scratch, hostPort);
       daemon = await startDaemon(args, scratch, runtime);
@@ -446,14 +500,15 @@ async function runIsolated(args, runtimeDir, cleanupRuntime) {
       profile = writeProfile(scratch, daemon.port, runtime.modelerFixture.url);
       report.note(`seeded loopback daemon on 127.0.0.1:${daemon.port} (${daemon.seed})`);
     } else {
-      report.note(`external daemon via profile ${profile} (observational: sidebar/transcript non-fatal)`);
+      report.note(args.servedUrl ? 'explicit served proof (no shared service is started or stopped)'
+        : `external daemon via profile ${profile} (observational: sidebar/transcript non-fatal)`);
     }
 
     // A FIXED port (not 0), so a restart rebinds the same address and the
     // already-loaded page reconnects to a fresh host process — the scenario the
     // host-restart walk needs (see restartHost below).
-    host = await startHostKeepingSignals(['--profile', profile, '--port', String(hostPort)]);
-    const url = `http://127.0.0.1:${host.port}/`;
+    if (!args.servedUrl) host = await startHostKeepingSignals(['--profile', profile, '--port', String(hostPort)]);
+    const url = args.servedUrl || `http://127.0.0.1:${host.port}/`;
     report.note(`web host ${url}`);
 
     // Simulate `pentacle-web-start stop && pentacle-web-start`: tear the host
@@ -590,7 +645,8 @@ async function runIsolated(args, runtimeDir, cleanupRuntime) {
     } : null;
 
     const chromeBin = resolveChrome();
-    const cdpMatch = new RegExp(`127\\.0\\.0\\.1:${host.port}|Terminal Dashboard`);
+    const cdpMatch = args.servedUrl ? new RegExp(new URL(url).host.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      : new RegExp(`127\\.0\\.0\\.1:${host.port}|Terminal Dashboard`);
     // Retry on a lost CDP port race (fresh port each attempt) unless a fixed
     // --cdp-port was requested.
     let cdpErr;
@@ -632,18 +688,19 @@ async function runIsolated(args, runtimeDir, cleanupRuntime) {
       await new Promise((resolve) => setTimeout(resolve, args.timeoutMs));
     }
 
-    const ctx = { session, report, cdp, cdpPort, url, timeoutMs: args.timeoutMs, tmux, fixture, runtime, restartHost, stopHost, startHostSamePort, killDaemon, startDaemonSamePort,
+    const ctx = { session, report, cdp, cdpPort, url, wrapProof: args.wrapProof, timeoutMs: args.timeoutMs, tmux, fixture, runtime, restartHost, stopHost, startHostSamePort, killDaemon, startDaemonSamePort,
       configureModeler, configureMic, modelerFixtureUrl: runtime.modelerFixture?.url, catalog };
     let failed = 0;
     for (const [name, fn] of scenarios.SCENARIOS.filter(([name]) => !args.scenarios?.length || args.scenarios.includes(name))) {
       if (runtime.stopping) break;
       console.log(`\n▸ ${name}`);
-      try { await fn(ctx); } catch (e) { failed += 1; report.note(`scenario ${name} FAILED: ${e && e.message}`); }
+      if (await dispatchScenario(name, fn, ctx)) failed += 1;
     }
 
     assertNotStopping(runtime);
     fs.writeFileSync(path.join(report.dir, 'chrome.log'), chromeLog.join(''));
-    fs.writeFileSync(path.join(report.dir, 'console.log'), (session.consoleLines || []).join('\n'));
+    await session.drainConsole();
+    fs.writeFileSync(path.join(report.dir, 'console.log'), (session.consoleLines || []).map((entry) => JSON.stringify(entry)).join('\n'));
     const verdict = report.write({ url, fixture, daemonPort: daemon && daemon.port, failedScenarios: failed });
     console.log(`\n◀ web_gate: ${verdict.status}\n  artifacts: ${report.dir}`);
     return verdict.status === 'PASS' && failed === 0 ? 0 : 1;
@@ -699,4 +756,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { run, parseArgs, FIXTURE, startDaemon, writeProfile, freePort, onceExit, stopOwnedProcess, allocateReportDir, resolveChrome };
+module.exports = { run, parseArgs, FIXTURE, startDaemon, writeProfile, freePort, onceExit, stopOwnedProcess, stopOwnedGroup, allocateReportDir, resolveChrome };

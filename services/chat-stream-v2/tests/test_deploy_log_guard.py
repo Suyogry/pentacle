@@ -47,7 +47,7 @@ def test_volume_guard_still_requires_a_mount(monkeypatch):
 
 
 @pytest.fixture
-def isolated_release(tmp_path, monkeypatch):
+def isolated_release(tmp_path, monkeypatch, request):
     """Real Git/stamp files; launchd, gate execution and live probes are counterparts."""
     module = _load_deploy(tmp_path / "home", monkeypatch)
     service = module.SERVICES["chat-streamd-v2"]
@@ -67,10 +67,31 @@ def isolated_release(tmp_path, monkeypatch):
     main.parent.mkdir(parents=True)
     main.write_text("version = 1\n")
     (repo / service.requirements_path).write_text("")
+    selection_fixture = getattr(request, "param", None) == "selection"
+    if selection_fixture:
+        from .test_release_selection import _seed_selector_files
+        _seed_selector_files(repo)
+        # Only an external provider counterpart: records the real child argv/env.
+        smoke = repo / "services/chat-stream-v2/tools/spawn_fleet_smoke.py"
+        smoke.parent.mkdir(parents=True, exist_ok=True)
+        smoke.write_text("""import json, os, pathlib, sys
+root = pathlib.Path(__file__).resolve().parents[3].parent
+json.dump({'argv': sys.argv, 'machines_file': os.environ.get('PENTACLE_MACHINES_FILE'),
+           'ambient_hosts': os.environ.get('PENTACLE_SMOKE_HOSTS'),
+           'ambient_json': os.environ.get('PENTACLE_MACHINES_JSON')}, open(root/'observed-child.json', 'w'))
+payload = json.load(open(root/'synthetic-provider-result.json'))
+print(json.dumps(payload['result']))
+sys.exit(payload['returncode'])
+""")
     git("add", ".")
     git("commit", "-qm", "prior")
     prior = git("rev-parse", "HEAD")
     main.write_text("version = 2\n")
+    if selection_fixture:
+        main.write_text("version = 1\n")
+        (repo / "renderer").mkdir(exist_ok=True)
+        (repo / "renderer/fixture.js").write_text("// isolated client change\n")
+        git("add", "renderer/fixture.js")
     git("commit", "-qam", "target")
     target = git("rev-parse", "HEAD")
     git("init", "--bare", "-q", str(origin))
@@ -79,7 +100,7 @@ def isolated_release(tmp_path, monkeypatch):
     git("checkout", "-q", "--detach", prior)
     python = module._venv_python(repo, service)
     python.parent.mkdir(parents=True)
-    python.touch()
+    python.symlink_to(sys.executable) if selection_fixture else python.touch()
     guard = Path(service.log_guard_dir)
     assert guard.is_relative_to(tmp_path), "test guard must stay inside the owned temporary home"
     guard.mkdir(parents=True)
@@ -89,7 +110,8 @@ def isolated_release(tmp_path, monkeypatch):
         "StandardOutPath": str(guard / "launchd.log"),
         "EnvironmentVariables": {"HOME": str(tmp_path / "home")},
     }))
-    monkeypatch.setattr(module, "_launchd_plist_path", lambda _label: plist)
+    monkeypatch.setattr(module, "_launchd_plist_path", lambda label:
+                        tmp_path / "collector.plist" if selection_fixture and label == module.USAGE_COLLECTOR_LABEL else plist)
     # A stale stamp must not replace the checkout's actual pre-activation identity. The managed
     # digest is stamped to match the on-disk plist, so an unchanged definition still kickstarts
     # (no spurious reload); out-of-band drift is covered by its own test below.
@@ -101,7 +123,8 @@ def isolated_release(tmp_path, monkeypatch):
     before = module._stamp_path(repo, service).read_bytes()
     monkeypatch.setattr(module, "verify_deploy_guard", lambda *_a, **_k: {"sole_deployer": True})
     monkeypatch.setattr(module, "_ensure_v2_usage_probe_launchd", lambda *_a: False)
-    monkeypatch.setattr(module, "_v2_usage_probe_rollback", lambda *_a: lambda: None)
+    if not selection_fixture:
+        monkeypatch.setattr(module, "_v2_usage_probe_rollback", lambda *_a: lambda: None)
     calls = []
     # The job is loaded (pid 111) until a bootout, and gone after it, as launchd reports it.
     monkeypatch.setattr(module, "_launchd_state", lambda *_a: (
@@ -123,8 +146,10 @@ def isolated_release(tmp_path, monkeypatch):
         "passed": True,
     }))
 
-    def activate(*, reload=False, rollback=False, same_ref=False, fail=False, override=None):
-        selected = prior if same_ref else target
+    def activate(*, reload=False, rollback=False, same_ref=False, fail=False, override=None,
+                 release_inputs=None):
+        selected = module._read_stamp(repo, service)["prior_sha"] if rollback else prior if same_ref else target
+        actual_prior = git("rev-parse", "HEAD")
         payload = json.loads(evidence.read_text())
         payload["sha"] = selected
         payload["source"].update(sha_before=selected, sha_after=selected)
@@ -135,12 +160,16 @@ def isolated_release(tmp_path, monkeypatch):
             calls.append(tuple(command))
             if command[0] == "git":
                 return subprocess.run(command, cwd=cwd, text=True, capture_output=True)
-            if command[0] == "ps":
+            if tuple(command[:4]) == ("env", "TZ=UTC0", "LC_ALL=C", "ps"):
                 return subprocess.CompletedProcess(command, 0, "Mon Jan 1 11:00:00 2024", "")
+            if selection_fixture and (command[0] == str(python) or command[0] == "/usr/bin/env"):
+                return subprocess.run(command, cwd=cwd, text=True, capture_output=True)
             assert command[0] == "launchctl", command
+            if selection_fixture and command[1] == "bootout" and command[2].endswith("/" + module.USAGE_COLLECTOR_LABEL):
+                return subprocess.CompletedProcess(command, 0, "", "")
             # Inspect actual disk bytes at the moment activation is attempted.
             stamp = module._read_stamp(repo, service)
-            assert stamp["prior_sha"] == prior
+            assert stamp["prior_sha"] == actual_prior
             assert stamp["sha"] == selected
             assert stamp["restart_activation"]["pre_restart_pid"] == 111
             return subprocess.CompletedProcess(command, 1 if fail else 0, "", "isolated failure" if fail else "")
@@ -150,6 +179,7 @@ def isolated_release(tmp_path, monkeypatch):
             ref=prior if rollback or same_ref else "origin/main", rollback=rollback,
             gate_evidence=evidence, deployer_stream_id="test-host:deployer",
             log_guard_dir=override, runner=runner,
+            **({"release_inputs": release_inputs} if release_inputs is not None else {}),
         )
 
     yield module, service, repo, prior, target, before, calls, activate
@@ -303,7 +333,7 @@ def _diag(event, conn='reader', **values):
 
 def _proof(module, **changes):
     def runner(argv, cwd):
-        pid = int(argv[2])
+        pid = int(argv[argv.index('-p') + 1])
         return subprocess.CompletedProcess(argv, 0 if pid == 222 else 1,
                                            _ACTIVE_START if pid == 222 else '', '')
     return dict(expected_pid=222, expected_start=_ACTIVE_START, prior_pid=111,
@@ -355,14 +385,14 @@ def test_uncertain_generation_never_passes(tmp_path, monkeypatch, change):
     elif change == 'reused_pid': stderr = _boot(start=_OLD_START)
     elif change == 'missing_start': kwargs['expected_start'] = None
     elif change == 'old_writer_alive':
-        kwargs['runner'] = lambda argv, cwd: subprocess.CompletedProcess(argv, 0, _OLD_START if argv[2]=='111' else _ACTIVE_START, '')
+        kwargs['runner'] = lambda argv, cwd: subprocess.CompletedProcess(argv, 0, _OLD_START if argv[argv.index('-p') + 1]=='111' else _ACTIVE_START, '')
     elif change == 'new_writer_dead':
         kwargs['runner'] = lambda argv, cwd: subprocess.CompletedProcess(argv, 1, '', '')
     elif change == 'new_writer_reused_during_scan':
         calls = []
         def runner(argv, cwd):
-            calls.append(argv[2])
-            return subprocess.CompletedProcess(argv, 0, _ACTIVE_START if calls.count('222')==1 and argv[2]=='222' else 'changed', '')
+            calls.append(argv[argv.index('-p') + 1])
+            return subprocess.CompletedProcess(argv, 0, _ACTIVE_START if calls.count('222')==1 and argv[argv.index('-p') + 1]=='222' else 'changed', '')
         kwargs['runner'] = runner
     elif change == 'invalid_uuid': stderr = _boot(boot_uuid='missing')
     elif change == 'partial_marker': stderr = stderr[:-1]
@@ -468,7 +498,7 @@ def test_unanswered_old_writer_query_cannot_prove_exit(tmp_path, monkeypatch):
     module = _load_deploy(tmp_path, monkeypatch)
     proof = _proof(module)
     def runner(argv, cwd):
-        return (subprocess.CompletedProcess(argv, 2, '', 'process query denied') if argv[2] == '111'
+        return (subprocess.CompletedProcess(argv, 2, '', 'process query denied') if argv[argv.index('-p') + 1] == '111'
                 else subprocess.CompletedProcess(argv, 0, _ACTIVE_START, ''))
     proof['runner'] = runner
     result = _managed_window(module, tmp_path, monkeypatch, _boot(), _boot(), **proof)

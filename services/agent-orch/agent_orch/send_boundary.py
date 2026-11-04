@@ -18,6 +18,7 @@ from collections.abc import Mapping as MappingABC
 from .config import Config
 
 FIXED_SERVICE_IDENTITIES = {
+    "codex-reset-monitor": ("file", "AGENT_ORCH_STREAM_TOKEN_FILE"),
     "altum-bot-cd": ("file", "AGENT_ORCH_STREAM_TOKEN_FILE"),
     "amaterasu:wmi-pg-dailybackup": ("file", "AGENT_ORCH_STREAM_TOKEN_FILE"),
     "work-report-reader": ("env", "PENTACLE_WORK_REPORT_READER_TOKEN"),

@@ -156,6 +156,7 @@ class ConfigFailsClosed(Tmp):
             "target kind": lambda c: c["profiles"]["pentacle"]["targets"]["v2-unit"].update(kind="shell"),
             "timeout over max": lambda c: c["profiles"]["pentacle"]["targets"]["v2-unit"].update(timeout_s=99999),
             "unknown capability set": lambda c: c["profiles"]["pentacle"]["targets"]["v2-unit"].update(capabilities="nope"),
+            "invalid required selection": lambda c: c["profiles"]["pentacle"]["targets"]["v2-pytest"].update(required_select="tests/test_x.py"),
             "no targets": lambda c: c["profiles"]["pentacle"].update(targets={}),
             "deadline budget": lambda c: c["deadline"].update(slack_s=-1),
         }
@@ -168,6 +169,77 @@ class ConfigFailsClosed(Tmp):
             ge.load_config(broken)
         with self.assertRaises(ge.SetupFailure):
             ge.load_config(self.tmp / "missing.json")
+
+
+class CLIInstructionInput(Tmp):
+    def snapshot(self):
+        root = self.tmp / "instructions"
+        names = ["AGENTS.md", "docs/config/agent_orchestration.md"] + ["agents/" + name for name in
+            ("qa_baseline.md", "documentation_baseline.md", "doc_qa_baseline.md", "nexus_baseline.md", "lead_baseline.md", "evaluator_baseline.md")]
+        rows = []
+        for name in names:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("synthetic snapshot\n")
+            rows.append({"path": name, "sha256": ge.file_digest(path)})
+        (root / "instruction-manifest.json").write_text(json.dumps({"files": rows, "provenance": {
+            "source_root": str(self.tmp), "source_git_head": "a" * 40, "observed_at": "synthetic", "scope": "synthetic-only"}}))
+        for path in [*root.rglob("*"), root]:
+            path.chmod(0o555 if path.is_dir() else 0o444)
+        def writable():
+            for path in [root, *root.rglob("*")]:
+                path.chmod(0o755 if path.is_dir() else 0o644)
+        self.addCleanup(writable)
+        return root
+
+    def test_only_cli_declares_input_and_values_are_not_ambient(self):
+        profile = REAL_CONFIG["profiles"]["pentacle"]
+        self.assertEqual([name for name, target in profile["targets"].items() if ge.ENV_NAME in target.get("pass_env", [])], ["cli-pytest"])
+        root = self.snapshot()
+        identity = ge.instruction_snapshot(str(root))
+        self.assertEqual(len(identity["files"]), 8)
+        self.assertEqual(identity, ge.instruction_snapshot(str(root)))
+        env = ge.build_env(REAL_CONFIG, profile, profile["targets"]["cli-pytest"], checkout=self.tmp, toolchain={},
+            venv=None, home=self.tmp / "home", tmp=self.tmp / "tmp", locale_name="C.UTF-8", evidence=self.tmp,
+            attempt_id="input", pass_env={ge.ENV_NAME: str(root)}, ambient={ge.ENV_NAME: "/untrusted"})
+        self.assertEqual(env[ge.ENV_NAME], str(root))
+
+    def test_absent_malformed_writable_and_content_drift_refuse(self):
+        for value in (None, "relative", str(self.tmp / "absent")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                ge.instruction_snapshot(value)
+        root = self.snapshot()
+        path = root / "AGENTS.md"
+        path.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "writable"):
+            ge.instruction_snapshot(str(root))
+        path.write_text("changed\n")
+        path.chmod(0o444)
+        with self.assertRaisesRegex(ValueError, "content drift"):
+            ge.instruction_snapshot(str(root))
+
+    def test_extra_baseline_symlink_and_malformed_manifest_refuse(self):
+        root = self.snapshot()
+        (root / "agents").chmod(0o755)
+        extra = root / "agents/extra_baseline.md"
+        extra.write_text("unexpected\n")
+        extra.chmod(0o444)
+        (root / "agents").chmod(0o555)
+        with self.assertRaisesRegex(ValueError, "membership"):
+            ge.instruction_snapshot(str(root))
+        (root / "agents").chmod(0o755)
+        extra.unlink()
+        extra.symlink_to(root / "AGENTS.md")
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            ge.instruction_snapshot(str(root))
+        extra.unlink()
+        (root / "agents").chmod(0o555)
+        manifest = root / "instruction-manifest.json"
+        manifest.chmod(0o644)
+        manifest.write_text("{")
+        manifest.chmod(0o444)
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            ge.instruction_snapshot(str(root))
 
 
 class ToolchainResolution(Tmp):
@@ -354,7 +426,15 @@ class PreflightFaults(Tmp):
         co = self.tmp / "co"
         (co / "services/chat-stream-v2/tests").mkdir(parents=True)
         (co / "services/chat-stream-v2/tests/test_a.py").write_text("")
-        self.assertEqual(ge.validate_selection(target, ["tests/test_a.py::test_x"], co), ["tests/test_a.py::test_x"])
+        guards = ["tests/test_capabilities.py::" + name for name in (
+            "test_changed_test_skip_calls_are_confined_to_requires",
+            "test_original_assertions_and_tracked_skip_are_unchanged",
+            "test_fixture_manifest_is_explicitly_synthetic_and_hash_pinned",
+            "test_scope_manifest_covers_all_new_portability_tests")]
+        (co / "services/chat-stream-v2/tests/test_capabilities.py").write_text("")
+        self.assertEqual(ge.validate_selection(target, ["tests/test_a.py::test_x"], co), ["tests/test_a.py::test_x", *guards])
+        self.assertEqual(ge.validate_selection(target, ["tests/test_capabilities.py"], co), ["tests/test_capabilities.py"])
+        self.assertEqual(ge.validate_selection(target, [guards[0]], co), guards)
         for bad in ("../x.py", "--co", "/etc/passwd", "tests/test_missing.py", "tests/test_a.py; rm -rf /", "tests/conftest.py"):
             with self.subTest(bad), self.assertRaises(ge.SetupFailure):
                 ge.validate_selection(target, [bad], co)
@@ -538,6 +618,73 @@ class EntrypointReceipts(Tmp):
     def attempts(self):
         return ga.build_index(self.tmp / "ev")["attempts"]
 
+    def npm_python_case(self, version, *, undeclared=False):
+        cfg = json.loads(json.dumps(REAL_CONFIG))
+        cfg['search_path'] = {'darwin': [], 'linux': []}
+        cfg['system_path'] = []
+        target = cfg['profiles']['pentacle']['targets']['npm-test']
+        if undeclared:
+            target['needs'] = [n for n in target['needs'] if n != 'python']
+        tools = self.tmp / 'tools'
+        tools.mkdir()
+        fake_exe(tools, 'node', 'v22.4.1')
+        fake_exe(tools, 'npm', '10.9.0')
+        if version:
+            fake_exe(tools, 'python3', 'Python ' + version)
+        # Real resolver rejects missing/wrong versions before any subject launch.
+        resolved = ge.resolve_toolchain(cfg, target['needs'], ambient_path=str(tools), system='linux')
+        observed = []
+        venv = self.tmp / 'venv'
+        def subject(command, **kw):
+            env = kw['env']
+            interpreter = env.get('PENTACLE_PYTHON', 'python3')
+            observed.append((interpreter, env.get('V2_PYTHON_BIN')))
+            # Deterministic model of the Python-3.9 probe: a bare fallback fails.
+            rc = 0 if interpreter == str(venv / 'bin/python') else 1
+            return SimpleNamespace(pid=123456789, returncode=rc, wait=lambda **k: rc, poll=lambda: rc)
+        with mock.patch.multiple(ge, load_config=lambda *a: cfg,
+                resolve_toolchain=lambda *a: resolved, pick_locale=lambda *a: ('C.UTF-8', None),
+                check_layout=lambda *a: [], prepared_key=lambda *a: 'fixture', ensure_python_env=lambda *a: (venv, {'reused': True}, []),
+                ensure_npm_env=lambda *a: ({'reused': True}, []), check_scratch=lambda *a: [],
+                check_node_npm=lambda *a: [], check_dependencies=lambda *a: [],
+                check_process_listing=lambda *a: [], group_alive=lambda *a: False,
+                build_command=lambda *a: (['npm', 'test'], {'cwd': self.tmp, 'classify':
+                    lambda rc, to: ('pass' if rc == 0 else 'product_failure', None, {})})), \
+                mock.patch.object(ge.subprocess, 'run', return_value=done()), \
+                mock.patch.object(ge.subprocess, 'Popen', side_effect=subject):
+            code = self.run_main('--target', 'npm-test', '--spec', 's', '--series', 'npm-python', '--purpose', 'negative_control')
+        events = [json.loads(p.read_text()) for p in sorted((self.tmp / 'ev/attempts').glob('*/*.json'))]
+        return code, observed, events, venv
+
+    def test_npm_declared_python_missing_stops_before_subject(self):
+        code, observed, events, _ = self.npm_python_case(None)
+        self.assertEqual(code, 3)
+        self.assertEqual(observed, [])
+        self.assertEqual([e['state'] for e in events], ['started', 'terminal'])
+        self.assertEqual(events[-1]['outcome'], 'setup_failure')
+        self.assertIn('python 3.13', events[-1]['detail']['failures'][0]['detail'])
+
+    def test_npm_declared_python_wrong_version_stops_before_subject(self):
+        code, observed, events, _ = self.npm_python_case('3.9.0')
+        self.assertEqual(code, 3)
+        self.assertEqual(observed, [])
+        self.assertIn('3.9.0', events[-1]['detail']['failures'][0]['detail'])
+
+    def test_npm_undeclared_python_reaches_wrong_interpreter_control(self):
+        code, observed, events, _ = self.npm_python_case('3.9.0', undeclared=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(observed, [('python3', None)])
+        self.assertIn('subject_started', [e['state'] for e in events])
+        self.assertEqual(events[-1]['outcome'], 'product_failure')
+
+    def test_npm_declared_python_is_provisioned_injected_and_recorded(self):
+        code, observed, events, venv = self.npm_python_case('3.13.1')
+        self.assertEqual(code, 0)
+        self.assertEqual(observed, [(str(venv / 'bin/python'), str(venv / 'bin/python'))])
+        prepared = next(e for e in events if e['state'] == 'prepared')
+        self.assertEqual(prepared['toolchain']['python']['version'], '3.13.1')
+        self.assertIn('PENTACLE_PYTHON', prepared['env_names'])
+
     def test_unknown_target_is_a_retained_setup_failure_and_missing_identity_is_unknown_history(self):
         code = self.run_main("--target", "does-not-exist")
         self.assertEqual(code, 3)
@@ -553,7 +700,11 @@ class EntrypointReceipts(Tmp):
         self.assertEqual((a["primary_outcome"], a["history"], a["purpose"]), ("setup_failure", "first_observed", "acceptance"))
 
     def test_resolved_default_scope_survives_setup_failure_without_prepared(self):
-        with mock.patch.multiple(ge, resolve_toolchain=lambda *a, **k: ({}, [ge.fail("toolchain", "fixture setup failure")]),
+        default_needs = []
+        def default_tools(config, needs):
+            default_needs.append(needs)
+            return {}, [ge.fail("toolchain", "fixture setup failure")]
+        with mock.patch.multiple(ge, resolve_toolchain=default_tools,
                                  pick_locale=lambda *a, **k: ("en_US.UTF-8", None), check_layout=lambda *a, **k: []):
             code = self.run_main("--target", "npm-test", "--spec", "s", "--series", "x", "--purpose", "negative_control")
         self.assertEqual(code, 3)
@@ -561,6 +712,24 @@ class EntrypointReceipts(Tmp):
         events = [json.loads(p.read_text()) for p in files]
         self.assertEqual([e["state"] for e in events], ["started", "terminal"])
         self.assertEqual(events[-1]["effective_selection"], REAL_CONFIG["profiles"]["pentacle"]["targets"]["npm-test"]["default_patterns"])
+        self.assertEqual(default_needs, [REAL_CONFIG["profiles"]["pentacle"]["targets"]["npm-test"]["needs"]])
+        interrupt = self.tmp / "co/test/e2e/web_gate_interrupt.test.js"
+        interrupt.parent.mkdir(parents=True)
+        interrupt.write_text("")
+        observed = []
+        def toolchain(config, needs):
+            observed.append(needs)
+            return {}, [ge.fail("toolchain", "fixture setup failure")]
+        with mock.patch.multiple(ge, resolve_toolchain=toolchain,
+                                 pick_locale=lambda *a, **k: ("en_US.UTF-8", None), check_layout=lambda *a, **k: []):
+            self.assertEqual(self.run_main("--target", "npm-test", "--select", "test/e2e/web_gate_interrupt.test.js",
+                                           "--spec", "s", "--series", "x", "--purpose", "negative_control"), 3)
+        self.assertEqual(observed, [REAL_CONFIG["profiles"]["pentacle"]["targets"]["web-gate"]["needs"]])
+        with mock.patch.multiple(ge, resolve_toolchain=toolchain,
+                                 pick_locale=lambda *a, **k: ("en_US.UTF-8", None), check_layout=lambda *a, **k: []):
+            self.assertEqual(self.run_main("--target", "npm-test", "--select", "test/e2e/*.test.js",
+                                           "--spec", "s", "--series", "x", "--purpose", "negative_control"), 3)
+        self.assertEqual(observed[-1], REAL_CONFIG["profiles"]["pentacle"]["targets"]["web-gate"]["needs"])
 
     def test_unresolved_config_failure_never_fabricates_scope(self):
         self.run_main("--target", "npm-test", patch_load=ge.SetupFailure([ge.fail("config", "fixture malformed config")]))
@@ -614,6 +783,7 @@ class EntrypointReceipts(Tmp):
         tools.mkdir(parents=True, exist_ok=True)
         (self.tmp / "co" / "services" / "chat-stream-v2" / "tests").mkdir(exist_ok=True)
         (self.tmp / "co" / "services" / "chat-stream-v2" / "tests" / "test_x.py").write_text("")
+        (self.tmp / "co" / "services" / "chat-stream-v2" / "tests" / "test_capabilities.py").write_text("")
         (tools / "gate_owner_manifest.py").write_bytes((HERE.parent / "services" / "chat-stream-v2" / "tools" / "gate_owner_manifest.py").read_bytes())
         tool = {"path": "/x/t", "realpath": "/x/t", "version": "3.13.1", "sha256": "aa"}
         # A subject that records a detached child into the owner manifest, like the daemon fixtures do, then waits.
@@ -686,6 +856,111 @@ class EntrypointReceipts(Tmp):
         self.assertEqual({a["primary_outcome"] for a in attempts}, {"setup_failure"})
 
 
+
+class WebTerminalPreflight(Tmp):
+    run_main = EntrypointReceipts.run_main
+
+    def case(self, target="web-gate", *, reused=False, probe_rc=1, web=False, timeout=False):
+        checkout = self.tmp / "co"
+        checkout.mkdir(exist_ok=True)
+        (checkout / "package-lock.json").write_text("{}")
+        installed = checkout / "node_modules/.package-lock.json"
+        installed.parent.mkdir()
+        installed.write_text("{}")
+        (checkout / "renderer/dist/web").mkdir(parents=True)
+        (checkout / "renderer/dist/web/web.html").write_text("fixture")
+        selected = "test/e2e/web_wrap_paste_gate.test.js" if web else "test/unit.test.js"
+        (checkout / selected).parent.mkdir(parents=True, exist_ok=True)
+        (checkout / selected).touch()
+        prepared = self.tmp / "ws/prepared/fixture"
+        if reused:
+            prepared.mkdir(parents=True)
+            (prepared / "npm-ready.json").write_text(json.dumps({
+                "lock": ge.file_digest(checkout / "package-lock.json"),
+                "installed": ge.file_digest(installed)}))
+        calls, subjects = [], []
+        def runner(argv, **kw):
+            calls.append((argv, kw))
+            if argv == ["node", "-e", "require('node-pty')"]:
+                if timeout:
+                    raise subprocess.TimeoutExpired(argv, kw["timeout"], stderr="probe timed out")
+                return done(probe_rc, err="old diagnostic\n" * 100 + "Cannot find module 'node-pty'")
+            if argv == ["npm", "ci"]:
+                return done(out="old npm line\n" * 100 + "optional native install failed")
+            return done()
+        def subject(*a, **kw):
+            subjects.append(a)
+            return SimpleNamespace(pid=123456789, returncode=0, wait=lambda **k: 0, poll=lambda: 0)
+        with mock.patch.multiple(ge, resolve_toolchain=lambda *a: ({}, []),
+                pick_locale=lambda *a: ("C.UTF-8", None), check_layout=lambda *a: [],
+                prepared_key=lambda *a: "fixture", ensure_python_env=lambda *a: (None, {}, []),
+                build_env=lambda *a, **k: {}, check_scratch=lambda *a: [],
+                check_node_npm=lambda *a: [], check_process_listing=lambda *a: [],
+                run_preflight_script=lambda *a: [], group_alive=lambda *a: False,
+                build_command=lambda *a: (["synthetic-subject"], {"cwd": checkout,
+                    "classify": lambda rc, to: ("pass", None, {})})), \
+                mock.patch.object(ge.subprocess, "run", side_effect=runner), \
+                mock.patch.object(ge.subprocess, "Popen", side_effect=subject):
+            extra = ["--select", selected] if target == "npm-test" else []
+            code = self.run_main("--target", target, "--spec", "s", "--series", "terminal", *extra)
+        events = [json.loads(p.read_text()) for p in sorted((self.tmp / "ev/attempts").glob("*/*.json"))]
+        probes = [(argv, kw) for argv, kw in calls if argv == ["node", "-e", "require('node-pty')"]]
+        return code, subjects, events, calls, probes
+
+    def assert_missing(self, result, *, fresh):
+        code, subjects, events, calls, probes = result
+        self.assertEqual(code, 3)
+        self.assertEqual(subjects, [])
+        self.assertEqual([e["state"] for e in events], ["started", "terminal"])
+        terminal = events[-1]
+        self.assertEqual(terminal["outcome"], "setup_failure")
+        self.assertEqual(terminal["first_failure"]["code"], "dependencies")
+        failure = terminal["detail"]["failures"][0]["detail"]
+        self.assertIn("node-pty", failure)
+        self.assertIn("Cannot find module", failure)
+        self.assertLess(len(failure), 600)
+        self.assertEqual(len(probes), 1)
+        self.assertEqual(probes[0][1]["cwd"], str(self.tmp / "co"))
+        self.assertLessEqual(probes[0][1]["timeout"], 30)
+        if fresh:
+            tail = terminal["detail"]["npm"]["ci_output_tail"]
+            self.assertIn("optional native install failed", tail)
+            self.assertLessEqual(len(tail), 400)
+        else:
+            self.assertNotIn("npm", terminal["detail"])
+            self.assertFalse(any(argv == ["npm", "ci"] for argv, _ in calls))
+
+    def test_fresh_web_missing_terminal_is_setup_before_subject(self):
+        self.assert_missing(self.case(), fresh=True)
+
+    def test_reused_web_missing_terminal_is_setup_before_subject(self):
+        self.assert_missing(self.case(reused=True), fresh=False)
+
+    def test_selected_npm_web_also_requires_terminal(self):
+        self.assert_missing(self.case("npm-test", web=True), fresh=True)
+
+    def test_passing_terminal_probe_preserves_subject(self):
+        code, subjects, events, _, probes = self.case(probe_rc=0)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(subjects), 1)
+        self.assertEqual(len(probes), 1)
+        self.assertIn("subject_started", [e["state"] for e in events])
+
+    def test_npm_non_web_does_not_probe_terminal(self):
+        code, subjects, _, _, probes = self.case("npm-test")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(subjects), 1)
+        self.assertEqual(probes, [])
+
+    def test_probe_timeout_is_setup_before_subject(self):
+        code, subjects, events, _, probes = self.case(timeout=True)
+        self.assertEqual(code, 3)
+        self.assertEqual(subjects, [])
+        self.assertEqual(events[-1]["first_failure"]["code"], "dependencies")
+        self.assertIn("node-pty", events[-1]["detail"]["failures"][0]["detail"])
+        self.assertEqual(len(probes), 1)
+
+
 class PythonChromePolicy(unittest.TestCase):
     def test_selenium_launch_retains_executable_headless_and_keychain_flags(self):
         import ast
@@ -709,12 +984,15 @@ class PythonChromePolicy(unittest.TestCase):
 
 class ScratchRetention(Tmp):
     """Drive the real main/finally with isolated process/preflight counterparts."""
-    def run_case(self, mode, outcome="product_failure", target="v2-pytest"):
+    def run_case(self, mode, outcome="product_failure", target="v2-pytest", instruction=None):
         co = self.tmp / "co"
         service = co / "services/chat-stream-v2"
         (service / "tests").mkdir(parents=True)
         (service / "tests/test_x.py").write_text("")
+        (service / "tests/test_capabilities.py").write_text("")
         (service / "requirements.txt").write_text("websockets==17.0.1\n")
+        if target == "cli-pytest":
+            (co / "services/agent-orch/tests").mkdir(parents=True)
         short = Path(tempfile.mkdtemp(prefix="gr-", dir="/tmp"))
         self.addCleanup(lambda: __import__("shutil").rmtree(short, ignore_errors=True))
         home, tmp = self.tmp / "r/home", short / "t"
@@ -761,6 +1039,8 @@ class ScratchRetention(Tmp):
                 "--evidence-dir", str(evidence), "--checkout", str(co), "--tmp-root", str(self.tmp / "short"),
                 "--target", target, "--spec", "synthetic", "--series", "retention", "--purpose", "negative_control"]
         if target == "v2-pytest": argv += ["--select", "tests/test_x.py"]
+        if target == "cli-pytest": argv += ["--select", "tests"]
+        if instruction is not None: argv += ["--pass-env", ge.ENV_NAME]
         with mock.patch.multiple(ge, **patches), mock.patch.object(ge.subprocess, "Popen", return_value=Process()):
             code = ge.main(argv)
         attempts = ga.build_index(evidence)["attempts"]
@@ -770,6 +1050,31 @@ class ScratchRetention(Tmp):
         self.assertEqual([e["state"] for e in events], ["started", "prepared", "subject_started", "terminal"], msg=json.dumps(events[-1], sort_keys=True))
         self.assertEqual(len([e for e in events if e["state"] == "terminal"]), 1)
         return code, attempt, events[-1], home.parent, tmp, basetemp
+
+    def test_ordinary_cli_without_declared_input_retains_existing_entry(self):
+        with mock.patch.object(ge, "instruction_snapshot", side_effect=AssertionError("undeclared input was inspected")):
+            code, attempt, terminal, *_ = self.run_case("clean", outcome="pass", target="cli-pytest")
+        self.assertEqual(code, 0)
+        self.assertEqual(attempt["primary_outcome"], "pass")
+        self.assertNotIn("passed_environment", terminal["secondary"])
+
+    def test_supplied_cli_input_is_bound_before_and_after_subject(self):
+        identity = {"root": "/synthetic/read-only", "manifest": {"path": "/synthetic/manifest", "sha256": "a" * 64}, "files": []}
+        with mock.patch.dict(os.environ, {ge.ENV_NAME: identity["root"]}), mock.patch.object(ge, "instruction_snapshot", return_value=identity) as observe:
+            code, _, terminal, *_ = self.run_case("clean", outcome="pass", target="cli-pytest", instruction=identity)
+        self.assertEqual(code, 0)
+        self.assertEqual(observe.call_count, 2)
+        self.assertEqual(terminal["secondary"]["passed_environment"], {ge.ENV_NAME: identity})
+        prepared = next((self.tmp / "evidence").glob("attempts/*/*-prepared.json"))
+        self.assertEqual(json.loads(prepared.read_text())["passed_environment"], {ge.ENV_NAME: identity})
+
+    def test_cli_post_subject_input_drift_is_non_green(self):
+        identity = {"root": "/synthetic/read-only", "manifest": {}, "files": []}
+        with mock.patch.dict(os.environ, {ge.ENV_NAME: identity["root"]}), mock.patch.object(ge, "instruction_snapshot", side_effect=[identity, ValueError("content drift")]):
+            code, attempt, terminal, *_ = self.run_case("clean", outcome="pass", target="cli-pytest", instruction=identity)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(attempt["primary_outcome"], "harness_failure")
+        self.assertEqual(terminal["first_failure"]["code"], "instruction_input_drift")
 
     def check_retained(self, result, primary, reason):
         code, attempt, terminal, run_dir, tmp, basetemp = result
@@ -836,21 +1141,21 @@ class MigratedTargets(Tmp):
         standard = profile["targets"]["v2-merge"]
         for key in ("kind", "gate", "needs", "capabilities", "preflight_script"):
             self.assertEqual(target[key], standard[key])
-        self.assertEqual(target["timeout_s"], 2100)
-        self.assertEqual(target["max_timeout_s"], 2100)
+        self.assertEqual(target["timeout_s"], 2700)
+        self.assertEqual(target["max_timeout_s"], 2700)
         self.assertEqual(profile["targets"]["v2-unit"]["timeout_s"], 900)
         self.assertEqual(standard["timeout_s"], 1800)
-        self.assertEqual(profile["targets"]["v2-merge-ci"]["tier_timeouts"], {"unit": 1500, "smoke": 900})
+        self.assertEqual(profile["targets"]["v2-merge-ci"]["tier_timeouts"], {"unit": 2100, "smoke": 900})
         env = ge.build_env(cfg, profile, target, checkout=HERE.parent, toolchain={}, venv=self.tmp / "v",
                            home=self.tmp / "h", tmp=self.tmp / "t", locale_name="C.UTF-8", evidence=self.tmp / "ev",
                            attempt_id="a", pass_env={}, ambient={"V2_UNIT_TIMEOUT_S": "1", "V2_SMOKE_TIMEOUT_S": "1"})
-        self.assertEqual((env["V2_UNIT_TIMEOUT_S"], env["V2_SMOKE_TIMEOUT_S"]), ("1200", "900"))
+        self.assertEqual((env["V2_UNIT_TIMEOUT_S"], env["V2_SMOKE_TIMEOUT_S"]), ("1800", "900"))
         cmd, result = ge.build_command(cfg, target, self.tmp / "v", HERE.parent, HERE.parent / profile["service_dir"],
                                        self.tmp / "ev", self.tmp / "t/b", [], target["timeout_s"], env)
         self.assertNotIn("--timeout-seconds", cmd)
         self.assertIn("merge", cmd)
-        self.assertEqual(float(cmd[cmd.index("--deadline-seconds") + 1]), 2220)
-        self.assertEqual(result["wall_s"], 2250)
+        self.assertEqual(float(cmd[cmd.index("--deadline-seconds") + 1]), 2820)
+        self.assertEqual(result["wall_s"], 2850)
 
     def test_ci_merge_uses_reviewed_distinct_tier_limits_and_deadline(self):
         cfg = ge.load_config()
@@ -859,13 +1164,13 @@ class MigratedTargets(Tmp):
         env = ge.build_env(cfg, profile, target, checkout=HERE.parent, toolchain={}, venv=self.tmp / "v",
                            home=self.tmp / "h", tmp=self.tmp / "t", locale_name="C.UTF-8", evidence=self.tmp / "ev",
                            attempt_id="a", pass_env={}, ambient={"V2_UNIT_TIMEOUT_S":"1"})
-        self.assertEqual((env["V2_UNIT_TIMEOUT_S"],env["V2_SMOKE_TIMEOUT_S"]),("1500","900"))
+        self.assertEqual((env["V2_UNIT_TIMEOUT_S"],env["V2_SMOKE_TIMEOUT_S"]),("2100","900"))
         cmd, result = ge.build_command(cfg,target,self.tmp / "v",HERE.parent,HERE.parent / profile["service_dir"],
                                        self.tmp / "ev",self.tmp / "t/b",[],target["timeout_s"],env)
         self.assertNotIn("--timeout-seconds",cmd)  # runner reads the reviewed per-tier limits
         self.assertIn("merge",cmd)
-        self.assertEqual(float(cmd[cmd.index("--deadline-seconds")+1]),2520)
-        self.assertEqual(result["wall_s"],2550)  # existing outer startup/teardown slack
+        self.assertEqual(float(cmd[cmd.index("--deadline-seconds")+1]),3120)
+        self.assertEqual(result["wall_s"],3150)  # existing outer startup/teardown slack
 
     def test_cli_and_shared_targets_use_their_own_roots_without_foreign_plugin(self):
         cfg = ge.load_config(); profile = cfg["profiles"]["pentacle"]

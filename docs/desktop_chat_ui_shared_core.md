@@ -35,10 +35,9 @@ An optimistic send starts as `queued`, becomes `dispatched` after the transport 
 
 The composer sends normally with Enter, Alt+Enter or Send, including while the agent works. The provider owns any native queue; there is no Queue/Steer chooser. Shift+Enter inserts a newline. Stop stays beside Send while a non-composite agent works, even with a draft.
 
-Rows show sending until receipt proof arrives. `provider_queued` shows Queued with a Send now button; a local working hint or the optimistic lifecycle's initial queued state does not establish native queueing. A confirmed nonqueued receipt or correlated processing echo resolves the row to Sent. Historical receipt captions and ordinary failure/retry reconciliation retain their existing rules.
+Rows show sending until receipt proof arrives. A genuine `provider_queued` receipt shows Queued; a local working hint does not establish native queueing. Qualified queued rows offer Send now through a separate receipt/generation-bound bridge. Pending actions coalesce; a native echo arriving before the callback prevents dispatch. The queued action never sends a replacement original or clears the web draft. Normal receipt/native proof controls Sent, independently of control acknowledgement or model completion.
 
-Send now calls the generation-fenced interrupt bridge for that queued row's stream. It sends one Escape to end the current turn and release the provider-owned queue; it never resends text or attachments, rotates the request id, or creates another row. Multiple queued messages keep the provider's native order and may run together. The current composer draft is preserved. Stop and Send now share one Escape for the queued rows in the current session generation. Send now shows the selected row as sending until it starts; an explicit failure restores Queued, shows a notice, and allows an operator retry. Replacing the session discards its old queue-action state, and retired rows cannot enable or block current actions. Reconnect never replays an interrupt. Without a queued-row request, Stop retains its existing explicit retry behavior and originally selected generation. The assistant composite has no Stop, chooser or queued-row action.
-
+The daemon selects the pinned native Claude shortcut or exact-turn Codex interruption/ordinary-continue route described in [chat protocol](chat_protocol.md#session-interrupt). Nonempty/unproven native drafts, unqualified versions and unbound legacy queues fail closed. No persistent unavailable label/reason is rendered. Explicit Stop keeps its generation fence and cancels pending continuation; agent urgency and new-message operator urgency stripping remain unchanged. Composite chats have no queued acceleration or Stop. Old operator tabs require the deployment's authorized refresh/closure disposition.
 
 ## Transcript rendering
 
@@ -47,6 +46,8 @@ The view receives a bounded window of rows and renders content-bearing DOM eleme
 Reply buttons are an opt-in transcript affordance. The renderer suppresses them for assistant composites identified by daemon metadata while preserving opted-in behavior on other streams; this presentation rule does not change reply correlation or send semantics.
 
 The latest user row derives a receipt caption from its correlated durable echo (see the send-receipt design note): a committed-but-unconfirmed receipt reads Sent once the echo has bound, never sticking at Sending. An attachment send's server echo is the daemon's agent-facing wrapper text (`Look at the image file at <path>, then respond…`), not the operator caption; the reducer correlates that wrapper to the optimistic row by its embedded attachment keys and keeps the operator caption as the rendered text across the live, snapshot, and duplicate-replay reconcile paths, so one caption bubble renders rather than a second wrapper row.
+
+Operator USER rows with client origin, an optimistic id, or structured provenance stay visible even when their text matches a Codex starter suggestion. Only legacy rows without that provenance use the starter-suggestion filter, consistently across live events, history, snapshots, rendering and diagnostics. Helper-shaped USER summaries can update the sidebar preview; transient noise remains suppressed.
 
 ### Lazy history recovery
 

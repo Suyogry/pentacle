@@ -25,6 +25,13 @@ require operator authority. Local-admin proof is reserved for the existing
 limited recovery routes; it cannot bootstrap a token grant or spawn-admission
 change. Setting `role=nexus` retains its separate parent/operator authorization.
 
+The account `pin-status` and `pin-set` recovery actions also accept verified
+daemon-user local-admin proof on an actual native loopback connection. Their
+CLI path bypasses stale seat identity and the ordinary hello, using the same
+independent recovery transport as consent setup. This grants no operator or
+seat credential: other account actions, spawning and inventory still require
+their usual authentication and authorization.
+
 A headless/CLI installation, where agents are the only operator interface, may
 opt into **seat operator authority** by setting
 `PENTACLE_SEAT_OPERATOR_AUTHORITY=1` on the daemon (a deploy-window restart

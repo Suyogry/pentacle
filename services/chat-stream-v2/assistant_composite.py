@@ -359,8 +359,10 @@ class AssistantComposite:
         question_answer: QuestionAnswer | None = None,
         publication_attachments: Callable[..., Awaitable[list[dict[str, Any]]]] | None = None,
         voice_answers_validate: VoiceAnswersValidate | None = None,
+        sessions: Any = None,
     ) -> None:
         self.store = store
+        self.sessions = sessions
         from front_desk_digest import FrontDeskDigest
         self.front_desk_digest = FrontDeskDigest(store, lambda: self.config)
         self.env_config = config
@@ -847,9 +849,14 @@ class AssistantComposite:
             voice_answers=voice_answers,
             direct_binding=direct_binding,
             binding_env=self._env_binding(),
+            # Server-owned (finisher) sends only; installed clients are unchanged.
+            expected_origin_generation=msg.get("_voice_operation_generation")
+            if (msg.get("_auth_context") or {}).get("outbound_finisher") is True else None,
         )
         receipt_id = record.get("receipt_id")
         await self.refresh_activity()
+        if not record.get("duplicate"):
+            self._advance_summary(record["event"])
         if not record.get("duplicate") and self.broadcast is not None:
             await self.broadcast({"type": "chat.event", "event": (await self.enrich_events([record["event"]]))[0]})
         if not record.get("duplicate"):
@@ -1709,7 +1716,7 @@ class AssistantComposite:
                     or not isinstance(auth.get("session_generation"), str)
                     or not auth["session_generation"]):
                 raise ValueError("assistant_publish_provenance_unverified")
-            if (kind not in {"prose", "status"} or attachment_ids
+            if (kind not in {"prose", "status"}
                     or msg.get("reply_to_message_id") is not None
                     or msg.get("reply_to_question_id") is not None):
                 raise ValueError("assistant_publish_payload_invalid")
@@ -1772,7 +1779,9 @@ class AssistantComposite:
         if attachment_ids:
             if self.publication_attachments is None:
                 raise ValueError("assistant_publish_attachment_validation_unavailable")
-            attachments = await self.publication_attachments(attachment_ids, route)
+            # A proactive publication has no route; uploads scope to the composite itself.
+            scope = route if route is not None else {"stream_id": self.config.stream_id}
+            attachments = await self.publication_attachments(attachment_ids, scope)
             for attachment in attachments:
                 attachment["publisher"] = {"stream_id": actor_stream_id, "generation": actor_generation}
         canonical_payload = {
@@ -1837,6 +1846,7 @@ class AssistantComposite:
         )
         await self.refresh_activity()
         if not stored.get("duplicate"):
+            self._advance_summary(stored["event"])
             if self.broadcast is not None:
                 await self.broadcast({"type": "chat.event", "event": stored["event"]})
             # One push per committed user-facing reply.  The publish-key dedup means
@@ -2099,12 +2109,23 @@ class AssistantComposite:
         )
         published = result.pop("publication", None)
         if not result.get("duplicate"):
+            if published is not None:
+                self._advance_summary(published)
             if published is not None and self.broadcast is not None:
                 await self.broadcast({"type": "chat.event", "event": published})
             if self.work_lanes_changed is not None:
                 await self.work_lanes_changed()
         return {"type": "assistant.operation.ok", "operation": "work_lane." + operation,
                 "request_id": request_id, **result}
+
+    def _advance_summary(self, event: dict[str, Any]) -> None:
+        """Advance the registry preview with a committed composite row.
+
+        Composite rows reach the store without touching the session registry, so
+        the sidebar's last_text would otherwise stay frozen at the startup rebuild.
+        """
+        if self.sessions is not None:
+            self.sessions.apply_genuine_activity_event(self.config.stream_id, event)
 
     async def _is_current_dispatch_actor(
         self, route: dict[str, Any], actor: str, *, allow_authority: bool = False,

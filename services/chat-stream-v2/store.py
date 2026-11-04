@@ -456,6 +456,10 @@ def _admission_held(conn: sqlite3.Connection, host: str, now: float) -> bool:
     return row is not None and float(row["held_until"]) >= now
 
 
+def _initial_admission_paused(conn: sqlite3.Connection) -> bool:
+    return conn.execute("SELECT 1 FROM kv WHERE k=?",("provider_cli.initial_admission_pause",)).fetchone() is not None
+
+
 def _insert_stream_reservation(
     conn: sqlite3.Connection, *, host: str, session_name: str, request_id: str,
     expires_at: float, nonce: str, owner_instance_id: str,
@@ -1473,6 +1477,9 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
     def __init__(self, path: str = ":memory:", *, max_pending: int = 10_000,
                  archive_path: str | None = None) -> None:
         self._path = path
+        # Shared with Sessions: ownership/binding writes cannot outrun a close
+        # between its final authoritative admission and process termination.
+        self.session_graph_lock = asyncio.Lock()
         self._configured_archive_path = archive_path
         self._spec_identity_resolver: Callable[[str | None], str | None] | None = None
         self._spec_identities_resolver: Callable[[Any], dict] | None = None
@@ -1737,6 +1744,8 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 conn.execute("ALTER TABLE v2_assistant_composite_tell_queue ADD COLUMN service_ingress_body TEXT")
             conn.execute(SCOPED_OWNERSHIP_DDL)
             conn.execute(RULING_REQUESTS_DDL)
+            if "covered" not in {r[1] for r in conn.execute("PRAGMA table_info(v2_assistant_lane_rulings)")}:
+                conn.execute("ALTER TABLE v2_assistant_lane_rulings ADD COLUMN covered INTEGER NOT NULL DEFAULT 0")
             conn.execute(ASSISTANT_LANE_OWNERSHIP_DDL)
             conn.execute(RULING_AUDIT_DDL)
             conn.execute(ASSISTANT_COMPOSITE_ROUTES_DUE_INDEX_DDL)
@@ -3684,6 +3693,9 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
         def _op(conn: sqlite3.Connection) -> bool:
             host_transfer.preparation_may_open(conn, f'{host}:{session_name}')
             now = time.time()
+            if _initial_admission_paused(conn):
+                conn.commit()
+                return False
             # The keyless path is always a NEW admission (no replay), so a live
             # hold refuses it in this same serialized txn.
             if refuse_if_held and _admission_held(conn, host, now):
@@ -3832,6 +3844,23 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 "UPDATE v2_stream_reservations SET payload=? WHERE host=? AND session_name=?",
                 (json.dumps(prior_intent, separators=(",", ":")), host, session_name),
             )
+            normalization = prior_intent.get("parent_closed_resume_top_level")
+            if cursor.rowcount == 1 and isinstance(normalization, dict):
+                # The admission decision and recoverable intent commit together;
+                # interruption before pane creation cannot lose or repeat it.
+                episode = conn.execute(
+                    "SELECT episode_id,attempt_seq FROM v2_assistant_restore_episode "
+                    "WHERE spawn_key=? AND stream_id=? AND attempt_generation=?",
+                    (normalization["spawn_key"], normalization["stream_id"], normalization["new_generation"]),
+                ).fetchone()
+                conn.execute(
+                    "INSERT OR IGNORE INTO v2_assistant_restore_audit"
+                    "(episode_id,attempt_seq,event,outcome,detail_json,request_id,created_at) "
+                    "VALUES(?,?,'parent_closed_resume_top_level',?,?,?,?)",
+                    (episode["episode_id"] if episode else None, episode["attempt_seq"] if episode else 0,
+                     normalization["reason"], json.dumps(normalization),
+                     "restore-parent:" + normalization["spawn_key"], iso_now()),
+                )
             conn.commit()
             return cursor.rowcount == 1
 
@@ -4029,11 +4058,14 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             if isinstance(delivery, dict):
                 store_exchange.append(conn, delivery.get("exchange"))
                 conn.execute("UPDATE v2_tell_deliveries SET reply=? WHERE tell_id=?", (json.dumps(payload, separators=(",", ":")), tell_id))
-            # Keep every tell an unsettled notice (any kind) can still read back, so
-            # a retry never finds its proof row pruned; answer/alert rows stay
-            # protected after delivery as before.
+            # Unresolved ordinary tells keep their no-second-paste custody.
+            # Notice-owned rows retain their existing settlement/retention rules.
             conn.execute(
-                "DELETE FROM v2_tell_deliveries WHERE NOT EXISTS (SELECT 1 FROM v2_child_exchange e WHERE e.kind='tell' AND e.ref_id=v2_tell_deliveries.tell_id) "
+                "DELETE FROM v2_tell_deliveries WHERE "
+                "((json_extract(reply,'$.reply.delivery_status')='delivered' "
+                "AND COALESCE(json_extract(reply,'$.delivery.delivery_status'),'delivered')='delivered') "
+                "OR EXISTS (SELECT 1 FROM v2_outbound_notices n WHERE n.tell_id=v2_tell_deliveries.tell_id)) "
+                "AND NOT EXISTS (SELECT 1 FROM v2_child_exchange e WHERE e.kind='tell' AND e.ref_id=v2_tell_deliveries.tell_id) "
                 "AND NOT EXISTS (SELECT 1 FROM v2_outbound_notices n WHERE n.tell_id=v2_tell_deliveries.tell_id "
                 "AND (n.kind IN ('notification_answer','error_alert') OR (n.terminal_at IS NULL AND n.delivered_at IS NULL))) "
                 "AND tell_id NOT IN"
@@ -4048,6 +4080,8 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
 
     async def promote_tell_delivery(
         self, tell_id: str, payload_digest: str, *, proof: dict[str, Any] | None = None,
+        reconcile: bool = False,
+        prepared_result: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Atomically promote one matching proof-pending tell.
 
@@ -4082,6 +4116,21 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 if not isinstance(reply, dict) or not isinstance(delivery, dict):
                     conn.rollback()
                     return None
+                if prepared_result is not None:
+                    from tell_proof import finalize_prepared
+                    completed = finalize_prepared(conn, payload, prepared_result)
+                    if completed is None:
+                        conn.rollback()
+                        return None
+                    completed["reply"]["ledger_row_id"] = int(row["ledger_row_id"])
+                    completed["delivery"]["ledger_row_id"] = int(row["ledger_row_id"])
+                    store_exchange.append(conn, completed["delivery"].get("exchange"))
+                    conn.execute("UPDATE v2_tell_deliveries SET reply=? WHERE tell_id=?",
+                                 (json.dumps(completed, separators=(",", ":")), tell_id))
+                    conn.commit()
+                    return _decode_tell_envelope(conn.execute(
+                        "SELECT rowid AS ledger_row_id,reply,created_at FROM v2_tell_deliveries WHERE tell_id=?",
+                        (tell_id,)).fetchone())
                 if (
                     reply.get("delivery_status") not in COMMITTED_PENDING_PROOF_STATUSES
                     or delivery.get("delivery_status") not in COMMITTED_PENDING_PROOF_STATUSES
@@ -4089,11 +4138,26 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                     conn.rollback()
                     return None
 
+                resolved_proof = proof
+                if reconcile:
+                    from tell_proof import retained_proof
+                    resolved_proof = retained_proof(conn, payload)
+                    if resolved_proof is None:
+                        conn.rollback()
+                        return None
+
                 acknowledged_at = iso_now()
                 reply["delivery_status"] = "delivered"
                 reply["submission_confirmed"] = True
                 reply["delivery_ack_at"] = acknowledged_at
                 reply.pop("reason", None)
+                if reconcile:
+                    reply.update(action_status="committed", action_committed=True,
+                                 confirmation_pending=False, confirmation_status="confirmed")
+                    delivery.update(action_status="committed", action_committed=True,
+                                    confirmation_pending=False, confirmation_status="confirmed")
+                    reply["submission_attempts"] = max(1, int(reply.get("submission_attempts") or 0))
+                    delivery["submission_attempts"] = reply["submission_attempts"]
                 if delivery.get("notification_answer_generation"):
                     reply.update(action_status="committed", action_committed=True,
                                  confirmation_pending=False, confirmation_status="confirmed")
@@ -4105,9 +4169,9 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 delivery["submission_confirmed"] = True
                 delivery["delivered_at"] = acknowledged_at
                 delivery["delivery_ack_at"] = acknowledged_at
-                if isinstance(proof, dict):
-                    reply.update(proof)
-                    delivery.update(proof)
+                if isinstance(resolved_proof, dict):
+                    reply.update(resolved_proof)
+                    delivery.update(resolved_proof)
                 conn.execute(
                     "UPDATE v2_tell_deliveries SET reply=? WHERE tell_id=?",
                     (json.dumps(payload, separators=(",", ":")), tell_id),
@@ -4448,7 +4512,7 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             # serialized txn that would otherwise claim it (QA cycle-3 astra-[3]);
             # the already-admitted-key replay resolved above is unaffected, so an
             # interrupted caller's retry still gets its seat during a deploy hold.
-            if refuse_if_held and _admission_held(conn, host, now):
+            if _initial_admission_paused(conn) or (refuse_if_held and _admission_held(conn, host, now)):
                 conn.commit()
                 return {"status": "frozen"}
             # No prior claim for this key (or keyless): reserve exactly as
@@ -5549,7 +5613,12 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 conn.rollback()
                 raise
 
-        return await self.submit(_op)
+        inserted = await self.submit(_op)
+        if inserted is not None:
+            for entry, result in zip(entries, inserted):
+                if result is not ENTRY_DROPPED:
+                    await self._reconcile_ingested_tell(entry["event"])
+        return inserted
 
     # -- durable send receipts -------------------------------------------
 
@@ -5619,7 +5688,7 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
         receipt = await self.submit(_op)
         return receipt
 
-    async def get_send_receipt(self, to_stream_id: str, request_id: str) -> dict[str, Any] | None:
+    async def get_send_receipt(self, to_stream_id: str, request_id: str, *, include_display_text: bool = False, include_submission_identity: bool = False) -> dict[str, Any] | None:
         """Return only the highest-rowid receipt for one lookup key."""
         target = str(to_stream_id or "").strip()
         request = str(request_id or "").strip()
@@ -5633,7 +5702,14 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                    ORDER BY rowid DESC LIMIT 1""",
                 (target, request),
             ).fetchone()
-            return _project_send_receipt_row(conn, row) if row is not None else None
+            if row is None:
+                return None
+            result = _project_send_receipt_row(conn, row, include_display_text=include_display_text)
+            if include_submission_identity:
+                first = history_query(conn, "SELECT created_at FROM v2_send_receipts WHERE to_stream_id=? AND request_id=? ORDER BY rowid LIMIT 1", (target, request)).fetchone()
+                result["wire_digest"] = row["wire_digest"]
+                result["first_created_at"] = first[0] if first else None
+            return result
 
         return await self.submit(_op)
 
@@ -6236,7 +6312,30 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             except BaseException:
                 conn.rollback()
                 raise
-        return await self.submit(transaction)
+        event_id = await self.submit(transaction)
+        await self._reconcile_ingested_tell(event)
+        return event_id
+
+    async def _reconcile_ingested_tell(self, event: dict[str, Any]) -> None:
+        """Late native peer input uses the existing same-ID proof transition.
+
+        Run on durable replays too, so a crash after append cannot strand proof.
+        The promotion rechecks original text, digest, watermark and generation;
+        an ingest envelope alone never establishes delivery.
+        """
+        raw = event.get("raw")
+        tell_id = raw.get("tell_id") if event.get("kind") == "TELL" and isinstance(raw, dict) else None
+        if not isinstance(tell_id, str) or not tell_id:
+            return
+        prior = await self.get_tell_delivery(tell_id)
+        if (prior is not None and isinstance(prior.get("delivery"), dict)
+                and isinstance(prior.get("payload_digest"), str)
+                and prior["delivery"].get("delivery_status") in COMMITTED_PENDING_PROOF_STATUSES
+                and not (prior["delivery"].get("delivery_status") == "proof_unavailable"
+                         and prior["delivery"].get("submission_attempts") == 0)
+                and not prior["delivery"].get("notification_answer_generation")
+                and prior["delivery"].get("to_stream_id") == event.get("stream_id")):
+            await self.promote_tell_delivery(tell_id, prior["payload_digest"], reconcile=True)
 
     async def tell_event_identity(
         self, stream_id: str, identity: str, event: dict[str, Any] | None = None,

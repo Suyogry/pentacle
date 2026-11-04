@@ -89,6 +89,8 @@ ANSWER_BACK_MAX_CHARS = 800
 ANSWERED_QUESTION_RECOVERY_LIMIT = 100
 ANSWER_TELL_ID_PREFIX = "notification-answer-"
 FIXED_SYSTEM_PRODUCER_STREAM_ID = "altum-bot-cd"
+#: Fixed daemon-owned principal for warning/critical cards from any other producer.
+OPERATOR_NOTIFY_PRINCIPAL = "system:operator-notify"
 _AGENT_QUESTION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 #: D3 (daemon_updates_2026_09): ack is deleted from accepted modes. A question
 #: is a choice (single/multi) or pure free text; every mode admits free text via
@@ -307,6 +309,7 @@ class Notify:
         notice_store: Any = None,
         outbound: Any = None,
         assistant_binding: Any = None,
+        lane_rulings: Any = None,
         assistant_stream_id: str = "",
         alerts: Any = None,
     ) -> None:
@@ -319,6 +322,7 @@ class Notify:
         self._notice_store = notice_store
         self._outbound = outbound
         self._assistant_binding = assistant_binding
+        self._lane_rulings = lane_rulings
         self._assistant_stream_id = str(assistant_stream_id or "")
         self._answer_recovery_after = ""
         if outbound is not None:
@@ -790,6 +794,11 @@ class Notify:
             await self._broadcast({"type": "notification", "notification": client_record})
         return client_record or {}
 
+    async def get_internal_notification_by_dedup(self, *, producer: str, dedup_key: str) -> dict | None:
+        """Reconcile daemon publication across open and historical rows."""
+        await self._await_ready()
+        return await self._db.call("get_latest_by_dedup", producer=producer, dedup_key=dedup_key)
+
     # -- prompt.* dispatch (lifted) ---------------------------------------
 
     async def prompt(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -815,6 +824,28 @@ class Notify:
         try:
             await self._await_ready()
             if verb == "prompt.ask":
+                # A known replay is resolved before the producer lifecycle lock:
+                # publication holds that lock, and an approved replay must still
+                # return its in-flight state without waiting for publication.
+                auth = msg.get("_auth_context") if isinstance(msg.get("_auth_context"), dict) else {}
+                raw = msg.get("envelope")
+                if (self._lane_rulings is not None and isinstance(raw, dict)
+                        and auth.get("token_verified") is True
+                        and auth.get("stream_id") == raw.get("producer_stream_id") == msg.get("from_stream_id")
+                        and auth.get("session_generation")
+                        and not raw.get("_assistant_composite_question_proxy")
+                        and not auth.get("assistant_composite_question_proxy")):
+                    envelope, actions = self._validate_prompt_envelope_and_actions(raw, msg.get("actions"))
+                    row = await self._lane_rulings.question_row(str(auth["stream_id"]), str(auth["session_generation"]), str(envelope.get("question_id") or ""))
+                    if row:
+                        original = json.loads(row["intent_json"])["envelope"]
+                        if not envelope.get("spec_id"):
+                            envelope = {**envelope, "spec_id": original.get("spec_id")}
+                        frozen = {"envelope": envelope, "actions": actions, "severity": str(msg.get("severity") or "info")}
+                        from assistant_lane_rulings import _question_digest
+                        if _question_digest(frozen) != row["intent_digest"]:
+                            return self._prompt_error(request_id, "assistant_ruling_intent_changed", question_id=str(envelope.get("question_id") or ""))
+                        return {**self._lane_rulings.question_reply(row), "request_id": request_id}
                 # Ask admission cannot slip behind a handoff's transfer/close.
                 producer = str((msg.get("envelope") or {}).get("producer_stream_id") or "") if isinstance(msg.get("envelope"), dict) else ""
                 lock = getattr(self._sessions, "_lifecycle_lock", None)
@@ -824,6 +855,14 @@ class Notify:
                 qid = str(msg.get("question_id") or "")
                 question = await self._db.call("get_agent_question", qid)
                 if question is None:
+                    auth = msg.get("_auth_context") or {}
+                    row = await self._lane_rulings.question_row(str(auth.get("stream_id") or ""), str(auth.get("session_generation") or ""), qid) if self._lane_rulings and auth.get("token_verified") else None
+                    if row is None and self._lane_rulings:
+                        row = await self._lane_rulings.question_row_by_id(qid)
+                    if row:
+                        held = self._lane_rulings.question_reply(row)
+                        return {"type": "prompt.status.ok", "request_id": request_id, "ok": True,
+                                "state": "held", **{k: v for k, v in held.items() if k not in {"type"}}}
                     return self._prompt_error(request_id, "question_not_found", question_id=qid)
                 question = await self._expire_if_stale(question)
                 return {"type": "prompt.status.ok", "request_id": request_id, "ok": True, "question": question}
@@ -923,6 +962,22 @@ class Notify:
             if assigned:
                 envelope = {**envelope, "spec_id": assigned}
 
+        frozen = {"envelope": envelope, "actions": actions, "severity": str(msg.get("severity") or "info")}
+        if self._lane_rulings is not None and not assistant_proxy:
+            try:
+                held = await self._lane_rulings.request_question(frozen, auth, spec_omitted=spec_omitted)
+            except ValueError as exc:
+                if str(exc) == "assistant_ruling_intent_changed":
+                    return self._prompt_error(request_id, str(exc), question_id=question_id)
+                raise
+            if held is not None:
+                return {**held, "request_id": request_id}
+        return await self._prompt_publish(frozen, request_id=request_id, spec_omitted=spec_omitted)
+
+    async def _prompt_publish(self, frozen: dict, request_id: str, *, spec_omitted: bool = False) -> dict:
+        envelope, actions = frozen["envelope"], frozen["actions"]
+        question_id = str(envelope.get("question_id") or "")
+        generation = envelope.get("producer_session_generation")
         existing = await self._db.call("get_agent_question", question_id)
         if isinstance(existing, dict):
             existing_envelope = (
@@ -962,7 +1017,7 @@ class Notify:
 
         question = await self._db.call(
             "create_agent_question", envelope=envelope, actions=actions,
-            severity=str(msg.get("severity") or "info"),
+            severity=frozen["severity"],
         )
         notification = await self._db.call("get_notification", str(question.get("notification_id") or ""))
         client_notification = await self._serialize(notification)
@@ -1248,6 +1303,13 @@ class Notify:
                                       message="note must be a string")
         question = await self._db.call("get_agent_question", qid)
         if question is None:
+            auth = msg.get("_auth_context") if isinstance(msg.get("_auth_context"), dict) else {}
+            if self._lane_rulings and auth.get("token_verified"):
+                row = await self._lane_rulings.withdraw_question(str(auth.get("stream_id") or ""), str(auth.get("session_generation") or ""), qid)
+                if row:
+                    if row["state"] == "withdrawn" and row["_withdrawn_now"]:
+                        return {"type": "prompt.cancel.ok", "request_id": request_id, "ok": True, "held": True, "state": "withdrawn"}
+                    return self._prompt_error(request_id, "question_release_pending" if row["state"] == "approved" else "question_terminal_state", question_id=qid, state=row["state"])
             return self._prompt_error(request_id, "question_not_found", question_id=qid)
         auth = msg.get("_auth_context") if isinstance(msg.get("_auth_context"), dict) else {}
         proxy_cancel = bool(
@@ -1316,6 +1378,24 @@ class Notify:
             limit=raw_limit if isinstance(raw_limit, int) else None,
         )
         questions = await self._sweep_stale_open_questions(questions)
+        if self._lane_rulings is not None:
+            auth = msg.get("_auth_context") or {}
+            producer = str(auth.get("stream_id") or "")
+            generation = str(auth.get("session_generation") or "")
+            if auth.get("token_verified") and producer and (not producer_stream_id or producer_stream_id == producer):
+                rows = await self._lane_rulings.store.submit(lambda conn: [dict(row) for row in conn.execute(
+                    "SELECT * FROM v2_assistant_lane_rulings WHERE action='question' AND requester_stream_id=? AND requester_generation=? AND state != 'done' ORDER BY created_at DESC",
+                    (producer, generation))])
+                for row in rows:
+                    intent = json.loads(row["intent_json"])
+                    if msg.get("spec_id") and intent["envelope"].get("spec_id") != msg["spec_id"]:
+                        continue
+                    if raw_open and row["state"] not in {"pending", "approved", "bypassed", "unruled_disabled"}:
+                        continue
+                    questions.append({"question_id": intent["envelope"].get("question_id"), "state": "held",
+                                      **{k: v for k, v in self._lane_rulings.question_reply(row).items() if k != "type"}})
+                if raw_limit is not None:
+                    questions = questions[:raw_limit]
         response = {"type": "prompt.list.ok", "request_id": request_id, "ok": True, "questions": questions}
         if scope is not None:
             response["producer_stream_ids"] = scope
@@ -1523,6 +1603,7 @@ class Notify:
             WMI_BACKUP_PRODUCER_STREAM_ID: "system_backup_failed",
             "bot-messaging-desk": "bot_messaging_failed",
         }.get(actor)
+        fact = None
         if kind is not None:
             fields = {"severity": msg.get("severity"), "dedup_key": msg.get("dedup_key")}
             if kind == "bot_messaging_failed":
@@ -1536,6 +1617,20 @@ class Notify:
                         log.warning("subsystem=error_adapters actor=%s action=sink_unavailable", actor)
                 except Exception:
                     log.warning("subsystem=error_adapters actor=%s action=sink_failed", actor)
+        severity = record.get("severity")
+        if fact is None and (severity == "critical" or (severity == "warning" and kind is None)):
+            # Any other warning/critical card reaches the FD as a typed fact; a
+            # fixed actor's declined frame does only when critical (an error).
+            fact = adapt("operator_notification", record)
+            if fact is not None:
+                try:
+                    nid = None if self.alerts is None else await self.alerts.error(
+                        fact, principal=OPERATOR_NOTIFY_PRINCIPAL,
+                        source_notification_id=record["notification_id"])
+                    if nid is None:
+                        log.warning("subsystem=error_adapters kind=operator_notification action=sink_unavailable")
+                except Exception:
+                    log.warning("subsystem=error_adapters kind=operator_notification action=sink_failed")
         client_record = await self._serialize(record)
         if self._broadcast is not None:
             await self._broadcast({"type": "notification", "notification": client_record})

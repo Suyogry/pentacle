@@ -387,8 +387,11 @@ def _live_seat(row: dict[str, Any] | None, *, target: bool = False) -> None:
         raise ValueError("assistant_rebind_generation_unavailable")
 
 
-def _configured_spec_authorized(row: dict[str, Any], authorized_spec_ids: frozenset[str]) -> bool:
-    if not authorized_spec_ids or row["parent_stream_id"] or row["visibility"] != "default":
+def _configured_spec_authorized(
+    row: dict[str, Any], authorized_spec_ids: frozenset[str], *, allow_hidden: bool = False,
+) -> bool:
+    if (not authorized_spec_ids or row["parent_stream_id"]
+            or row["visibility"] not in ({"default", "hidden"} if allow_hidden else {"default"})):
         return False
     try:
         qualified = json.loads(row["qualified_spec_ids"] or "[]")
@@ -551,7 +554,9 @@ class AssistantBindingStoreMixin:
                         "AND predecessor_stream_id=? AND predecessor_generation=?",
                         (actor_stream_id, actor_generation, old["stream_id"], old["generation"]),
                     ).fetchone()
-                    if handoff is None and not _configured_spec_authorized(actor, authorized_spec_ids):
+                    if handoff is None and not _configured_spec_authorized(
+                        actor, authorized_spec_ids, allow_hidden=name == primary_assistant_name(),
+                    ):
                         raise ValueError("assistant_rebind_unauthorized")
                 if clear:
                     if old["source"] != "durable":
@@ -620,7 +625,8 @@ class AssistantBindingStoreMixin:
                 conn.rollback()
                 raise
 
-        result = await self.submit(_op)
+        async with self.session_graph_lock:
+            result = await self.submit(_op)
         if result.get("error_code"):
             raise ValueError(result["error_code"])
         return result
@@ -657,7 +663,8 @@ class AssistantBindingStoreMixin:
             except BaseException:
                 conn.rollback()
                 raise
-        return await self.submit(_op)
+        async with self.session_graph_lock:
+            return await self.submit(_op)
 
     # -- daemon-owned restore of the bound seat (assistant_restore.py) --------
     # Every episode transition and its audit row share one transaction, and
@@ -704,6 +711,36 @@ class AssistantBindingStoreMixin:
                     (episode_id,),
                 )
             return [dict(r) for r in rows.fetchall()]
+        return await self.submit(_op)
+
+    async def restore_record_degraded_notice(
+        self, *, episode_id: int, budget_epoch: int, notification_id: str,
+    ) -> bool:
+        """Receipt for an already durable warning; one per episode/budget epoch."""
+        def _op(conn: sqlite3.Connection) -> bool:
+            with conn:
+                conn.execute("BEGIN IMMEDIATE")
+                episode = conn.execute(
+                    "SELECT * FROM v2_assistant_restore_episode WHERE episode_id=?", (episode_id,),
+                ).fetchone()
+                if (episode is None or episode["state"] != "degraded"
+                        or int(episode["budget_epoch"]) != budget_epoch):
+                    return False
+                prior = conn.execute(
+                    "SELECT detail_json FROM v2_assistant_restore_audit WHERE episode_id=? "
+                    "AND event='degraded_notice_published'", (episode_id,),
+                ).fetchall()
+                if any(json.loads(r["detail_json"] or "{}").get("budget_epoch") == budget_epoch for r in prior):
+                    return False
+                conn.execute(
+                    "INSERT INTO v2_assistant_restore_audit"
+                    "(episode_id,attempt_seq,event,outcome,detail_json,created_at) "
+                    "VALUES(?,?,'degraded_notice_published','ok',?,?)",
+                    (episode_id, episode["attempt_seq"], json.dumps({
+                        "notification_id": notification_id, "budget_epoch": budget_epoch,
+                    }), _stamp()),
+                )
+                return True
         return await self.submit(_op)
 
     async def restore_request_receipt(self, *, request_id: str) -> dict[str, Any] | None:
@@ -995,7 +1032,8 @@ class AssistantBindingStoreMixin:
             except BaseException:
                 conn.rollback()
                 raise
-        return await self.submit(_op)
+        async with self.session_graph_lock:
+            return await self.submit(_op)
 
     async def restore_reset_budget(
         self, *, episode_id: int, request_id: str, env_binding: dict[str, str],

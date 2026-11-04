@@ -139,7 +139,10 @@ async function webVoice({ session, report, fixture, cdp }) {
     const originalTranscribe = window.cc.chatTranscribeBlob;
     const originalSend = window.cc.chatSendCorrelated;
     const originalPty = window.cc.createPty;
+    const originalCommit = window.cc.chatOutboundCommit;
     window.cc.createPty = async () => '%web-voice-fixture';
+    // This journey covers the client-owned path; web_voice_reload_scenario covers the committed one.
+    window.cc.chatOutboundCommit = async () => ({ ok: false, error_code: 'unsupported' });
     window.__voiceGate = { sent: [], transcribed: [], media: [], roomClicks: 0, holdTranscription: true };
     const room = document.getElementById('mic-btn-toggle');
     const listener = () => window.__voiceGate.roomClicks++;
@@ -162,7 +165,7 @@ async function webVoice({ session, report, fixture, cdp }) {
       window.__voiceGate.stopObserving?.();
       window.__voiceGate.releaseTranscription?.();
       navigator.mediaDevices.getUserMedia = originalMedia;
-      window.cc.chatTranscribeBlob = originalTranscribe; window.cc.chatSendCorrelated = originalSend; window.cc.createPty = originalPty;
+      window.cc.chatTranscribeBlob = originalTranscribe; window.cc.chatSendCorrelated = originalSend; window.cc.createPty = originalPty; window.cc.chatOutboundCommit = originalCommit;
       room.removeEventListener('click', listener);
       for (const media of window.__voiceGate.media) { media.oscillator.stop(); media.stream.getTracks().forEach(t => t.stop()); await media.context.close(); }
     };
@@ -170,9 +173,11 @@ async function webVoice({ session, report, fixture, cdp }) {
   const retainedChecks = []; const errors = [];
   let recording; let pending; let result;
   try {
-    await session.eval(`window.focusStreamId(${JSON.stringify(fixture.streamId)})`);
+    await session.waitFor(`window.focusStreamId(${JSON.stringify(fixture.streamId)}) === true`);
     await session.waitFor("!!document.querySelector('#header-0 [data-mode=\"chat\"]')");
     await session.click('#header-0 [data-mode="chat"]');
+    await session.waitFor(`document.querySelector('#cell-0 .slot-chat-list')?.dataset.streamId === ${JSON.stringify(fixture.streamId)}`, { label: 'voice target slot0 is the base fixture before recording' });
+    report.note('voice target precondition: slot0=' + await session.eval("document.querySelector('#cell-0 .slot-chat-list').dataset.streamId"));
     const mic = '#cell-0 .slot-chat-compose-mic'; const panel = '#cell-0 .slot-chat-voice-take';
     await session.eval(`(${observeRecording.toString()})(document.querySelector(${JSON.stringify(panel)}), document.querySelector(${JSON.stringify(mic)}), window.__voiceGate)`);
     await session.send('Runtime.evaluate', { expression: `document.querySelector(${JSON.stringify(mic)}).click()`, userGesture: true });

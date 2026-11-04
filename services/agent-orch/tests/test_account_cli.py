@@ -91,3 +91,90 @@ def test_front_desk_can_request_existing_handoff_to_a_named_account(monkeypatch,
     assert seen[0]["account"]=="spare" and seen[0]["handoff_from_stream_id"]=="host-a:conversation"
     assert seen[0]["initial_prompt"].startswith("Checkpoint:")
     assert "resume_session_id" not in seen[0]
+
+
+@pytest.mark.parametrize("reconcile_of",[None,"prior-repin"])
+def test_pin_snapshot_and_repin_payloads_use_existing_authenticated_transport(tmp_path,monkeypatch,reconcile_of):
+    from agent_orch import config,stream_id,wsclient
+    monkeypatch.setattr(config,"load_config",lambda:object())
+    monkeypatch.setattr(stream_id,"discover_leader_stream_id_short",lambda _:"host-a:front-desk")
+    seen=[]
+    async def rpc(config,payload,**kwargs): seen.append((payload,kwargs));return {"type":"account.ok"}
+    monkeypatch.setattr(wsclient,"account_once",rpc)
+    snapshot=tmp_path/"pair.json";snapshot.write_text('{"schema":1,"revision":1}')
+    args=cli.build_parser().parse_args(["account","pin-set","--pin-file",str(snapshot),"--expected-revision","0",
+        "--operation-id","initial","--reason","reviewed"])
+    assert args.func(args)==0
+    payload,options=seen.pop()
+    assert payload["pin"]=={"schema":1,"revision":1} and payload["expected_revision"]==0
+    assert "login_generation" not in payload
+    args=cli.build_parser().parse_args(["account","repin","--host","host-a","--provider","claude","--account","primary",
+        "--login-generation","old","--new-generation","new","--operation-id","same-home",
+        "--expected-pin-revision","2","--expected-pin-digest","a"*64,"--reason","reviewed"]+(["--reconcile-of",reconcile_of] if reconcile_of else []))
+    assert args.func(args)==0
+    payload,options=seen.pop()
+    assert payload["action"]=="repin" and options["timeout"]==330
+    assert payload.get("reconcile_of")==reconcile_of
+    assert not {"home","executable","profile_ref"}&payload.keys()
+
+
+def test_duplicate_pin_json_refuses_before_rpc(tmp_path,monkeypatch):
+    from agent_orch import config,stream_id,wsclient
+    monkeypatch.setattr(config,"load_config",lambda:object())
+    monkeypatch.setattr(stream_id,"discover_leader_stream_id_short",lambda _:"host-a:front-desk")
+    async def forbidden(*args,**kwargs): pytest.fail("duplicate snapshot reached transport")
+    monkeypatch.setattr(wsclient,"account_once",forbidden)
+    snapshot=tmp_path/"pair.json";snapshot.write_text('{"schema":1,"schema":2}')
+    args=cli.build_parser().parse_args(["account","pin-set","--pin-file",str(snapshot)])
+    assert args.func(args)==2
+
+
+def test_local_admin_pin_transport_does_not_depend_on_stale_seat_identity(monkeypatch):
+    import asyncio
+    from agent_orch import wsclient
+    seen=[]
+    async def rpc(config,verb,payload,**kwargs):
+        assert verb == "account"
+        seen.append((payload,kwargs)); return {"type":"account.ok"}
+    monkeypatch.setattr(wsclient,"consent_once",rpc)
+    result=asyncio.run(wsclient.account_once(object(),{"type":"account","action":"pin-status",
+        "from_stream_id":"host-a:dead-fd","stream_token":"fixture-stale-seat",
+        "local_admin_token":"fixture-admin"}))
+    assert result["type"]=="account.ok"
+    payload,options=seen[0]
+    assert "from_stream_id" not in payload and "stream_token" not in payload
+    assert options["local_admin"] is True
+    assert payload["local_admin_token"]=="fixture-admin"
+
+
+@pytest.mark.parametrize("action",["repin","pin-status","pin-set"])
+def test_initial_activation_pair_and_readiness_inputs_reach_existing_transport(tmp_path,monkeypatch,action):
+    from agent_orch import config,stream_id,wsclient
+    monkeypatch.setattr(config,"load_config",lambda:object())
+    monkeypatch.setattr(stream_id,"discover_leader_stream_id_short",lambda _:"fixture-host:front-desk")
+    calls=[]
+    async def rpc(config,payload,**options):calls.append((payload,options));return {"type":"account.ok"}
+    monkeypatch.setattr(wsclient,"account_once",rpc)
+    pair=tmp_path/"pair.json";pair.write_text(json.dumps({"schema":1,"revision":1}))
+    parked=tmp_path/"parked.json";parked.write_text("[]")
+    argv=["account",action,"--host","fixture-host"]
+    if action=="repin":argv += ["--target-pin-file",str(pair),"--expected-pin-revision","0"]
+    else:argv += ["--pin-file",str(pair),"--initial-parked-cells-file",str(parked),"--expected-readiness-digest","a"*64]
+    args=cli.build_parser().parse_args(argv)
+    assert args.func(args)==0
+    payload,options=calls[0]
+    assert payload["target_pin" if action=="repin" else "pin"]=={"schema":1,"revision":1}
+    assert options["timeout"]==330
+    assert not {"home","executable","profile_ref","binding"}&payload.keys()
+    if action!="repin":assert payload["initial_parked_cells"]==[] and payload["expected_readiness_digest"]=="a"*64
+
+
+def test_active_repin_refuses_pre_enforcement_target_file_before_rpc(tmp_path,monkeypatch):
+    from agent_orch import config,stream_id,wsclient
+    monkeypatch.setattr(config,"load_config",lambda:object())
+    monkeypatch.setattr(stream_id,"discover_leader_stream_id_short",lambda _:"fixture-host:front-desk")
+    async def forbidden(*args,**kwargs):pytest.fail("active repin sent an initial target")
+    monkeypatch.setattr(wsclient,"account_once",forbidden)
+    pair=tmp_path/"pair.json";pair.write_text('{}')
+    args=cli.build_parser().parse_args(["account","repin","--target-pin-file",str(pair),"--expected-pin-revision","1"])
+    assert args.func(args)==2

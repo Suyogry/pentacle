@@ -29,6 +29,7 @@ _SERVICE_DIR = str(Path(__file__).resolve().parent.parent)
 if _SERVICE_DIR not in sys.path:
     sys.path.insert(0, _SERVICE_DIR)
 from deploy.packet.log_scan import AttributionAmbiguous, freeze, generation_ranges, lines_many
+from deploy import release_selection
 from managed_logs import Config, retained_paths
 
 
@@ -277,7 +278,7 @@ def _assert_deploy_stamp_path(release_stamp_path: Path, launchd_environment: Seq
 def _new_restart_activation(
     *,
     requested_at: str,
-    pre_restart_pid: int,
+    pre_restart_pid: int | None,
     target_sha: str,
     deployer_stream_id: str,
 ) -> dict[str, object]:
@@ -297,7 +298,7 @@ GATE_SYSTEM_PATHS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", 
 # The inline gate runs under `env -i`, so run_gate.py would fall back to 900 s per
 # tier. Use the qualified v2-merge-capacity tier bounds (scripts/gate-env.json);
 # a caller's own V2_<TIER>_TIMEOUT_S still wins.
-DEPLOY_GATE_TIER_TIMEOUTS = {"V2_UNIT_TIMEOUT_S": "1200", "V2_SMOKE_TIMEOUT_S": "900"}
+DEPLOY_GATE_TIER_TIMEOUTS = {"V2_UNIT_TIMEOUT_S": "1800", "V2_SMOKE_TIMEOUT_S": "900"}
 
 
 def _effective_home() -> Path:
@@ -395,6 +396,7 @@ def _fleet_smoke_hosts(machines_file: str) -> tuple[tuple[str, ...], tuple[str, 
 
 def _fleet_smoke_verdict(
     result: subprocess.CompletedProcess[str], machines_file: str,
+    required_cells: list[dict[str, str]] | None = None,
 ) -> dict[str, object]:
     """Combine every smoke evidence channel; missing cells can never turn green.
 
@@ -413,11 +415,20 @@ def _fleet_smoke_verdict(
         issues.append("installed_local_host_not_identified")
     # This is the full deployed smoke matrix, matching spawn_fleet_smoke's
     # PROVIDERS/PROMPT_MODES. Exclusions never prove full-fleet acceptance.
-    expected = {
+    full_expected = {
         (host, provider, mode)
         for host in hosts for provider in ("claude", "codex")
         for mode in ("prompted", "promptless")
     }
+    expected = full_expected
+    if required_cells is not None:
+        try:
+            keys = [tuple(row[field] for field in ("host", "provider", "prompt_mode")) for row in required_cells]
+            if not keys or len(set(keys)) != len(keys) or not set(keys) <= full_expected:
+                raise ValueError("required cells must be unique configured cells")
+            expected = set(keys)
+        except (TypeError, KeyError, ValueError) as exc:
+            issues.append("invalid_required_cells: " + str(exc))
     cells: dict[tuple[str, str, str], dict[str, object]] = {}
     severity = {"passed": 0, "unreachable": 1, "untested": 2, "failed": 3}
     for source in ("cells", "untested", "quota_exhausted", "failures"):
@@ -489,11 +500,40 @@ def _fleet_smoke_verdict(
         outcome = FLEET_SMOKE_PASSED
     return {
         "outcome": outcome, "cells": reports, "local_hosts": list(local_hosts),
+        "scope": "qualified_affected" if required_cells is not None else "full_matrix",
+        "full_fleet_acceptance": outcome == FLEET_SMOKE_PASSED and expected == full_expected,
+        "not_selected": [{"host": h, "provider": p, "prompt_mode": m, "outcome": "UNTESTED",
+                          "reason": "outside_qualified_scope"} for h, p, m in sorted(full_expected - expected)],
         "unreachable_hosts": unreachable_hosts, "untested": untested, "skipped": skipped,
         "evidence": payload, "issues": issues, "returncode": result.returncode,
         "detail": _terminal_command_detail(result),
         **({"raw_stdout": result.stdout, "raw_stderr": result.stderr} if not payload else {}),
     }
+
+
+def _validate_selected_activation(plan: dict, repo: Path, service: ServiceConfig) -> None:
+    identity = plan["identity"]
+    activation = identity["activation"]
+    # The deploy readback itself is for this local endpoint. A successful canary
+    # against another daemon cannot establish the newly activated source.
+    if activation["url"] != "ws://127.0.0.1:7791":
+        raise DeployError("release selection: activation endpoint does not match runtime readback")
+    configured = _launchd_environment(service.launchd_label).get("PENTACLE_MACHINES_FILE", "").strip()
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        path = repo / path
+    try:
+        hosts, local_hosts, _ = _fleet_smoke_hosts(str(path))
+        if activation["host"] not in local_hosts:
+            raise ValueError("affected canary is not an installed local host")
+        supplied_satellites = {row["component"] for row in identity["installed"] if row["role"] == "satellite"}
+        if supplied_satellites != set(hosts) - set(local_hosts):
+            raise ValueError("missing or extra configured satellite baseline")
+        bindings = identity["external_inputs"]["deploy_config"]["candidate"]["files"]
+        if not any(Path(b["path"]).resolve() == path.resolve() and b["sha256"] == _sha256(path) for b in bindings):
+            raise ValueError("installed machine configuration is not bound to selected inputs")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise DeployError(f"release selection: invalid activation configuration: {exc}") from exc
 
 
 def run_gate_and_write_evidence(
@@ -843,12 +883,8 @@ def _reload_launchd(
     # bootout returns while the old daemon is still in its graceful shutdown, and launchd
     # refuses a bootstrap of a job it still holds (rc 5). Wait, bounded, for the job to go;
     # past the bound the bootstrap below still runs and reports its own failure.
-    unload_deadline = monotonic() + RELOAD_UNLOAD_WAIT_S
-    while monotonic() < unload_deadline:
-        state = _launchd_state(label, runner)
-        if state.answered and not state.loaded:
-            break
-        sleep(RELOAD_UNLOAD_POLL_S)
+    _wait_launchd_unloaded(label, runner, timeout_s=RELOAD_UNLOAD_WAIT_S,
+                          sleep=sleep, monotonic=monotonic)
     command = ("launchctl", "bootstrap", domain, str(_launchd_plist_path(label)))
     result: subprocess.CompletedProcess[str] | None = None
     for attempt in range(3):
@@ -860,6 +896,48 @@ def _reload_launchd(
         sleep(0.25)
     detail = ((result.stderr or result.stdout) if result is not None else "") or ""
     raise DeployError(f"command failed rc={result.returncode if result is not None else '?'}: {' '.join(command)} {detail.strip()}".strip())
+
+
+def _wait_launchd_unloaded(
+    label: str, runner: Runner, *, timeout_s: float,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> LaunchdState:
+    deadline = monotonic() + timeout_s
+    state = LaunchdState(loaded=False, pid=None, answered=False)
+    while monotonic() < deadline:
+        state = _launchd_state(label, runner)
+        if state.answered and not state.loaded:
+            break
+        sleep(RELOAD_UNLOAD_POLL_S)
+    return state
+
+
+def reload_web(
+    label: str, plist: Path, runner: Runner, *, timeout_s: float = 10.0,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, object]:
+    """Reload only the caller's descriptor, after positively observing unload.
+
+    The web owner retains its artifact/config preimages, descriptor transaction,
+    PID/listener/served-build readback and exact rollback. This replaces only its
+    copied bootout/print/bootstrap block; it neither stages nor certifies a release.
+    Unlike daemon reload, web activation must refuse an unknown or stuck label.
+    """
+    plist = Path(plist)
+    if plistlib.loads(plist.read_bytes()).get("Label") != label:
+        raise DeployError("web descriptor Label does not match the requested label")
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise DeployError("web unload timeout must be positive and finite")
+    target = _launchctl_target(label)
+    _checked(("launchctl", "bootout", target), Path.cwd(), runner)
+    state = _wait_launchd_unloaded(label, runner, timeout_s=timeout_s,
+                                  sleep=sleep, monotonic=monotonic)
+    if not state.answered or state.loaded:
+        raise DeployError(f"web label not positively unloaded within {timeout_s:g}s: {target}; {state.detail}")
+    _checked(("launchctl", "bootstrap", target.rsplit("/", 1)[0], str(plist)), Path.cwd(), runner)
+    return {"target": target, "unloaded": True, "plist": str(plist)}
 
 
 def _asset_store_identity(service: ServiceConfig) -> dict[str, object]:
@@ -1038,10 +1116,11 @@ def classify_slow_consumer_lines(lines, *, boot_marker_seen=True, max_examples=N
     failures: list[dict[str, str]] = []
     connection_failures: dict[str, int] = {}
     peer_4000_connections: list[str] = []
-    priority = {"1011_close": 1, "peer_liveness": 2, "overflow": 3}
+    priority = {"1011_close": 1, "keepalive_timeout": 2, "peer_liveness": 3, "overflow": 4}
+    keepalive_connections: set[str] = set()
     for raw_line in lines:
         raw_line = raw_line.rstrip("\r\n")
-        if len(connection_failures) + len(peer_4000_connections) + len(failures) > 100000:
+        if len(connection_failures) + len(peer_4000_connections) + len(failures) + len(keepalive_connections) > 100000:
             raise ValueError("diagnostic identity resource limit")
         line = raw_line.strip()
         if "conn_diag " in raw_line:
@@ -1068,6 +1147,9 @@ def classify_slow_consumer_lines(lines, *, boot_marker_seen=True, max_examples=N
                 queue_depth_warnings += 1
             kind: str | None = None
             if event == "force_close":
+                if (record.get("initiator") == "server" and record.get("cause") == "liveness"
+                        and record.get("cause_source") == "protocol_close"):
+                    keepalive_connections.add(conn_id)
                 if record.get("initiator") == "server" and record.get("cause") == "slow_consumer":
                     kind = "overflow"
                 elif record.get("initiator") == "peer" and record.get("cause") == "liveness":
@@ -1077,6 +1159,10 @@ def classify_slow_consumer_lines(lines, *, boot_marker_seen=True, max_examples=N
                     "close_code", "close_sent_code", "close_received_code",
                 )):
                     kind = "1011_close"
+                if kind == "1011_close" and (record.get("close_reason") == "keepalive_ping_timeout"
+                        or record.get("close_sent_reason") == "keepalive_ping_timeout"
+                        or conn_id in keepalive_connections):
+                    kind = "keepalive_timeout"
                 if (record.get("initiator") == "peer" and record.get("close_code") == 4000
                         and record.get("close_reason") not in (
                             "liveness_force_close", "focused_heartbeat_timeout",
@@ -1084,6 +1170,11 @@ def classify_slow_consumer_lines(lines, *, boot_marker_seen=True, max_examples=N
                     peer_4000_connections.append(conn_id)
             if kind is not None:
                 row = {"kind": kind, "client": conn_id, "line": raw_line}
+                if kind == "keepalive_timeout":
+                    row["class"] = "liveness"
+                    for metric in ("queue_depth", "queue_max", "queue_peak", "queued_by_type", "queue_snapshot_age_ms"):
+                        if metric in record:
+                            row[metric] = record[metric]
                 if "transport" in record:
                     row["transport"] = record["transport"]
                 if max_examples is not None and len(failures) >= max_examples:
@@ -1128,8 +1219,11 @@ def classify_slow_consumer_lines(lines, *, boot_marker_seen=True, max_examples=N
     }
     peer_4000_other = sum(conn_id not in forced_connections for conn_id in peer_4000_connections)
     overflow_drops = sum(row["kind"] == "overflow" for row in failures)
+    kinds = {kind: sum(row["kind"] == kind for row in failures)
+             for kind in sorted({row["kind"] for row in failures})}
     return {
-        "class": "slow_consumer",
+        "class": "liveness" if kinds and set(kinds) == {"keepalive_timeout"} else "slow_consumer",
+        "kinds": kinds,
         "outcome": SLOW_CONSUMER_FAILED if failures else SLOW_CONSUMER_PASSED,
         "boot_marker_seen": boot_marker_seen,
         "queue_depth_warnings": queue_depth_warnings,
@@ -1149,6 +1243,7 @@ class LaunchdState:
     # the tool may just have hiccuped — so an unanswered poll is never counted as evidence of
     # a crash mid-wait; only the deadline check acts on it, after a confirming re-sample.
     answered: bool = True
+    detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -1195,7 +1290,8 @@ def _launchd_state(label: str, runner: Runner) -> LaunchdState:
         # evidence against it.
         text = f"{result.stderr or ''}{result.stdout or ''}".lower()
         definite = result.returncode == _LAUNCHCTL_NO_SUCH_SERVICE or "could not find service" in text
-        return LaunchdState(loaded=False, pid=None, answered=definite)
+        return LaunchdState(loaded=False, pid=None, answered=definite,
+                            detail=f"launchctl print rc={result.returncode}: {(result.stderr or result.stdout or '').strip()}")
     match = _LAUNCHD_PID_RE.search(result.stdout or "")
     return LaunchdState(loaded=True, pid=int(match.group(1)) if match else None, answered=True)
 
@@ -1266,13 +1362,13 @@ class _ManagedAppendedLogScanner:
 def _process_start(pid: int | None, runner: Runner) -> str | None:
     if type(pid) is not int or pid <= 0:
         return None
-    result = runner(("ps", "-p", str(pid), "-o", "lstart="), Path.cwd())
+    result = runner(("env", "TZ=UTC0", "LC_ALL=C", "ps", "-p", str(pid), "-o", "lstart="), Path.cwd())
     value = " ".join((result.stdout or "").split())
     return value if result.returncode == 0 and value else None
 
 
 def _prior_writer_exited(pid: int, start: str, runner: Runner) -> bool:
-    result = runner(("ps", "-p", str(pid), "-o", "lstart="), Path.cwd())
+    result = runner(("env", "TZ=UTC0", "LC_ALL=C", "ps", "-p", str(pid), "-o", "lstart="), Path.cwd())
     value = " ".join((result.stdout or "").split())
     # ps uses rc=1 with empty output for an absent PID. Tooling errors and
     # blank successful answers cannot establish a writer's exit.
@@ -1289,6 +1385,7 @@ def _scan_slow_consumer_window(
     expected_start: str | None = None,
     prior_pid: int | None = None,
     prior_start: str | None = None,
+    no_outgoing_writer: bool = False,
     runner: Runner,
 ) -> dict[str, object]:
     paths = _daemon_log_paths(service)
@@ -1304,27 +1401,28 @@ def _scan_slow_consumer_window(
         attribution = {"outcome": "attribution_ambiguous", "reasons": []}
         selected, preceding, markers = [], [], []
         try:
-            if (type(prior_pid) is not int or prior_pid <= 0
+            if not (no_outgoing_writer and prior_pid is None) and (type(prior_pid) is not int or prior_pid <= 0
                     or prior_pid == expected_pid or not prior_start
                     or not _prior_writer_exited(prior_pid, prior_start, runner)):
                 raise AttributionAmbiguous("outgoing writer lifetime is unproven")
             if not expected_start or _process_start(expected_pid, runner) != expected_start:
                 raise AttributionAmbiguous("activated PID/start identity is missing or changed")
             selected, preceding, markers = generation_ranges(groups, expected_pid, expected_start)
-            attribution.update(outcome="attributed", generation=markers[0]["identity"],
-                               markers=markers, prior_pid=prior_pid, prior_start=prior_start,
-                               prior_writer_exited=True)
+            attribution.update(outcome="no_outgoing_writer" if no_outgoing_writer and prior_pid is None else "attributed",
+                               generation=markers[0]["identity"], markers=markers,
+                               prior_pid=prior_pid, prior_start=prior_start,
+                               prior_writer_exited=not (no_outgoing_writer and prior_pid is None))
         except AttributionAmbiguous as error:
             attribution["reasons"].append(str(error))
         # Ambiguous records remain inspectable and can never produce a pass.
-        observed = selected if attribution["outcome"] == "attributed" else groups
+        observed = selected if attribution["outcome"] in ("attributed", "no_outgoing_writer") else groups
         scan = classify_slow_consumer_lines(
             (line for group in observed for line in lines_many(group)),
             boot_marker_seen=boot_marker_seen, max_examples=100,
         )
-        if attribution["outcome"] == "attributed" and _process_start(expected_pid, runner) != expected_start:
+        if attribution["outcome"] in ("attributed", "no_outgoing_writer") and _process_start(expected_pid, runner) != expected_start:
             attribution.update(outcome="attribution_ambiguous", reasons=["activated PID/start changed during scan"])
-        if attribution["outcome"] != "attributed":
+        if attribution["outcome"] not in ("attributed", "no_outgoing_writer"):
             scan["outcome"] = SLOW_CONSUMER_FAILED
         prior_scan = classify_slow_consumer_lines(
             (line for group in preceding for line in lines_many(group)), max_examples=100,
@@ -1564,7 +1662,7 @@ def _apply_post_activation(
             }
             if runtime_confirmed:
                 active_start = _process_start(readback.pid, runner)
-                # Full smoke follows installed configuration, independent of caller overrides.
+                # Invocation and verdict share the same admitted affected scope.
                 machines_file = _launchd_environment(service.launchd_label).get("PENTACLE_MACHINES_FILE", "").strip()
                 if machines_file:
                     # The child runs in repo, not the caller's working directory. Resolve
@@ -1573,6 +1671,14 @@ def _apply_post_activation(
                     if not machines_path.is_absolute():
                         machines_path = repo / machines_path
                     machines_file = str(machines_path.resolve())
+                selection = stamp.get("release_selection")
+                required_cells = None
+                smoke_args = ()
+                if selection is not None:
+                    identity = selection["identity"]
+                    activation = identity["activation"]
+                    required_cells = identity["required_cells"]
+                    smoke_args = (activation["url"], activation["host"])
                 smoke = runner(
                     (
                         "/usr/bin/env",
@@ -1581,16 +1687,29 @@ def _apply_post_activation(
                         f"PENTACLE_MACHINES_FILE={machines_file}",
                         str(_venv_python(repo, service)),
                         str(repo / "services/chat-stream-v2/tools/spawn_fleet_smoke.py"),
+                        *smoke_args,
                     ),
                     repo,
+                )
+                guard = stamp.get("restart_guard") or {}
+                activation = stamp.get("restart_activation") or {}
+                no_outgoing_writer = (
+                    guard.get("daemon_state") == activation.get("daemon_state") == "down"
+                    and guard.get("down_basis") == "launchd_answered_no_pid"
+                    and guard.get("launchd_answered") is True
+                    and guard.get("pre_restart_pid") is None
+                    and guard.get("pre_restart_launchd_answered") is True
+                    and activation.get("pre_restart_launchd_answered") is True
+                    and activation.get("pre_restart_pid") is None
+                    and prior_pid is None
                 )
                 stamp["slow_consumer"] = _scan_slow_consumer_window(
                     service, prior_log_size, expected_pid=readback.pid,
                     expected_start=active_start, prior_pid=prior_pid,
-                    prior_start=prior_start, runner=runner,
+                    prior_start=prior_start, no_outgoing_writer=no_outgoing_writer, runner=runner,
                 )
-                stamp["fleet_smoke"] = _fleet_smoke_verdict(smoke, machines_file)
-                if stamp["fleet_smoke"]["outcome"] == FLEET_SMOKE_PASSED:
+                stamp["fleet_smoke"] = _fleet_smoke_verdict(smoke, machines_file, required_cells)
+                if stamp["fleet_smoke"]["outcome"] == FLEET_SMOKE_PASSED and required_cells is None:
                     _install_fleet_smoke_schedule(repo, runner)
         # Persist the classified record inside the same never-raising boundary. A stamp-write
         # failure after activation must not escape as a refusal either — record it and make one
@@ -1639,6 +1758,8 @@ def verify_deploy_guard(
     *,
     repo: Path = REPO_ROOT,
     sha: str,
+    rollback: bool = False,
+    rollback_from_sha: str | None = None,
     sessions_db: Path | None = None,
     legacy_schedules_db: Path | None = None,
 ) -> dict[str, object]:
@@ -1649,34 +1770,74 @@ def verify_deploy_guard(
     instead serializes every deployer, refusing to proceed while any other open
     `role=deployer` session exists. It records the target checkout SHA and the
     pre-restart launchd pid as activation evidence, and refuses if any nonterminal
-    scheduled spawn (v2 or legacy) could race the restart.
+    scheduled spawn (v2 or legacy) could race the restart. Rollback of a down
+    daemon uses durable sessions instead of the unavailable live list; only that
+    mode permits a null pre-restart PID, marked by daemon_state="down".
     """
     resource = _coordination_resource(service)
     if not deployer_stream_id:
         raise DeployError("restart activation requires a deployer stream id")
     if not isinstance(sha, str) or re.fullmatch(r"[0-9a-f]{40}", sha) is None:
         raise DeployError("restart activation requires a full lowercase target SHA")
-    agent_orch = _resolve_agent_orch(repo, service)
-    listing = _checked((agent_orch, "list"), Path.cwd(), runner)
-    try:
-        rows = json.loads(listing.stdout or "[]")
-    except ValueError as exc:
-        raise DeployError("invalid agent-orch list response") from exc
-    if not isinstance(rows, list):
-        raise DeployError("invalid agent-orch list response")
-    other_deployers = sorted(
-        str(row.get("stream_id") or "")
-        for row in rows
-        if isinstance(row, dict)
-        and row.get("role") == "deployer"
-        and str(row.get("stream_id") or "") != deployer_stream_id
-    )
+    down = False
+    down_basis = None
+    launchd_answered = None
+    if rollback:
+        state = _launchd_state(service.launchd_label, runner)
+        current_stamp = _read_stamp(repo, service)
+        # deploy() has already checked out the rollback target. Bind the failed
+        # stamp to the checkout that the operator asked to roll back instead.
+        checkout_sha = rollback_from_sha or _git(repo, "rev-parse", "HEAD", runner=runner)
+        boot = current_stamp.get("daemon_boot_readback")
+        launchd_answered = state.answered
+        down = (state.answered and state.pid is None) or (
+            current_stamp.get("sha") == checkout_sha
+            and isinstance(boot, dict) and boot.get("outcome") == "boot_failed"
+        )
+        if down:
+            down_basis = "launchd_answered_no_pid" if state.answered and state.pid is None else "boot_failed_stamp"
+    configured_db = sessions_db
+    if down:
+        arguments = _launchd_plist(service.launchd_label).get("ProgramArguments", [])
+        if configured_db is None and isinstance(arguments, list) and "--db" in arguments:
+            index = arguments.index("--db") + 1
+            if index >= len(arguments) or not isinstance(arguments[index], str) or not arguments[index]:
+                raise DeployError("rollback sessions DB path is missing")
+            configured_db = Path(arguments[index]).expanduser()
+        if configured_db is None and os.environ.get("PENTACLE_STREAM_SESSIONS_DB"):
+            configured_db = Path(os.environ["PENTACLE_STREAM_SESSIONS_DB"]).expanduser()
+        if configured_db is None:
+            raise DeployError("rollback sessions DB path is missing")
+        try:
+            with sqlite3.connect(configured_db.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+                other_deployers = sorted(
+                    f"{host}:{name}" for host, name in conn.execute(
+                        "SELECT host, session_name FROM sessions WHERE status='open' AND role='deployer'"
+                    ) if f"{host}:{name}" != deployer_stream_id
+                )
+        except (OSError, sqlite3.Error) as exc:
+            raise DeployError("rollback sessions DB readback failed") from exc
+    else:
+        agent_orch = _resolve_agent_orch(repo, service)
+        listing = _checked((agent_orch, "list"), Path.cwd(), runner)
+        try:
+            rows = json.loads(listing.stdout or "[]")
+        except ValueError as exc:
+            raise DeployError("invalid agent-orch list response") from exc
+        if not isinstance(rows, list):
+            raise DeployError("invalid agent-orch list response")
+        other_deployers = sorted(
+            str(row.get("stream_id") or "")
+            for row in rows
+            if isinstance(row, dict)
+            and row.get("role") == "deployer"
+            and str(row.get("stream_id") or "") != deployer_stream_id
+        )
     if other_deployers:
         raise DeployError(
             "daemon deploys serialize on a single deployer; other open deployer "
             f"session(s) present: {', '.join(other_deployers)}"
         )
-    configured_db = sessions_db
     if (
         configured_db is None
         and service.launchd_label == V2_DAEMON_LABEL
@@ -1717,8 +1878,9 @@ def verify_deploy_guard(
         raise DeployError(
             f"daemon deploy requires zero nonterminal legacy schedules; found {legacy_count}"
         )
-    pre_restart_pid = _launchd_state(service.launchd_label, runner).pid
-    if type(pre_restart_pid) is not int or pre_restart_pid <= 0:
+    pre_restart_state = _launchd_state(service.launchd_label, runner)
+    pre_restart_pid = pre_restart_state.pid
+    if not (down and pre_restart_pid is None) and (type(pre_restart_pid) is not int or pre_restart_pid <= 0):
         raise DeployError("restart activation requires a positive launchd PID")
     return {
         "resource": resource,
@@ -1726,6 +1888,9 @@ def verify_deploy_guard(
         "sole_deployer": True,
         "checkout_sha": sha,
         "pre_restart_pid": pre_restart_pid,
+        **({"daemon_state": "down", "down_basis": down_basis,
+            "launchd_answered": launchd_answered,
+            "pre_restart_launchd_answered": pre_restart_state.answered} if down else {}),
     }
 
 
@@ -1736,6 +1901,7 @@ def deploy(
     ref: str,
     rollback: bool = False,
     gate_evidence: Path | None = None,
+    release_inputs: Path | None = None,
     deployer_stream_id: str | None = None,
     skip_kickstart: bool = False,
     log_guard_dir: str | Path | None = None,
@@ -1781,6 +1947,16 @@ def deploy(
             "generated_at": evidence.get("generated_at"),
             "evidence_source": evidence_source,
         }
+        selection = None
+        if release_inputs is not None:
+            try:
+                selection = release_selection.admit(repo, sha, release_inputs, evidence,
+                                                     str(_venv_python(repo, service)), runner)
+                _validate_selected_activation(selection, repo, service)
+            except (release_selection.Invalid, OSError, ValueError, TypeError, KeyError) as exc:
+                raise DeployError(str(exc)) from exc
+        elif "seam_results" in evidence:
+            raise DeployError("release selection: seam evidence requires actual release inputs")
 
         log_paths = _daemon_log_paths(service)
         log_path = log_paths[0] if log_paths else None
@@ -1799,12 +1975,17 @@ def deploy(
             "requirements_hash": requirements_hash,
             "asset_store": _asset_store_identity(service),
             "gates": gates,
+            "selective_qualification": "admitted" if selection is not None else "not_enabled",
         }
+        if selection is not None:
+            stamp["release_selection"] = selection
+            stamp["gates"]["seam_results"] = evidence["seam_results"]
         activation_runtime_manifest = runtime_manifest(repo, service, runner)
         stamp["activation_runtime_manifest"] = activation_runtime_manifest
         if not skip_kickstart:
             stamp["restart_guard"] = verify_deploy_guard(
-                service, str(stamp["deployer_stream_id"]), runner, repo=repo, sha=sha
+                service, str(stamp["deployer_stream_id"]), runner, repo=repo, sha=sha,
+                rollback=rollback, rollback_from_sha=prior_sha,
             )
         activation_launchd_environment = service.launchd_environment
         if not skip_kickstart:
@@ -1860,8 +2041,10 @@ def deploy(
                 raise DeployError("restart activation requires a non-empty deployer stream id")
             if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
                 raise DeployError("restart activation requires a full lowercase target SHA")
-            prior_pid = _launchd_state(service.launchd_label, runner).pid
-            if type(prior_pid) is not int or prior_pid <= 0:
+            pre_restart_state = _launchd_state(service.launchd_label, runner)
+            prior_pid = pre_restart_state.pid
+            down = rollback and restart_guard.get("daemon_state") == "down"
+            if not (down and prior_pid is None) and (type(prior_pid) is not int or prior_pid <= 0):
                 raise DeployError("restart activation requires a positive launchd PID")
             requested_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             stamp["restart_activation"] = _new_restart_activation(
@@ -1870,6 +2053,17 @@ def deploy(
                 target_sha=sha,
                 deployer_stream_id=deployer_stream_id,
             )
+            if down:
+                stamp["restart_activation"]["daemon_state"] = "down"
+                stamp["restart_activation"]["pre_restart_launchd_answered"] = pre_restart_state.answered
+        if selection is not None:
+            try:
+                release_selection.revalidate(selection, release_inputs)
+                if _dirty_entries(repo, runner) or _git(repo, "rev-parse", "HEAD", runner=runner) != sha:
+                    raise DeployError("release selection: changed candidate source before activation")
+                _validate_selected_activation(selection, repo, service)
+            except (release_selection.Invalid, OSError, ValueError, KeyError, TypeError) as exc:
+                raise DeployError(str(exc)) from exc
         _write_stamp(repo, service, stamp)
         transaction.commit()
     if not skip_kickstart:
@@ -1902,6 +2096,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ref", default=DEFAULT_REF)
     parser.add_argument("--rollback", action="store_true")
     parser.add_argument("--gate-evidence", type=Path)
+    parser.add_argument("--release-inputs", type=Path, help="Observed installed baselines and external tuples for qualified seam admission.")
     parser.add_argument("--deployer-stream-id", default=None)
     parser.add_argument("--log-guard-dir", default=None, help="Override the service log guard directory checked before deploy.")
     parser.add_argument("--skip-kickstart", action="store_true", help="Test/dev only: do not kick launchd after stamping.")
@@ -1945,6 +2140,7 @@ def main(argv: list[str] | None = None) -> int:
             ref=args.ref,
             rollback=args.rollback,
             gate_evidence=args.gate_evidence,
+            release_inputs=args.release_inputs,
             deployer_stream_id=args.deployer_stream_id,
             skip_kickstart=args.skip_kickstart,
             log_guard_dir=args.log_guard_dir,
@@ -2002,11 +2198,12 @@ def main(argv: list[str] | None = None) -> int:
         })
         client_detail = ", ".join(clients) if clients else "unknown"
         print(
-            f"deploy applied; post-boot slow_consumer failure: client={client_detail}; "
+            f"deploy applied; post-boot {slow_consumer.get('class', 'slow_consumer')} failure: client={client_detail}; "
+            f"kinds={json.dumps(slow_consumer.get('kinds') or {}, sort_keys=True)}; "
             f"{json.dumps(failures, sort_keys=True)}",
             file=sys.stderr,
         )
-        print("The daemon is on the target SHA; investigate the slow consumer and do NOT retry the deploy.", file=sys.stderr)
+        print("The daemon is on the target SHA; investigate the reported connection failure kinds and do NOT retry the deploy.", file=sys.stderr)
         return EXIT_SLOW_CONSUMER_FAILED
     if slow_consumer:
         print(

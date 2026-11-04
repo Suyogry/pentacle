@@ -69,6 +69,18 @@ row is optional and the client hides it when no Fable quota is reported.
    For a Codex-only installation, omit `--skip-codex` and pass `--skip-claude`.
    This preserves unknown/previous Claude and Fable state without requiring a
    Claude login or trusted Claude workspace.
+
+   The central LaunchAgent passes `--account-ledger` with the daemon's default
+   `~/.local/share/pentacle-stream/sessions.db`. Each Codex probe reads that host's
+   current enabled, healthy Codex default and sets `CODEX_HOME` only for its child.
+   A missing or unusable default records a provider error and retains the last
+   good observation without freshening it; Claude collection continues. A custom
+   daemon `--state-dir` requires the collector's explicit ledger path to match its
+   `--db`. No account credentials or defaults are changed by this lookup.
+   Without `--account-ledger`, account selection keeps its existing behavior;
+   satellite templates intentionally omit the flag. Moving a live job's release
+   checkout or regenerating its descriptor activates the collector change and
+   requires the same deployment approval as restarting that job.
 4. Install one user-owned scheduled job running that exact command every five
    minutes, with absolute paths and explicit PATH, HOME and
    `PENTACLE_USAGE_CWD`. Use a macOS LaunchAgent with `RunAtLoad=true` and
@@ -84,6 +96,13 @@ percentage/reset in the actual client. The collector can exit zero while
 recording a provider error. If login expires or `/usage` changes, retain the
 last good value with its stale/error status; inspect the current UI and repair
 the probe. Do not fabricate zero or repeatedly rebuild clients.
+
+For named accounts, `agent-orch usage --account <alias> --json` retains the
+same binding's last successful quota windows and upstream timestamp after a
+failed collection. That observation has `collection: "failed"` and `fresh: false`;
+it cannot satisfy a fresh-quota admission guard. Each failed source carries its
+safe `error_code`, also exposed by binding key in the pool's `error_codes`.
+A successful collection clears the code; new generations inherit no old meter.
 
 ## Machine stats
 

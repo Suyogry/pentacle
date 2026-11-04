@@ -62,6 +62,13 @@ receipts become interrupted, including while policy is off, without changing
 health or defaults. A new explicitly chosen operation ID can proceed through
 the existing host locks. Store connections alone do not interrupt requests.
 
+Launch admission, first-input artifact checks and recovery-status host probes
+share the collector's per-host mutex. Coordinator-only status reads remain
+available while host work is running. A failed host command preserves its
+bounded scalar error code, such as `account_busy` or
+`provider_executable_missing`; provider output and arbitrary context are not
+copied into that error. A separate process can still hold the registry flock.
+
 The default RPC deadline is 210 seconds, as for a probe; explicit shorter
 deadlines are honored. Host queue time can exceed a caller's deadline. Read the
 same operation's receipt/status instead of blindly repeating provider work.
@@ -190,12 +197,18 @@ The reviewed receiver checkout supplies the one private URL relay:
 ```sh
 python services/chat-stream-v2/tools/provider_account_operator_login.py \
   --policy /absolute/private-policy.json --host host-a --provider codex --account primary \
-  --login-generation login-one --new-generation login-two --operation-id upgrade-one
+  --login-generation login-one --new-generation login-two --operation-id upgrade-one \
+  --expected-version 'codex-cli PINNED_VERSION' --expected-executable-sha256 "$NATIVE_SHA256" \
+  --reason approved_bound_executable_upgrade
 ```
 
 This command verifies the live assistant binding and calling seat token, reads
-the host executor paths from the owner-controlled policy, and invokes the host
-helper over configured SSH. The policy may be OFF during enrollment. It emits
+the host executor paths from the owner-controlled policy, and reserves the exact
+upgrade intent with the coordinator before invoking the host over configured SSH.
+The managed policy must be enabled, the host must advertise the required mutation
+clearance guard, the real hold must remain valid, and no repin may be unresolved.
+The coordinator supplies the immutable current pin and host clearance; missing
+clearance or coordinator reachability refuses before sign-in. The relay emits
 exactly one validated HTTPS authorization URL to the authenticated binding's
 private composite, then creates a separate Done / Not yet action prompt. Only
 publication/prompt IDs and the safe native outcome reach stdout. Done is not
@@ -208,7 +221,9 @@ it non-inheritable by native children. Do not redirect it to a file, terminal,
 stdout or stderr. The relay owns its SSH child and has a 320-second deadline,
 beyond the host's 300-second enrollment alarm. Never log URLs, codes or tokens.
 
-On success, enable the managed Codex policy while retaining the same live hold:
+After native success the relay imports the exact verified enrollment through the
+coordinator while retaining the same live hold. For an uncertain import, inspect
+it with the same immutable arguments and operation ID:
 
 ```sh
 agent-orch account upgrade --host host-a --provider codex --account primary \
@@ -380,11 +395,356 @@ Enable policy and configure each managed host/provider's saved default in the
 same activation window; verify an ordinary spawn with no account override.
 An enabled host without a saved default refuses ordinary spawns.
 
-Rollback disables new controls/new managed launches first and restores ordinary
-legacy admission, while existing bound agents can drain. Retain binding and
+Disabling account policy parks new launches for every retained enrolled
+host/provider. Raw commands are refused on enrolled hosts. Management readback,
+reports and owner-directed draining remain available; new work to an old release
+is fenced by the active exact pair. Retain binding and
 default rows; no database restore or account-row deletion is needed. Use the
 existing handoff before reverting to a binary that
 cannot understand named transcript roots. Keep saved defaults and immutable
 bindings coherent. Never restore stale token bytes, wipe homes or log out another
 account as rollback. Missing host/provider/account enrollment is incomplete and
 must be reported explicitly.
+
+
+## One exact fleet release pair
+
+`provider_cli.release_pin` is the daemon-owned desired state for both providers.
+Its schema-1 JSON carries a positive monotonic revision and `providers`, whose
+`claude` and `codex` entries have exact semver `version` and an `artifacts` map.
+Artifact keys are `darwin-arm64`, `darwin-x64`, `linux-arm64` or `linux-x64`;
+both providers must cover the same reviewed platform set. Each entry supplies
+HTTPS release `provenance`, `native_sha256` and `resource_sha256`. No host or
+account selects a different desired release. Paths stay in host configuration.
+
+A deployment owner prepares the reviewed complete snapshot outside source:
+
+```sh
+agent-orch account pin-status
+agent-orch account pin-set --pin-file /absolute/reviewed-pair.json \
+  --expected-revision 0 --operation-id initial-pair --reason reviewed-release
+```
+
+First initialization uses revision 0 only on a pristine installation: no pin,
+initialized marker or pin-history rows. The snapshot supplies revision 1.
+Every later move, including rollback, supplies the next revision and both
+providers. An unchanged provider retains its artifact map. The receiver commits
+the pair, prior record and immutable receipt atomically. Identical operation-ID
+replay returns its historical receipt; changed payload or stale CAS refuses.
+After initialization, a missing or corrupt pin parks managed admission,
+independently of account-policy OFF. Partial marker/history states never become
+pristine. Minimum-only installer manifests never attest exact managed admission.
+
+### Prepare serving homes before first enforcement
+
+Pristine installations keep ordinary managed launch and input available under
+their existing account policy, health and enrollment checks. There is no
+preparation RPC, lease or flag. Historical admissions record `pre_enforcement`;
+later read-only artifact observations do not rewrite their original attribution.
+Enrolled/OFF and raw-command refusals still apply.
+
+Under the deployment owner's separate window, the authenticated front desk may
+prepare a same-home successor before the first pin exists:
+
+```sh
+agent-orch account repin --host host-a --provider codex --account primary \
+  --login-generation current-generation --new-generation prepared-successor \
+  --operation-id prepare-one --expected-pin-revision 0 \
+  --target-pin-file /absolute/reviewed-pair.json \
+  --expected-pin-digest EXACT_REVIEWED_PAIR_SHA256 --reason reviewed-release
+```
+
+This requires the complete revision-one pair, its exact digest, current FD
+authority, required-clearance consumers, a real unchanged host hold and the same
+native/home/identity proofs as an active-pin repin. The immutable repin row owns
+its target and recovery history. Active-pin requests reject `target_pin`.
+Historical success, non-split settlement, canonical tails, restart and expired
+window recovery retain their existing rules, anchored to that row's target.
+A no-op creates no unused generation. First enforcement cannot bypass an
+unresolved attempt or silently accept preparation for a different pair.
+
+Readiness is server-derived on the existing privileged status/set controls:
+
+```sh
+agent-orch account pin-status --pin-file /absolute/reviewed-pair.json
+agent-orch account pin-set --pin-file /absolute/reviewed-pair.json \
+  --expected-revision 0 --expected-readiness-digest READINESS_DIGEST \
+  --operation-id initial-pair --reason reviewed-release
+```
+
+`candidate_pin` and `initial_readiness` are separate from the absent active pin.
+The optional readiness digest compares a census; it grants no authority. The
+first set refreshes native/resource and managed-launcher proofs (at most120
+seconds old), consumer identity, bindings, health, policy and defaults. It pauses
+new reservations and waits outside global locks for already-dispatched creation.
+Unknown/late creation, starting or misrouted seats, unresolved account work,
+maintenance fences, uncertain input and untransferred closed-parent custody
+refuse promotion. Compatible existing input remains available during the wait.
+The final short input-order boundary and database transaction compare the same
+snapshot and commit pin, history, marker and observations together. Failure
+releases only its owned admission pause and leaves pristine service available.
+An owned daemon restart aborts the old pause without forgetting late reservations.
+
+Input readiness uses the current open-session census. Unresolved receipts for
+verified concrete closed or missing stream IDs do not block initial promotion;
+their original delivery state is unchanged. Current open holders and unknown,
+malformed or configured logical/composite targets remain blocking. No receipt is
+acknowledged, replayed or waived by this projection. A reopened holder or changed
+lifecycle still invalidates the same-transaction snapshot.
+
+`initial_readiness.input_obligation_counts` reports `blocking` and `not_open`.
+These are diagnostics. Only the blocking projection enters the snapshot and
+readiness digest, so unrelated historical receipt churn cannot invalidate the
+security decision. A late tell proof uses the original same-ID evidence path
+described in [tell delivery proof](tell_delivery_proof.md). Non-derivable send
+IDs cannot use voice/dot-email proof reconciliation; unresolved custody needs an
+authorized lifecycle disposition. Status alone settles no input obligation.
+
+An explicit initial parking decision can be supplied with
+`--initial-parked-cells-file`: a JSON array whose entries contain exactly `host`,
+`provider`, `account`, `generation`, `reason` and `decision_ref`. Every retained
+cell stays counted; omission never parks a cell. A parked cell must have no
+running or queued managed obligation. Its exact generation refuses managed
+admission/input after first enforcement, even if its bytes happen to match.
+Only a later authorized catch-up can lift that disposition. Status reports it
+as pending/parked, never fleet convergence. The caller must obtain the explicit
+capacity-loss decision before sending this file.
+
+### Home-scoped maintenance input fence
+
+The existing privileged spawn freeze can also fence physical input to one
+server-derived home. Supply all five scope fields together:
+
+```sh
+agent-orch spawn-freeze --host host-a --reason reviewed-home-slot --ttl 600 \
+  --input-provider codex --input-account primary \
+  --expected-login-generation current-generation --maintenance-id slot-one \
+  --expected-hold-digest absent
+```
+
+The authenticated operator/local-admin boundary is unchanged. The daemon
+derives the home and captures current binding/session generations, creates the
+real host admission hold plus a durable input slot atomically, then settles
+dispatched creation outside locks. It never overwrites another slot or hold.
+The home writer orders after an in-flight physical action; every later paste,
+Escape, Enter, compaction or resumed brief rechecks the durable fence. Other
+homes' existing work stays available; the host hold still refuses ordinary new
+launches on that host. Management, checkpoint/report and close remain available.
+
+Frozen ingress, including a temporarily closed target, returns
+`provider_cli_input_maintenance`, `not_landed`, zero attempts and
+`retry_after_maintenance`. It stores no refused body or background replay queue.
+The sender retains that body/logical ID. Already accepted or possibly pasted
+work keeps its original receipt/custody; an Enter blocked after a tell paste
+records `pasted_unsubmitted` and same-ID replay never pastes again. Reconcile
+unknown/pasted work from evidence instead of resending it.
+
+Read slot and hold digests from `account pin-status` (`input_maintenance`) or the
+freeze response. Repeated identical IDs replay their receipt; changed arguments
+conflict, and a cleared ID never rearms a fence. The slot survives restart and
+hold expiry. Authenticated proof-backed clear uses:
+
+```sh
+agent-orch spawn-unfreeze --host host-a --maintenance-id slot-one \
+  --expected-maintenance-digest EXACT_SLOT_SHA256 \
+  --expected-hold-digest EXACT_CURRENT_HOLD_SHA256
+```
+
+The current hold digest is an optional additional comparison. Clear proves
+current host/central agreement in the same home, native identity and no pending
+host/coordinator mutation or creation, outside locks. It then compares origin,
+slot and hold under the short home writer/store transaction. This works after
+expiry without acquiring a hold solely for read-only clearing. It deletes only
+the original matching slot-owned hold; a newer/foreign hold is preserved and
+reported. Plain unfreeze cannot discard a scoped slot.
+
+If unresolved account work requires Addendum B recovery after expiry, use the
+ordinary authenticated `spawn-freeze --host ... --reason ... --ttl ...` route
+to acquire a fresh real hold first. Its creation receipt is tied to the unchanged
+slot; a foreign live hold cannot be replaced. Reconcile under that actual hold,
+then proof-clear the old input slot and separately release the retained fresh
+hold. Expiry alone never authorizes mutation or clears an uncertain cause.
+Release matching input/admission fences before ordinary resume/replacement
+admission; holds have no implicit launch exemption.
+
+Deploy compatible enforcing consumers on every participating host before initial
+activation. In the named fleet window, stage official immutable artifacts beside
+retained releases; verify their complete hashes, checkpoint/drain affected seats,
+and acquire the existing authenticated operator/local-admin host admission hold.
+Keep `PENTACLE_SEAT_OPERATOR_AUTHORITY` OFF. Source publication alone grants no
+hold, installation, pin move, native proof or restart authority.
+
+Before enabling recovery for any cell, set `"mutation_clearance": "required"` in the private host-helper configuration on **every consumer host for that cell**, then read each value back through the authenticated `recovery-status` capability. Verify the accepted helper artifact and all active consumers as part of the same rollout. A missing or different setting refuses recovery and fresh-enrollment supersession with `account_mutation_clearance_required`; it is not an implicitly enabled recovery mode. Rollout steps are: stage source and artifacts, set and read back the required guard on every host, verify quiescence and the real hold, then enable and validate recovery. Raw host bootstrap behavior before this explicit activation remains unchanged. Rollback must park recovery before returning a consumer to bootstrap mode. These are rollout prerequisites; installing source alone does not activate them.
+
+Host cell configuration names the staged `executable`, its native `version` and
+`executable_sha256`, and `resource_root` for the complete immutable package. A
+standalone file's resource digest is its byte SHA256. A directory's digest is
+SHA256 of compact sorted-key JSON containing sorted `[relative_path, file_hash]`
+pairs for every regular file. Symlinks, writable artifacts and unsupported
+platforms refuse. Optional `resource_roots` maps retained executable paths to
+their original complete resource roots, so verification never substitutes a
+new package's resources for an older binding.
+
+```sh
+agent-orch account repin --host host-a --provider claude --account primary \
+  --login-generation current-generation --new-generation release-successor \
+  --operation-id reviewed-repin --expected-pin-revision 2 \
+  --expected-pin-digest EXACT_REVIEWED_PAIR_SHA256 --reason reviewed-release
+```
+
+Repin derives its successor from the healthy current binding. It keeps the exact
+home, transcript root, profile, provider/pool identity and saved default. It proves
+native bytes/resources, subscription identity and one minimal turn, then reads
+identity and artifacts again. It never logs in, copies credentials or changes a
+home's authentication storage. The host lock and journal serialize proof and
+activation. Authenticated launcher proof joins the current managed session
+generation/binding to tmux pane identity and process tree, PID birth, boot, uid
+and native executable. Proved managed processes in another home may continue.
+Affected-home processes must be drained through authorized managed lifecycle;
+any same-user provider process without complete launcher proof blocks the whole
+host/provider. PID reuse, unknown descendants and stale/missing records are not
+exclusions. Process environments and credentials are never read for attribution;
+unmanaged/operator processes are never torn down by this guard.
+The central import compares the pin, health, default and exact hold tuple. A host
+success with failed central import remains parked: reconcile that same operation
+under a valid hold, without repeating its native turn. Auth, network, quota and
+identity failures stay distinct; they never initiate login automatically.
+
+An interrupted operation has two separate histories: attempts, including zero
+binding effects, and successful same-home binding links. Status reports the
+current pin, the union of `uncertain`, `split` and `conflict` causes, the chain's
+canonical tail, missing prerequisites and one FD next action. Offline or disabled
+consumers remain pending. Time, hold expiry and matching rollback bytes never
+clear a cause.
+
+Use one fresh `account repin` with `--reconcile-of CANONICAL_TAIL`, the selected
+central generation, an unused prospective generation and the current pin's
+revision/digest. The tail is the newest reserved attempt, including a settled
+zero-link attempt. Earlier IDs cannot fork the chain. This request inspects the
+whole finite chain, seals abandoned work against delayed dispatch and folds only
+proved successful links. It needs an authenticated enforcing host and a real,
+unexpired admission hold. A live executor must finish or be owner-drained first;
+an absent journal or a transport error alone cannot authorize settlement.
+
+A conclusively non-split attempt can be sealed and settled without importing a
+binding, observation or lineage, even after its old pin or mutable central
+metadata changed. Its original arguments and receipt remain immutable. Settlement
+CASes the unchanged selected binding and current metadata/hold. It clears only
+that attempt's cause: a predecessor split, another unresolved attempt, unhealthy
+identity, unsafe home, current artifact mismatch or other admission refusal stays
+in force. A fresh current-pin request can proceed once the cause is clear.
+
+For a true split, every successful link must prove its immutable journal, registry
+row, original private home/anchor, identity, minimal turn and producing consumer.
+When actual host bytes already satisfy the current pin, reconciliation imports
+the verified host tip without creating its unused prospective generation or
+repeating a turn. A changed target adds one verified successor from that tip.
+Rollback creates a fresh successor; it never selects a historical generation.
+The final current-pin binding and all missing links are imported atomically.
+Historical proof retains its original revision; current verification is separate.
+
+Routine default, health-revision or policy changes require an explicit metadata
+re-anchor. Obtain `origin_digest` from authenticated account status, then include
+`--expected-origin-digest EXACT_CURRENT_ORIGIN_SHA256` on the fresh canonical-tail
+reconciliation. This accepts only the exact enabled/healthy current metadata for
+the unchanged original selected binding and proved same-account lineage. A
+successful real `revalidate-health` can clear eligible identity conflict using a
+read-only observation of the actual host tip; it records that provenance without
+selecting a generation. Outstanding auth/identity failures, disabled/unmanaged
+policy, changed immutable origin or invalid lineage still refuse. Re-anchor
+rechecks FD authority, metadata, actual host selection, current pin and the exact
+hold through commit; it preserves the current default. Omission or stale digest
+never silently refreshes an old import snapshot.
+
+Generation-changing relogin, enrollment, adoption and upgrade share durable
+per-cell ordering with repin, on both coordinator and host. An unresolved action
+in either order blocks the other until its exact outcome is accounted for.
+Restart does not release that exclusion. Read-only diagnosis, health revalidation,
+holds and policy/default maintenance remain available. No global pin lock spans
+remote work. With no unresolved repin, ordinary relogin retains its failed-auth
+requirement and ordinary upgrade retains its changed-artifact requirement.
+
+If old auth or proof cannot support in-place reconciliation, FD may explicitly
+choose one fresh sign-in through the existing relogin flow:
+
+```sh
+agent-orch account relogin --host host-a --provider claude --account primary \
+  --login-generation current-generation --operation-id fresh-recovery \
+  --supersede-repin EXACT_RECOVERY_SNAPSHOT_SHA256
+```
+
+The digest is the cell's `snapshot_digest` from authenticated status. It binds
+central metadata, actual host selection, current pin, real hold and the complete
+set of unresolved attempts, dispositions and host mutation records. The hatch
+works without trusted old lineage or healthy old credentials. It first accounts
+for/drains old workers and seals captured operations, retaining immutable
+supersession proof and a `fresh_enrollment_pending` fence. It stages/verifies the
+current pin, then enrolls one unused generation in a genuinely fresh managed
+home, with the same configured provider/pool identity. It never adopts, copies or
+reauthenticates a superseded home. Old host-only repin generations are not imported.
+
+Only the verified fresh enrollment is selected, atomically with resolution by
+supersession reference. Old-session attribution and the current default stay
+unchanged; old conversations need their existing checkpoint/handoff path across
+the new home. A stale digest, empty unresolved set, unauthorized caller, missing
+hold/guard, live unaccounted worker or bad new enrollment refuses. Existing
+browser safety, attempt limits, cooldown and human-stop outcomes remain.
+
+An uncertain started hatch is inspected by its exact journal, never signed in
+again automatically. After provable quiescence, a fresh explicit digest-authorized
+hatch may supersede an unrecoverable attempt. A successful fresh enrollment whose
+reply or central import was lost is retained and reverified without another
+sign-in. If the pin changed, continuation may repin only that new home to the
+current target before import, preserving its enrollment root and post-enrollment
+links. Metadata/hold/pin races park with a fresh snapshot and FD action; they do
+not make old attempts importable. Completed IDs replay one historical receipt
+without asserting current compliance or fleet readiness.
+
+Successful immutable repin receipts link old and new binding keys. Resume,
+including automatic front-desk restore, follows only that proven same-home chain
+for the same host/provider/account. Fresh-login/enroll/adopt transitions do not
+supply repin lineage. Historical lifecycle attribution remains unchanged. CLI
+version rollback creates another verified successor pointing to retained bytes;
+it never reactivates a historical generation. If the current home is incompatible
+with the retained native client, park it for separately authorized recovery.
+
+Every new process rechecks the pair after asynchronous host verification and
+records its admitted revision/digest/artifact per lifecycle. A process created
+from an older committed admission after a pin move remains an enumerable old
+seat. New normal work input to mismatching seats is refused while queued work
+and receipts are preserved. Status/read, checkpoints, reports and closure remain
+available. Same-release artifacts need verification rather than an unnecessary
+restart.
+
+Input verifies remote artifacts before taking the short pin decision lock.
+Each physical paste or key action shares a barrier with other targets; a pin
+move takes it exclusively, after in-flight physical actions finish. Input
+rechecks the current pin after entering that barrier. Submission-evidence waits
+hold neither lock, and any later Enter retry must pass the current pin again.
+
+An offline host remains pending and supplies no completion proof. On return,
+current satellite/helper code admission precedes native verification; catch up
+directly to the current pair, not missed intermediate releases. Disconnect during
+an operation requires exact journal reconciliation before another operation.
+`pin-status` reports each retained active cell's expected/observed release,
+reachability, proof freshness and old seats; parked/offline cells prevent fleet
+completion. Proof freshness expires after 120 seconds and never triggers an
+installation, login or pin move.
+
+For a dead front desk, only the server-authenticated operator or verified local
+administrator may recover a pin. `pin-status` still returns the safe raw-record
+digest and retained receipt IDs for a corrupt primary. Select an approved receipt
+matching the front desk's retained healthy binding, then use:
+
+```sh
+agent-orch account pin-set --recover-receipt APPROVED_OPERATION_ID \
+  --expected-raw-digest RAW_SHA256_OR_absent --expected-high-water-revision 4 \
+  --operation-id recover-pair --reason restore-approved-pair \
+  --local-admin-token-file /absolute/private/admin-token
+```
+
+Recovery loads only the receipt's exact pair and writes a revision above all
+retained commits. It never trusts a revision parsed from corrupt bytes, accepts
+arbitrary replacement JSON, authorizes repin or bypasses normal pinned restore.
+Reverting the desired pair can fence cells already on a newer pair; inspect the
+named cells before resuming. Lost receipt history is a storage-recovery blocker.

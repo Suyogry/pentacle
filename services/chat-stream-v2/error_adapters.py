@@ -9,7 +9,7 @@ Adding a producer is a source change here, never runtime registration.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import re
 from typing import Callable, Mapping
@@ -30,6 +30,7 @@ FAMILY_CODES: dict[str, frozenset[str]] = {
         "send_transport_failed", "send_unconfirmed", "operation_cancelled", "recovered",
         "report_gap", "no_speech", "too_long", "unsupported", "permission_declined",
     }),
+    "operator_notification.v1": frozenset({"warning", "critical"}),
 }
 CONDITIONS = frozenset({"active", "recovered", "cancelled", "unknown"})
 _EPISODE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
@@ -118,6 +119,25 @@ def _map_daemon_stall(fields: Mapping[str, object]) -> ErrorFact | None:
     return ErrorFact('daemon_runtime.v1', 'loop_stalled', episode, condition, cause)
 
 
+def _map_operator_notification(fields: Mapping[str, object]) -> ErrorFact | None:
+    """Any warning/critical card: episode is (producer, severity, dedup_key or title)."""
+    producer, severity = fields.get("producer"), fields.get("severity")
+    if not isinstance(producer, str) or not isinstance(severity, str) \
+            or severity not in FAMILY_CODES["operator_notification.v1"]:
+        return None
+    # The producer slug keeps one immediate fingerprint per producer and severity.
+    stage = re.sub(r"[^a-z_]", "_", producer.lower())[:32]
+    key = fields.get("dedup_key") or fields.get("title")
+    return _map_fields("operator_notification.v1", severity, {"producer": producer, "key": key},
+                       ("producer", "key"), stage=stage or None)
+
+
+def _map_pin_drift(fields: Mapping[str, object]) -> ErrorFact | None:
+    fact = (ErrorFact("integrity", "pin_drift", fields["episode_id"]) if "episode_id" in fields else
+            _map_fields("integrity", "pin_drift", fields, ("host", "pinned_sha", "daemon_sha")))
+    return None if fact is None else replace(fact, condition=fields.get("condition", "active"))
+
+
 #: Alerts kind -> pure mapper(fields) returning a fact, or None to stay log-only.
 #: Producers call `await alerts.record(kind, **fields)`; it commits before return.
 ADAPTERS: dict[str, Callable[[Mapping[str, object]], ErrorFact | None]] = {
@@ -127,11 +147,12 @@ ADAPTERS: dict[str, Callable[[Mapping[str, object]], ErrorFact | None]] = {
     "close_carcass": lambda fields: _map_fields("session_lifecycle", "close_carcass", fields, ("stream_id", "generation")),
     "deferred_reap_exhausted": lambda fields: _map_fields("session_lifecycle", "reap_exhausted", fields, ("stream_id", "generation")),
     "reap_fenced": lambda fields: _map_fields("session_lifecycle", "reap_fenced", fields, ("stream_id", "generation")),
-    "pin_drift": lambda fields: _map_fields("integrity", "pin_drift", fields, ("host", "pinned_sha", "daemon_sha")),
+    "pin_drift": _map_pin_drift,
     "close_claim_mismatch": lambda fields: _map_fields("integrity", "close_claim_mismatch", fields, ("report_id",)),
     "system_deploy_failed": _map_system_deploy,
     "system_backup_failed": _map_system_backup,
     "bot_messaging_failed": _map_bot_messaging,
+    "operator_notification": _map_operator_notification,
 }
 
 

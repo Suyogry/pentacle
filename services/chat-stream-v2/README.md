@@ -179,6 +179,21 @@ does not resume a task, switch models, or produce a completion report.
 
 ## Pending lane digests
 
+`agent-orch work owed --json` clears assignment debt on the normal accepted
+observation scan when source is fresh, has a revision, and is `completed`,
+`deprecated` or `backlog`, including work already settled before assignment.
+Backlog is deferred work. Other dispositions still require the existing
+witnessed transition or changed valid blocked declaration. Unusable source
+cannot clear debt from cached status; a later healthy scan can repair it.
+
+`agent-orch work unattended --json` lists fresh `in_progress` work without a
+qualifying live lead or Nexus. Missing records do not degrade this list when
+their last-good state was absent or inactive and no current owner, open lane,
+assignment episode or debt references them. The observation rows remain for
+diagnostics. Missing former active work and stale, ambiguous, referenced or
+unavailable observations remain omissions. CLI and lane digest share these
+projections; scan and delivery cadence are unchanged.
+
 An old `lane_digest` with committed-pending submission proof is reconciled by
 the existing notice retry loop after both its retry and proof-age bounds.
 Positive proof completes the original delivery. Otherwise, a complete ordered
@@ -190,6 +205,26 @@ Incomplete, unavailable or changed evidence stays pending with a typed
 `absence_readback_unknown:<reason>` in the existing error/action fields.
 `agent-orch ledger get <tell_id>` remains read-only. Do not resend or manually
 terminalize a pending notice to obtain fresh debt delivery.
+
+## Front desk close authority
+
+The verified current direct-primary front desk may use
+`agent-orch close <stream> --expected-generation <generation> --reason "Operator <directive-id>: close absorbed kickoff; custody with FD"`
+after inspecting the target and confirming that the cited instruction covers it.
+The reason and request identity are required and audited; a citation alone
+does not authorize other seats. This exception covers top-level visible seats
+without a handoff source. Protected assistants and leads or visible chats of
+open operator-owned lanes are refused, including with force or confirmation
+flags. Existing idle, child/spawn, report, disposition, external close-ruling
+and process-death checks still apply. Binding, generation and current lane
+ownership are rechecked under the close fence before termination.
+
+This is close-only authority. It does not designate a lifecycle manager,
+waive reports, grant reparent or descendant cleanup, or complete a lane/spec.
+Self, direct-parent, authenticated operator and designated-manager paths
+retain their existing behavior. Admission and outcome use `fd_close` audit
+rows with the verified actor/target generations, reason and request identity;
+close attribution records `actor_kind=front_desk`.
 
 ## Tests and supported integrations
 
@@ -247,7 +282,7 @@ output. PASS, FAIL and UNTESTED exit behavior is preserved.
 
 `tools/spawn_fleet_smoke.py --dry-run` resolves the full matrix without opening a WebSocket or spawning a session. The no-argument full run requires `PENTACLE_MACHINES_FILE` to point to the same file configured for the daemon. It rejects a missing file or `PENTACLE_MACHINES_JSON`, reads host names from that file, and includes every configured host by default. Set `PENTACLE_SMOKE_EXCLUDED_HOSTS` to a comma-separated list of unique configured host IDs only when a deployment explicitly excludes them; unknown names and an empty final matrix are refused. An optional `PENTACLE_SMOKE_HOSTS` subset must contain only remaining configured hosts. The dry-run output names the source, selected hosts, explicit excluded names and their configuration source, and every host/provider/prompt cell. A machine entry may set `"smoke_optional": true` for an intermittently available host. Only its proven `host_unavailable` cells become `SKIPPED_OFFLINE`; quota, missing evidence and failed cells retain their existing verdicts. Both the scheduled runner and deploy verdict retain skipped evidence and allow PASS when the required hosts pass. The flag defaults to false and must be a JSON boolean.
 
-The launchd template under `deploy/` runs every 12 hours and sets the machine-file path. The deploy helper also passes the installed daemon’s machine-file setting explicitly to its immediate full smoke, clearing inherited JSON configuration and host-subset overrides. A missing or invalid setting remains a post-activation smoke failure (exit 6); the activated SHA/PID stamp and do-not-retry instruction are preserved. A full run closes each spawned session, including after cell failure; a failed teardown is reported as a failure even if the provider is over quota. The explicit `<url> <host>` post-deploy canary remains a single Codex promptless cell.
+The launchd template under `deploy/` runs every 12 hours and sets the machine-file path. The deploy helper also passes the installed daemon’s machine-file setting explicitly to its immediate full smoke, clearing inherited JSON configuration and host-subset overrides. A missing or invalid setting remains a post-activation smoke failure (exit 6); the activated SHA/PID stamp and do-not-retry instruction are preserved. A full run closes each spawned session, including after cell failure; a failed teardown is reported as a failure even if the provider is over quota. The explicit `<url> <host>` post-deploy canary remains a single Codex promptless cell. A failed cell (class `failure`, including a connection or handshake failure) also raises one live `agent-orch notify` at severity `critical`, with the dedup key = host, provider, prompt mode and failure stage plus the UTC date; the error registry routes it to the front desk as a BLOCKER. Quota and untested cells stay in the disposable composite only. Tests point `PENTACLE_SMOKE_AGENT_ORCH` at a missing path so they never reach the live CLI.
 
 ### Transcript ingest fairness
 

@@ -83,6 +83,7 @@ from usage_publisher import UsageStatePublisher
 from voice_answers import dispatch_block as voice_answers_dispatch_block
 from send_metadata import voice_context_from_route, voice_context_dispatch_block
 from window_schedule import WindowSchedule
+import restart_notice
 
 log = logging.getLogger("chat_streamd_v2")
 
@@ -93,7 +94,7 @@ def _emit_boot_marker(host: str, port: int) -> None:
     try:
         process_start = " ".join(subprocess.check_output(
             ["ps", "-p", str(os.getpid()), "-o", "lstart="], text=True,
-            timeout=5,
+            timeout=5, env=dict(os.environ, TZ="UTC0", LC_ALL="C"),
         ).split())
     except (OSError, subprocess.SubprocessError):
         process_start = ""  # The deploy selector will refuse unproven identity.
@@ -102,6 +103,50 @@ def _emit_boot_marker(host: str, port: int) -> None:
     boot_line = f"generation={generation} chat_streamd_v2 listening on {host}:{port}"
     print(boot_line, file=sys.stdout, flush=True)
     print(boot_line, file=sys.stderr, flush=True)
+
+
+async def _deliver_composite_notice(
+    server: Any, store: Any, composite: Any, text: str, tell_id: str, *, from_stream_id: str,
+) -> str:
+    """Hand one daemon notice to the bound front desk, or queue it durably.
+
+    Returns ``queued`` (unbound, dead or stale seat: flushed later by the restore
+    or rebind path), ``committed`` (delivered or durably held by the digest) or
+    ``handoff`` (a reply that is neither; the caller decides whether to queue).
+    """
+    from sessions import VerbError as _VerbError
+    try:
+        delivered = await server._deliver_composite_tell(
+            composite, composite.config.stream_id, from_stream_id, text, tell_id, "",
+        )
+    except _VerbError:
+        delivered = None
+    if delivered is None:
+        await store.enqueue_composite_tell(
+            name=composite.config.name, tell_id=tell_id,
+            from_stream_id=from_stream_id, body=text, request_id="",
+        )
+        return "queued"
+    if server._composite_tell_committed(delivered) or await server._composite_tell_durably_held(delivered):
+        return "committed"
+    return "handoff"
+
+
+async def _start_restart_notice(*, enabled: bool, **kwargs: Any) -> "asyncio.Task | None":
+    """Capture the startup snapshot and schedule the restart notice, or do nothing.
+
+    `PENTACLE_RESTART_NOTICE=0` arrives as ``enabled=False``: no snapshot,
+    compose, delivery or marker. Only the DB-only capture is awaited here.
+    """
+    if not enabled:
+        return None
+    notice = restart_notice.RestartNotice(**kwargs)
+    try:
+        snapshot = await notice.capture()
+    except Exception:  # noqa: BLE001 - run_once still sends the header
+        log.exception("restart notice snapshot failed", extra={"subsystem": "restart_notice"})
+        snapshot = None
+    return notice.schedule(snapshot)
 
 
 def _wire_cosmo_reply_push(assistant_composites: dict, push_reply) -> None:
@@ -283,6 +328,7 @@ async def run(args: argparse.Namespace) -> int:
     # A malformed value fails startup before anything is opened.
     from assistant_restore import parse_auto_restore_flag
     auto_restore_enabled = parse_auto_restore_flag(os.environ)
+    restart_notice_enabled = restart_notice.parse_flag(os.environ)
     store = Store(args.db)
     lifecycle = DaemonLifecycle(store, host=args.local_host)
     tmux = Tmux(args.tmux_bin)
@@ -502,6 +548,7 @@ async def run(args: argparse.Namespace) -> int:
             question_answer=server._assistant_question_answer,
             publication_attachments=server._assistant_publication_attachments,
             voice_answers_validate=_validate_voice_answers,
+            sessions=sessions,
         )
     server.assistant_composites = assistant_composites
     # Primary alias: existing single-composite call sites (notify binding,
@@ -510,6 +557,7 @@ async def run(args: argparse.Namespace) -> int:
     assistant_composite = assistant_composites[primary_assistant_name()]
     assistant_config = assistant_configs[primary_assistant_name()]
     server.assistant_composite = assistant_composite
+    sessions.assistant.front_desk = assistant_composite
 
     async def _assistant_ingress_policy(*, target_stream_id, body, msg, verb):
         """Fan routine backend ingress across named assistants.
@@ -605,6 +653,7 @@ async def run(args: argparse.Namespace) -> int:
         sessions=sessions,
         notice_store=store,
         assistant_binding=assistant_composite.binding if assistant_composite.enabled else None,
+        lane_rulings=server.lane_rulings,
         assistant_stream_id=assistant_composite.config.stream_id if assistant_composite.enabled else "",
     )
     server.notify = notify
@@ -697,6 +746,9 @@ async def run(args: argparse.Namespace) -> int:
     from capacity_retry import CapacityRetry
     capacity_retry = CapacityRetry(store, sessions, comms, hosts, outbound=outbound)
     uiverbs.capacity_retry = capacity_retry
+    from queued_send_now import QueuedSendNow
+    queued_send_now = QueuedSendNow(store, sessions, comms, tmux, owner=lifecycle.instance_id)
+    uiverbs.queued_send_now = comms.queued_send_now = server.queued_send_now = queued_send_now
     server.handlers["capacity_retry.control"] = capacity_retry.control
     # Presence remains observation-only; the durable reconciler owns the
     # thresholded state transition and the read-only reconcile.status verb.
@@ -766,7 +818,7 @@ async def run(args: argparse.Namespace) -> int:
     async def reconcile_callbacks():
         # The alarm runs before tick so a late wake fired in this pass still alerts.
         callbacks = [event_push.check_pin_drift, watch_wake.missed_wake_alarm,
-                     watch_wake.tick, capacity_retry.tick, account_runtime.tick]
+                     watch_wake.tick, capacity_retry.tick, account_runtime.tick, queued_send_now.tick]
         if server.assistant_restore is not None:
             callbacks.append(server.assistant_restore.tick)
         await run_reconcile_callbacks(*callbacks)
@@ -822,21 +874,22 @@ async def run(args: argparse.Namespace) -> int:
     # episodes on its own only when PENTACLE_ASSISTANT_AUTO_RESTORE=1.
     if assistant_composite.config.enabled:
         import assistant_restore as _assistant_restore
+        from assistant_authority_restore import AuthorityRestore
 
-        async def _deliver_restore_notice(composite, text: str, tell_id: str) -> None:
-            from sessions import VerbError as _VerbError
-            try:
-                delivered = await server._deliver_composite_tell(
-                    composite, composite.config.stream_id, _assistant_restore.NOTICE_FROM,
-                    text, tell_id, "",
-                )
-            except _VerbError:
-                delivered = None
-            if delivered is None:
-                await store.enqueue_composite_tell(
-                    name=composite.config.name, tell_id=tell_id,
-                    from_stream_id=_assistant_restore.NOTICE_FROM, body=text, request_id="",
-                )
+        authority_flag = os.environ.get('PENTACLE_AUTHORITY_RESTORE', '1').strip()
+        if authority_flag not in ('0', '1'):
+            raise ValueError('PENTACLE_AUTHORITY_RESTORE must be 0 or 1')
+        server.authority_restore = AuthorityRestore(
+            server, enabled=authority_flag == '1',
+            inhibit_path=Path(args.db).with_name('authority-restore.inhibit') if args.db != ':memory:' else None,
+        )
+
+        async def _deliver_restore_notice(
+            composite, text: str, tell_id: str, *, from_stream_id: str = _assistant_restore.NOTICE_FROM,
+        ) -> str:
+            return await _deliver_composite_notice(
+                server, store, composite, text, tell_id, from_stream_id=from_stream_id,
+            )
 
         _restore_fault, _restore_ps = _assistant_restore.test_hooks(os.environ)
         server.assistant_restore = _assistant_restore.AssistantRestore(
@@ -849,6 +902,7 @@ async def run(args: argparse.Namespace) -> int:
             flush_composite_tells=server._flush_composite_tells,
             deliver_notice=_deliver_restore_notice, broadcast=server.broadcast,
             ps_runner=_restore_ps, fault=_restore_fault,
+            notify=notify,
         )
         assistant_composite.input_death_proof = server.assistant_restore.input_death_proof
 
@@ -904,6 +958,8 @@ async def run(args: argparse.Namespace) -> int:
     startup_phase_started = time.monotonic()
     store.start()
     log.info("startup phase=store_start duration_s=%.6f", time.monotonic() - startup_phase_started)
+    if server.authority_restore is not None:
+        await server.authority_restore.initialize()
     await store.mark_work_index_pending()
     await account_runtime.start()
     startup_phase_started = time.monotonic()
@@ -982,11 +1038,24 @@ async def run(args: argparse.Namespace) -> int:
         await server.lane_rulings.start()
     await lifted  # both are fast; ensure done before the background tasks below
     await server.configure_error_alerts(outbound, alerts)
+    # One restart notice per process: capture the open-seat snapshot now, then
+    # probe/compose/deliver in a daemon-owned task so no startup worker waits.
+    restart_task = None
+    if assistant_composite.config.enabled:
+        restart_task = await _start_restart_notice(
+            enabled=restart_notice_enabled, store=store, composite=assistant_composite,
+            deliver=_deliver_restore_notice,
+            probe=lambda host, name: (
+                tmux if host == args.local_host else hosts.tmux_for(host)).session_state(name),
+            notify=notify, instance_id=lifecycle.instance_id, daemon_sha=event_push.daemon_sha,
+        )
     work_lanes.refresh()  # Re-hand any opening persisted before the core was ready.
 
     # 3. Background tasks start last, each under the loop rules
     #    (cadence, per-pass cap, backoff, kill switch).
     tasks: list[asyncio.Task] = [asyncio.create_task(watchdog.run_consumer(), name="stall-handoff")]
+    if restart_task is not None:
+        tasks.append(restart_task)
     try:
         tasks.append(await server.start_consent())
     except (OSError, ValueError) as exc:
@@ -1118,6 +1187,8 @@ async def shutdown(budget: ShutdownBudget, *, server, spawnctl, tasks, composite
     # Restart continuity: no new spawn admission once stopping, then hand every
     # in-flight admitted spawn to durable state while the store still runs.
     server.spawn_ready.clear()
+    if getattr(server, "queued_send_now", None) is not None:
+        await budget.step("queued-send-now", server.queued_send_now.close(), cap=2.0)
     if getattr(server, "account_runtime", None) is not None:
         await budget.step("account-runtime", server.account_runtime.stop(), cap=3.0)
     await budget.step("spawn-drain", spawnctl.drain_background_spawns(
@@ -1134,6 +1205,8 @@ async def shutdown(budget: ShutdownBudget, *, server, spawnctl, tasks, composite
         await budget.step("composite", composite.stop(), cap=2.0)
     if lane_rulings is not None:
         await budget.step("lane-rulings", lane_rulings.stop(), cap=2.0)
+    if getattr(server, 'authority_restore', None) and server.authority_restore.task:
+        await budget.step('authority-restore', asyncio.gather(server.authority_restore.task, return_exceptions=True), cap=2.0)
     # Server.close's own waits end a little before its step does, so a stalled
     # wait still leaves time to close both listeners rather than be abandoned.
     server_s = budget.remaining(8.0)

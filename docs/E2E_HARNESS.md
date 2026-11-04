@@ -4,18 +4,143 @@ The public harness is provider-free and uses a disposable local daemon. It valid
 
 ## Supported entry: `scripts/gate_env.py`
 
+The web gate and web-selected npm tests require the optional `node-pty` module and fail as setup when it is absent.
+
+Use the [behavior coverage map](TEST_COVERAGE.md) to find existing protection,
+real/fake boundaries and unresolved selection; send retry to durable receipt
+is the first bounded reference flow. The map also holds the
+[working testing standard](TEST_COVERAGE.md#working-testing-standard) for
+new or materially changed tests within existing reviews and gates.
+
 [Advisory test selection](TEST_SELECTION.md) reports affected boundaries and
 coverage gaps for an exact baseline and proposed head. It runs no tests and
 does not change required gates.
 
 QA briefs and fleet gates run the daemon and npm checks through one entrypoint instead of an ambient shell. It builds an owned venv (Python 3.13) and `npm ci` cache keyed by toolchain and lockfile hashes, gives the child its own `HOME`, a short `TMPDIR` and a UTF-8 locale, drops every other environment variable (including `TMUX`, `MAKEFLAGS` and credentials), and preflights the exact child context before the subject starts. Missing or wrong executables, denied `ps`, absent tmux/lsof/socket capabilities, dependency drift and nested HOME/evidence/basetemp paths are all reported together as a setup failure and never reach the tests.
 
+The `npm-test` target declares Python 3.13 alongside Node 22 and npm. Its
+prepared interpreter is injected as `PENTACLE_PYTHON` and `V2_PYTHON_BIN`;
+callers need not supply either variable. Missing or wrong-version Python is
+a setup failure (exit 3) before any npm subject starts.
+
+Public checks frontend also runs `npm --prefix pentacle-chat-core test` after
+the supported root npm tests, reusing the root installation. This native command
+runs the client-core TS tests and `typecheck:test`; either failure blocks the
+required frontend result and aggregate checks.
+
+### Command reference
+
+Run from the repository root. Replace `OWNED_ROOT` and `EVIDENCE` with
+separate owned directories outside the checkout; replace `SPEC`, `SERIES`
+and `MANIFEST` with the acceptance identity and attempt-manifest path.
+Keep one series for retries and preserve every attempt, including setup failures.
+Use a distinct evidence directory per invocation, or archive its subject outputs
+before reuse: attempt receipts append, but the files under `EVIDENCE/gate/`
+have fixed names and can be overwritten.
+These are commands to use on a capable test workstation, not a claim that they
+have run on every platform.
+
 ```bash
+# Prepare only; no subject and no --select. Repeat for another target as needed.
+python3 scripts/gate_env.py prepare --profile pentacle --workspace OWNED_ROOT --evidence-dir EVIDENCE \
+  --target v2-pytest --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
+
+# Focused checks: daemon, npm, and CLI respectively.
 python3 scripts/gate_env.py run --profile pentacle --workspace OWNED_ROOT --evidence-dir EVIDENCE \
-  --target v2-unit --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
+  --target v2-pytest --select tests/test_router_replay.py \
+  --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
+python3 scripts/gate_env.py run --profile pentacle --workspace OWNED_ROOT --evidence-dir EVIDENCE \
+  --target npm-test --select test/asset_ipc.test.js \
+  --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
+python3 scripts/gate_env.py run --profile pentacle --workspace OWNED_ROOT --evidence-dir EVIDENCE \
+  --target cli-pytest --select tests/test_account_cli.py \
+  --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
+
+# Local browser gate, with disposable synthetic services and owned cleanup.
+python3 scripts/gate_env.py run --profile pentacle --workspace OWNED_ROOT --evidence-dir EVIDENCE \
+  --target web-gate --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
+
+# Final daemon gate on a workstation with a measured unit tier exceeding 900s.
+python3 scripts/gate_env.py run --profile pentacle --workspace OWNED_ROOT --evidence-dir EVIDENCE \
+  --target v2-merge-capacity --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
+# On hosts that meet the 900s unit bound, use --target v2-merge instead.
+
+# Final npm default union; omit --select. Bootstrap changes also need its selftest.
+python3 scripts/gate_env.py run --profile pentacle --workspace OWNED_ROOT --evidence-dir EVIDENCE \
+  --target npm-test --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
+python3 scripts/test_gate_env.py
+
+# Final CLI or shared-library area union, respectively.
+python3 scripts/gate_env.py run --profile pentacle --workspace OWNED_ROOT --evidence-dir EVIDENCE \
+  --target cli-pytest --select tests --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
+python3 scripts/gate_env.py run --profile pentacle --workspace OWNED_ROOT --evidence-dir EVIDENCE \
+  --target shared-pytest --select tests --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
 ```
 
-Targets are the closed list in `scripts/gate-env.json` (`v2-unit`, `v2-smoke`, `v2-merge`, `v2-merge-capacity`, `v2-pytest --select tests/test_x.py`, `npm-test --select test/x.test.js`); `prepare` (optionally with `--target`, to provision and preflight just that target) runs the same setup and never launches a subject or accepts `--select`; the focused `v2-pytest` target refuses to run without at least one `--select` (it never defaults to the full suite — use `v2-unit`/`v2-merge` for that). Every invocation writes append-only receipts under `EVIDENCE/attempts/<attempt_id>/` before any setup, so failures, cancellation and crashes stay visible; `EVIDENCE/test-attempts.v1.json` is a derived index. The daemon targets run `run_gate.py` under a finite `--deadline-seconds` envelope (tier limits, smoke preflight and reserve) and fold its `primary_outcome` and secondary outcomes into the receipt. A changed requirement, lockfile or profile selects a new prepared cache; a drifted cache is refused until `--rebuild` (which removes only that owned directory). Exit codes: 0 pass, 1 subject failure, 3 setup failure, 130 cancelled. Running `run_gate.py` or `pytest` directly remains possible but is not the supported route. Self-test: `python3 scripts/test_gate_env.py`.
+Select the final gate for each changed area, not just one for a cross-area change.
+Renderer integration changes additionally need the local `web-gate` command
+above and the explicitly selected Chrome contracts below. Docs-only changes
+need source/link review; this command reference change also runs the unchanged
+bootstrap selftest. These commands do not change release admission or replace
+platform-specific and installed-artifact acceptance.
+
+Targets are the closed list in `scripts/gate-env.json`. `prepare` (optionally
+with `--target`) runs setup only; focused pytest targets require `--select`
+and never silently default to a full suite. `v2-unit` runs unit only and is
+not a substitute for the serial unit-and-smoke closing gate. Every invocation
+writes append-only receipts under `EVIDENCE/attempts/<attempt_id>/` before
+setup; `EVIDENCE/test-attempts.v1.json` is a derived index. Subject evidence is
+under `EVIDENCE/gate/`: daemon `v2-merge-evidence.json` (or
+`v2-unit-evidence.json`), tier logs and JUnit; focused pytest
+`pytest.junit.xml`; npm `npm-test-summary.json`; browser `web-summary.json`.
+Keep these with the terminal receipt and exact candidate identity.
+
+The daemon targets run `run_gate.py` under a finite `--deadline-seconds`
+envelope (tier limits, smoke preflight and reserve) and fold primary and
+secondary outcomes into the receipt. A changed requirement, lockfile or profile
+selects a new prepared cache; a drifted cache is refused until `--rebuild`
+(which removes only that owned directory). Exit codes: 0 pass, 1 subject
+failure, 3 setup failure, 130 cancelled. Direct `run_gate.py` and `pytest`
+remain available lower-level entries, not the supported preparation route.
+
+`--tmp-root` defaults to `/tmp/ge-<uid>`. The child `TMPDIR` adds a slash and
+eight-character attempt suffix; its resolved path must fit the 48-byte
+`max_tmpdir_bytes` limit, not merely the root argument. Leave the default or
+pass a shorter owned `--tmp-root` if preflight rejects the path. This protects
+Unix/tmux socket paths; do not increase the guard or put scratch under a long
+evidence directory. The owned HOME, scratch and evidence layout checks still
+apply.
+
+Focused `v2-pytest` always includes the four existing repository invariants in
+`tests/test_capabilities.py`: changed-test skip confinement, original assertion
+pins, fixture manifest hashes and portability scope completeness. Selecting the
+whole module already covers that floor; nodes are not added twice. The requested
+selection and effective selection remain separate in the attempt receipts.
+Fixture-only edits therefore receive the same cheap metadata checks without a
+changed-file detector or regenerating metadata automatically. Select affected
+behavior modules separately, including `test_h2_portable_fixtures.py` when its
+behavior changes; the invariant floor does not replace those tests.
+
+Explicitly select the Chrome interrupt contract; it is outside npm's defaults:
+
+```bash
+python3 scripts/gate_env.py run --profile pentacle --workspace OWNED_ROOT --evidence-dir EVIDENCE \
+  --target npm-test --select test/e2e/web_gate_interrupt.test.js \
+  --select test/e2e/web_wrap_paste_gate.test.js --select test/e2e/web_wrap_paste_served.test.js \
+  --select test/e2e/lib/render_proofs.test.js \
+  --spec SPEC --series SERIES --purpose acceptance --attempt-manifest MANIFEST
+```
+
+These selected web integration files (including supported wildcard selections)
+reuse web-gate's builds and Chrome preflight; the interrupt contract additionally
+reuses its Python dependencies, tmux and capabilities. Ordinary npm selections
+retain their existing preparation. The integration file budget uses the existing
+finite web-gate run budget rather than npm's ordinary 60-second file bound.
+Missing Chrome or build is setup failure, not a skipped acceptance PASS. Retain
+actual case counts, browser PID audits, file cleanup and the terminal receipt.
+`--keep` now retains debug files only: the existing owner always stops its Chrome
+group, on success, failure and supported signals. Unknown process inspection is
+failed cleanup. It does not handle an uncatchable kill by claiming a finally ran.
 
 The gate owner manifest compares process start identities before recording or
 reaping children. On macOS, its `ps` probe uses `TZ=UTC0` and `LC_ALL=C`, so an
@@ -27,13 +152,14 @@ Sandboxed seats use the same supported entry. Do not hand-build its venv with
 isolated interpreter. The prepared venv fully installs the declared requirements.
 The owned `HOME` also owns `.ssh/cm`; ambient SSH control-directory overrides are
 not forwarded. Keep the real SSH directory read-only. Put Python 3.13 and Node 22
-on the launching PATH, then use `--target v2-merge` for the serial closing gate;
+on the launching PATH, then select the serial closing target below;
 its child PATH and HOME come from the bootstrap rather than the launching shell.
 
-For a workstation with a measured unit overrun, the opt-in `v2-merge-capacity`
-target runs the same serial unit and smoke union with a 1,200-second unit limit
-and the unchanged 900-second smoke limit. Its runner deadline is 2,220 seconds,
-inside a 2,250-second outer subject bound. Qualify it with a complete supported
+For a workstation with a measured unit tier exceeding 900 seconds,
+`v2-merge-capacity` is the supported closing target. Use ordinary `v2-merge`
+on hosts that meet the 900-second unit bound. The capacity target runs the same serial unit and smoke union with a 1,800-second unit limit
+and the unchanged 900-second smoke limit. Its runner deadline is 2,820 seconds,
+inside a 2,850-second outer subject bound. Qualify it with a complete supported
 gate on the intended host and retain the exact source, environment, node counts
 and timings. A pass establishes that observed window, not a timing guarantee.
 The default `v2-merge` and CI budgets are unchanged. The full 60-second hermetic
@@ -205,6 +331,14 @@ reconnect and answered-state reload. Free-text questions send `text` with the
 shows its labeled textarea immediately. Actual asking-seat delivery still needs
 a live fixture journey; this provider-free gate asserts durable resolution.
 
+The **composer-draft-per-chat** scenario uses the disposable chats and the real
+composer to check navigation, image ownership, send clearing, delayed uploads,
+newer edits, a composite chat and separate browser-context isolation. It also
+checks that unsent fixture text is absent from outgoing websocket frames. The
+**composer-draft-pending-send** and **composer-draft-retire** scenarios verify
+that a held upload cannot be sent twice after navigation and that an
+authoritatively closed, unmounted chat releases its image preview.
+
 The **scheduled-section** scenario reads the seeded recurring rule (weekly, days from
 firing, in America/Chicago) and one pending one-shot from the sidebar Scheduled section,
 then clicks Pause, Resume and Edit (a new `at_time`) and reads each result back from the
@@ -249,7 +383,10 @@ the same millisecond. The no-profile gate still starts its own daemon on an
 ephemeral port. Its verdict records the owned daemon PID and confirmed exit;
 failure to stop that process fails the gate after a forced termination attempt.
 
-For focused full-renderer slot-layout acceptance, build the web bundle and run:
+The standalone `test/e2e/grid_split_gate.js` entry is nonfunctional and is
+not a supported acceptance command. The historical invocations below are
+retained only to identify the path awaiting repair or retirement; do not use
+them as evidence of a passing gate:
 
 ```bash
 npm run build:web
@@ -257,7 +394,7 @@ node test/e2e/grid_split_gate.js web /tmp/pentacle-split-web
 node test/e2e/grid_split_gate.js desktop /tmp/pentacle-split-desktop
 ```
 
-This uses the same CDP client and scratch-daemon seeder. It launches the actual
+Its intended contract uses the same CDP client and scratch-daemon seeder. It launches the actual
 Electron entry point or served browser bundle with an isolated profile, creates
 four uniquely named local tmux fixtures, and checks their native PTY dimensions
 after drag, maximize/restore and view changes. It also checks narrow widths,
@@ -285,6 +422,30 @@ oscillator supplies a synthetic browser MediaStream. Transcription is held until
 the pending row is observed, and the provider send is captured. No physical
 microphone or live provider is used, and no live transcription backend is
 contacted.
+
+`web-chat-voice` refuses `chat-stream:outbound-commit` so it keeps covering the
+client path. `web-voice-reload-after-commit`
+([web_voice_reload_scenario.js](../test/e2e/lib/web_voice_reload_scenario.js))
+covers the committed path against the real loopback daemon. Its ASR backend is
+an in-process fixture in [web_gate_daemon.py](../test/e2e/lib/web_gate_daemon.py)
+that holds until the scenario writes a release file. The page requires the real
+commit ACK, then reloads after the daemon starts transcription; delivery is read
+from the daemon's send receipts.
+The fixture waits for the owned daemon's existing post-configuration
+`awaiter-resolution` startup log before starting the web host. A TCP listener
+alone can precede finisher setup and leave the host's initial capability cache
+on the legacy path. The log wait starts at that process's spawn byte offset. A
+reload before the commit is the control, and it loses the take on every build.
+Correlated metadata is saved before the ACK and delivery assertions and again
+in `finally`, including pre-ACK timeout paths. It records the take/request and
+intended origin/generation, actual reply operation/RPC identity and ownership
+flags, and allowlisted refusal codes. `getChatStreamState` supplies the current
+snapshot-derived capability, connection/state version and runtime/build hashes;
+this is not a reconstruction of historical snapshot or welcome ordering.
+Read-only operation/receipt metadata is queried by that take/request identity,
+with the fixture DB path/device/inode recorded. No mandate, transcript, auth or
+free-form exception text is logged. The pre-commit loss control and the separate
+`web-chat-voice` client-owned fallback coverage remain unchanged.
 
 The scenario retains recording duration/accessible Cancel, visible
 `backend_unavailable` with Retry, stable transcription identity, one text row,
@@ -430,16 +591,11 @@ region: the titlebar (sidebar toggle and pane selector) or live data (working
 spinners, machine stats). Gate page reloads (`reloadDashboardPage`) start the next document
 with an empty four-pane workspace so scenarios see a fresh renderer.
 
-`agent-chat-steer-controls` checks the composer of a working agent chat: the
-`Queue` | `Steer now` choice (default Queue), Stop beside Send while a draft
-exists, and the absence of both on the assistant composite chat. A send whose bridge
-never answers keeps a turn in flight (the daemon cannot make a seeded seat
-work); the real Send, Steer now, `Alt+Enter` and Stop controls then drive fake
-send and cancel bridges. It asserts `urgent` only on the first Steer now of a
-turn, the reset to Queue after each send, the "Steer did not take" and
-"Stopped. Queued messages run next" notices, that a second Stop is a no-op, and
-that Stop keeps the draft and the queued row. The Escape reaching a pane is a
-live-seat journey, not part of this hermetic gate.
+`agent-chat-send-default-queue-state` drives the real composer/shared transcript with deterministic ordinary-send, queued-action and Stop bridges. Enter/Alt+Enter retain ordinary intake; qualified provider queues render minimal Send now with no warning. Repeated pending clicks preserve original IDs/inputs and the web draft, without invoking Stop. Explicit Stop remains generation-fenced; the composite has no queued acceleration or Stop. These are DOM/bridge checks, not native shortcut, abort or model-completion proofs; native provider and durable-control/restart gates are separate.
+
+`test/e2e/web_host_recovery_gate.cjs` retains counted ordinary/composite lost-ACK, real reconnect, manual Retry overlap and >60-second durable restart acceptance. Its legacy `PHASE2_KIND=urgent` cell now verifies the retired operator action's ordinary replacement, with zero Escape and no urgent wire flag; intentional lower-level urgency has separate preservation controls. Counters live outside restarted processes; provider acceptance/queued receipts never stand in for model completion.
+
+Disposable installed-provider acceptance must separately bind the actual CLI/version, owned session generation, browser assets and harness hash. Establish the real provider queue creation route first (Codex versions that steer without queuing require explicit queue-cell N/A, not seeded queue proof). Delay only the owned USER echo to reproduce native intake before the stale queued control; count original inputs and native turn interruption/current-tool completion separately, since Codex tools can outlive an aborted turn. Keep the original failure and any corrected oracle replay, release owned profiles/processes, and never use operator chats. Deployment additionally inventories each operator tab's own injected build; the existing refresh icon only prompts a click.
 
 After a successful no-profile main run, the command also runs the
 [history retention](../test/e2e/web_chat_history_retention_gate.cjs),

@@ -81,7 +81,7 @@ the standard `unsupported_in_v2` response.
 | `agent-orch send [--retry] <stream_id> <msg_id> <prompt>` | Issue `send` RPC. The target may also be the assistant alias; see [Addressing the assistant by alias](#addressing-the-assistant-by-alias). `msg_id` is unique per target stream. `--retry` is accepted when the latest entry for `(msg_id, stream_id)` is `send.result` with `delivery:"not_landed"`, `send.error`, `transmit_failed`, `transmit_delivered_awaiting_result`, or `send_error`. The CLI builds and validates a minimal Inbox v1 envelope from the prompt, carries it inline to the daemon, and the daemon re-validates it. |
 | `agent-orch tell <peer_stream_id> <text> [--from STREAM_ID] [--ttl SECONDS] [--tell-id UUID] [--urgent]` | Direct one-way peer message. The target may also be the assistant alias; see [Addressing the assistant by alias](#addressing-the-assistant-by-alias). The daemon pastes immediately through the always-submit path and returns a durable completed-delivery receipt; `submission_confirmed` is post-hoc evidence, not a readiness gate. |
 | `agent-orch park <stream_id> --reason TEXT [--from STREAM_ID]` / `agent-orch unpark <stream_id> [--event-id ID --reason TEXT] [--from STREAM_ID]` | Declare or clear a session's parked state. The CLI is authorized for the target stream or its direct parent; the Pentacle desktop operator surface has the separate operator-confirmed path. A routing-integrity park requires its exact event id and a non-empty acknowledgement reason. Parked sessions receive no system nudges. |
-| `agent-orch notify (--message TEXT \| --ask TEXT) [--title TEXT] [--producer NAME] [--severity info\|warning\|critical] [--ttl SECONDS] [--button LABEL ... \| --actions JSON] [--await-answer] [--timeout SECONDS] [--from STREAM_ID]` | Publish an operator-facing notification through `chat_streamd`. `--message` creates a message-only Updates card with no buttons. `--ask` creates an actionable question; `--button` builds yes/no-style actions, while `--actions` accepts a JSON list of notification action objects (if both are supplied, `--actions` takes precedence). With `--await-answer`, the CLI records the publishing stream as `answer_to_stream_id`, blocks on `notification.await`, and prints the typed answer payload. |
+| `agent-orch notify (--message TEXT \| --ask TEXT) [--title TEXT] [--producer NAME] [--severity info\|warning\|critical] [--ttl SECONDS] [--button LABEL ... \| --actions JSON] [--await-answer] [--timeout SECONDS] [--from STREAM_ID]` | Publish an operator-facing notification through `chat_streamd`. `--message` creates a message-only Updates card with no buttons. `--ask` creates an actionable question; `--button` builds yes/no-style actions, while `--actions` accepts a JSON list of notification action objects (if both are supplied, `--actions` takes precedence). With `--await-answer`, the CLI records the publishing stream as `answer_to_stream_id`, blocks on `notification.await`, and prints the typed answer payload. `warning`/`critical` also reach the front desk as a typed error alert; a repeated `--dedup-key` does not re-alert. |
 | `agent-orch prompt ask --title TEXT --body TEXT [--question-id ID] [--spec-id ID] [--response-mode single_choice\|multi_choice\|free_text] [--option LABEL[=VALUE] ...] [--from STREAM_ID] [--provider NAME] [--ttl SECONDS] [--await-answer] [--timeout SECONDS]` | Standard operator-question protocol (verified, operator-visible producer only). Creates or refreshes a durable `agent_question.v1` record through `chat_streamd`, publishes one deduped Updates card, and returns immediately by default. Admission caps: title ≤90, body ≤1200 code points in blocks of ≤300 / ≤3 lines, 1–5 options with labels ≤40 and descriptions ≤100; no `ack` mode and no separate `--context` (put context in `--body`). Every question admits free text. If daemon/auth/store failure prevents durable creation, returns `prompt.fallback` plus an `AGENT_QUESTION_V1` inline block. |
 | `agent-orch prompt answer <question_id> [--select VALUE ...] [--text TEXT]` | Answer a durable question with the one canonical payload: selected option value(s) and/or free text. A choice takes selections and/or text; `free_text` takes `--text` only. |
 | `agent-orch prompt status <question_id>` / `agent-orch prompt list [--from STREAM_ID] [--spec-id ID] [--open] [--limit N]` | Recover durable prompt state. `status` reads one question and answer by `question_id`; `list` finds open or answered questions by producer stream or spec, including after the asking stream has closed. |
@@ -173,14 +173,16 @@ Success response:
 {"type":"tell.ok","request_id":"tell-<uuid>","tell_id":"<uuid>","ledger_row_id":123,"delivery_status":"delivered","submission_confirmed":true}
 ```
 
-`delivery_status` is `"delivered"` after the unconditional paste and the durable completed-delivery record is written. `submission_confirmed` is post-hoc pane evidence; false does not void or retry the delivery. When a Codex paste committed (left the composer, no active draft) but its post-watermark USER-event proof is still ingesting, `delivery_status` is `"committed_pending_proof"` with `action_committed:true` and `do_not_resubmit:true` — a non-fatal, do-not-resend state. Ordinary tell receipts remain stored snapshots; a later provider event does not automatically update them (see the send section's `committed_pending_proof` note). `tell` still exits 0. If the target stream closed with a successor, the daemon forwards the tell to the final live successor and records `original_to_stream_id` plus route hops. `agent-orch ledger get <tell-id>` and `agent-orch audit inbound <stream-id>` expose the exact text and route evidence later. Stable daemon errors include `peer_session_unknown_from`, `peer_session_unknown_to`, `terminated`, `route_loop`, `route_depth_exceeded`, `text_too_large`, `invalid_ttl`, and `tell_id_replay_conflict`.
+`delivery_status` is `"delivered"` after the unconditional paste and the durable completed-delivery record is written. `submission_confirmed` is post-hoc pane evidence; false does not void or retry the delivery. When a Codex paste committed (left the composer, no active draft) but its post-watermark USER-event proof is still ingesting, `delivery_status` is `"committed_pending_proof"` with `action_committed:true` and `do_not_resubmit:true` — a non-fatal, do-not-resend state. An ordinary peer tell can later be confirmed when its exact native TELL event is durably ingested and matches its original text, digest, session, generation and watermark. Same-ID reconciliation uses that same evidence path without input. Unresolved tell records survive the retention window; older delivered records remain bounded unless owned by a protected notice or exchange. `tell` still exits 0. If the target stream closed with a successor, the daemon forwards the tell to the final live successor and records `original_to_stream_id` plus route hops. `agent-orch ledger get <tell-id>` and `agent-orch audit inbound <stream-id>` expose the exact text and route evidence later. Stable daemon errors include `peer_session_unknown_from`, `peer_session_unknown_to`, `terminated`, `route_loop`, `route_depth_exceeded`, `text_too_large`, `invalid_ttl`, and `tell_id_replay_conflict`.
 
 `agent-orch list` and `agent-orch inspect` expose each session's computed `turn_state` (`idle`, `working`, `parked`, `limit_stalled`, or `unknown`), `turn_state_since`, and raw `turn_state_sources`. Source precedence is parked over limit-stalled over activity over unknown; lower-priority masked sources remain visible. `agent-orch park` sets the park source with a required reason and `agent-orch unpark` clears it. Stable park errors are `park_unauthorized`, `park_target_closed`, `park_not_found`, and `unpark_not_parked`.
 
 ### Addressing the assistant by alias
 
-`tell` and `send` (only these two verbs) also accept one literal, case-sensitive
-alias: the name of the primary assistant composite (set by `PENTACLE_ASSISTANT_PRIMARY_NAME`, default `assistant`). It means "that
+`tell` and `send` (only these two verbs) accept the stable, case-sensitive
+literal `assistant` and the configured primary name (`PENTACLE_ASSISTANT_PRIMARY_NAME`,
+default `assistant`). Both select the same primary composite, even when the
+CLI and daemon have different primary-name environments. They mean "that
 composite's current binding" and is for agent peers: a verified seat stream token and an explicit
 sender claim (`from_stream_id`, always sent by the CLI) naming the same seat are required. Operator-only
 callers receive `assistant_tell_unauthorized` / `assistant_send_unauthorized`, Dot and scoped clients keep their scope errors, and
@@ -195,7 +197,7 @@ agent-orch send assistant 101 'review the parser change'
 ```
 
 The CLI keeps the alias raw on the wire. `tell` sets `to_stream_id` to the
-alias. `send` sets both `to_stream_id` and inline `inbox.to` to the alias, with
+exact supplied alias. `send` sets both `to_stream_id` and inline `inbox.to` to the alias, with
 no `host`/`session_name` split and no optimistic ID. The daemon refuses an extra
 target member, or an inline INBOX `to` other than the alias, as `bad_request`.
 A daemon without alias support refuses the raw alias as `bad_request` before
@@ -258,6 +260,17 @@ On success the CLI prints a JSON receipt:
 ```
 
 `event_id` is the durable transcript row (it survives reconnect/history replay as one row). The send is idempotent by `request_id`: a retry with the same request id returns `"duplicate": true` and adds no second row. Genuine error receipts (non-zero exit, `send_image.error` with an `error_code`) cover an unsupported type or oversize file (rejected client-side before upload, exit `2`), a blob that was never uploaded (`attachment_missing`), an invalid attachment (`attachment_invalid`), and calling from an unverified or foreign stream (`stream_ownership_unverified`, exit `66`). Exit codes: `0` delivered, `1` send error, `2` bad input, `66` not authorized. This is agent → operator only; the operator's own image sends use the existing desktop/mobile attachment composer, not this verb.
+
+### Ad hoc images in the assistant chat
+
+A hidden seat has no operator-facing chat, and the assistant composite does not mirror an own-stream `send-image`. To show an image in the assistant chat (for example `home:assistant`) without waiting for a dispatch reply, the current direct-primary binding publishes it proactively:
+
+```bash
+agent-orch send-file ./chart.png --to home:assistant --proactive --caption "Q3 conversions"
+agent-orch send-file --upload-id <id> --to home:assistant --proactive
+```
+
+`send-file --proactive` uploads the path (printing the receipt first), then sends one `assistant.publish` with `attachment_ids=[<upload_id>]` and no dispatch or reply IDs. `--publish-kind` is `status` (default) or `prose`; `--request-id` defaults to `send-file:<upload_id>`. A retry with the same upload and caption returns `"duplicate": true`; a different caption on the same key is refused as `publish_replay_conflict`, so pass a fresh `--request-id` to post the same file twice. Correlation flags, `--evidence-refs-json` and `question`/`result` with `--proactive` are refused before any network call (`proactive_fields_invalid`). The equivalent two-step form is `agent-orch assistant publish --proactive --publish-kind status --message "" --attachment-ids-json '["<upload_id>"]' …`. Any other seat gets `publish_not_authorized` and keeps its upload receipt; it hands that receipt to the front desk, which publishes it. Correlated dispatch replies are unchanged ([chat file delivery](../../docs/chat_file_delivery.md)).
 
 ## Saved question answers
 
@@ -1328,7 +1341,7 @@ The `delivery=landed` happy path returns `{"ok":true,"delivery":"landed","attemp
 
 ### `committed_pending_proof` — durably committed, proof late (exit 0, do-not-resubmit)
 
-A Codex paste that left the composer (no active draft) is durably committed even before its post-watermark USER event is ingested. When that async proof has not yet landed inside the fast proof window, `send` returns `{"ok":true,"delivery":"committed_pending_proof","action_committed":true,"confirmation_pending":true,"do_not_resubmit":true,"reconcile_command":"agent-orch send-receipt <stream_id> <request_id>"}` and **exits 0**. This is not `not_landed`: the message reached the target, so the caller must NOT re-evaluate or resend (a resend would double the text). The printed `reconcile_command` reads the latest stored receipt; ordinary `send` and `tell` reads do not automatically promote pending records after later provider input. A pending snapshot can therefore outlast actual consumption and is not proof of current non-delivery. Automatic tell promotion belongs to the owned outbound-notice and notification-answer paths; send promotion requires the existing verified original-request contract. Neither applies to ordinary CLI sends/tells. Do not resend to obtain a fresh receipt; `--retry` is intentionally rejected for this state. `tell` reports the same committed state as `delivery_status:"committed_pending_proof"` (tell always exits 0), and a live-session `prompt ask` notice in this state is treated as authoritative (exit 0) rather than the former exit-1 `proof_pending`. Only genuinely un-committed sends (`not_landed`, active draft) remain hard failures. Measured remote-Codex ingest tail (2026-09-07): avg 3.51 s, max 8.86 s, 34% beyond the 4 s window — hence the bounded proof window rather than blocking the caller until consumption.
+A Codex paste that left the composer (no active draft) is durably committed even before its post-watermark USER event is ingested. When that async proof has not yet landed inside the fast proof window, `send` returns `{"ok":true,"delivery":"committed_pending_proof","action_committed":true,"confirmation_pending":true,"do_not_resubmit":true,"reconcile_command":"agent-orch send-receipt <stream_id> <request_id>"}` and **exits 0**. This is not `not_landed`: the message reached the target, so the caller must NOT re-evaluate or resend (a resend would double the text). The printed `reconcile_command` reads the latest stored receipt; ordinary `send` and tell-ledger reads do not promote pending records. Ordinary peer tells additionally reconcile on exact native TELL ingest or same-ID replay, using their retained original proof anchors; legacy rows without those anchors remain unresolved. A pending snapshot can therefore outlast actual consumption and is not proof of current non-delivery. Owned outbound-notice and notification-answer paths retain their existing promotion rules; send promotion requires the existing verified original-request contract. Do not resend to obtain a fresh receipt; `--retry` is intentionally rejected for this state. `tell` reports the same committed state as `delivery_status:"committed_pending_proof"` (tell always exits 0), and a live-session `prompt ask` notice in this state is treated as authoritative (exit 0) rather than the former exit-1 `proof_pending`. Only genuinely un-committed sends (`not_landed`, active draft) remain hard failures. Measured remote-Codex ingest tail (2026-09-07): avg 3.51 s, max 8.86 s, 34% beyond the 4 s window — hence the bounded proof window rather than blocking the caller until consumption.
 
 ### Terminal codes (no retry will help)
 
@@ -1664,3 +1677,26 @@ free-text Skip as `text`. Both carry the same reserved value. Mobile's canonical
 `prompt.answer` always sends `text`; the daemon maps choice text to the existing
 `custom_text` storage path. Web's existing notification resolver sends that
 choice alias directly. Asking agents recognize either field.
+
+
+### Exact provider release metadata
+
+The fleet installer accepts `--provider-cli-pin-file /absolute/reviewed-pair.json`.
+It uses the shared strict release-pair validator and writes `required_version`,
+pin revision/digest and platform artifact identities into `provider_packages`.
+The snapshot is a reviewed copy of the daemon-owned pair described in
+[provider accounts](../../docs/provider_accounts.md#one-exact-fleet-release-pair),
+not another desired-state authority. Without a snapshot the manifest explicitly
+reports `pin_snapshot_required`; it contains no managed version attestation.
+Old minimum-only manifests cannot authorize managed native launches. Preparing
+or installing CLI source does not move the active provider pin or repin accounts.
+Offline hosts remain pending until their actual current-pin/code/artifact proof;
+retained packages support rollback through a fresh same-home successor.
+
+
+A parked repin whose pin advanced uses a fresh `account repin` operation with
+`--reconcile-of PRIOR_OPERATION_ID`, central's still-selected generation and the
+current pin snapshot under a real admission hold. The authenticated host resolves
+the successful chain. Matching artifacts reuse retained turn evidence without
+creating the prospective generation; only a changed provider target needs a new
+native turn. See [provider accounts](../../docs/provider_accounts.md).

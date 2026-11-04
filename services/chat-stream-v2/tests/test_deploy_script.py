@@ -812,8 +812,11 @@ def test_u2_server_keepalive_needs_terminal_1011():
     close = _u2_line(initiator="server", close_sent_code=1011,
                      close_sent_reason="keepalive_ping_timeout")
     scan = _u2_scan(force, close)
-    assert scan["failures"] == [{"kind": "1011_close", "client": _U2_CONN_A,
-                                  "transport": "loopback", "line": close}]
+    assert len(scan["failures"]) == 1
+    row = scan["failures"][0]
+    assert (row["kind"], row["class"], row["client"], row["transport"], row["line"]) == (
+        "keepalive_timeout", "liveness", _U2_CONN_A, "loopback", close)
+    assert row["queue_depth"] == 0
     assert scan["overflow_drops"] == 0
 
 
@@ -927,7 +930,7 @@ def test_u2_missing_marker_selects_empty_window(boot_line):
     )
     assert scan == {"class": "slow_consumer", "outcome": deploy_mod.SLOW_CONSUMER_PASSED,
                     "boot_marker_seen": False, "queue_depth_warnings": 0, "overflow_drops": 0,
-                    "peer_4000_other": 0, "unparsed_conn_diag": 0, "failures": []}
+                    "peer_4000_other": 0, "unparsed_conn_diag": 0, "failures": [], "kinds": {}}
 
 
 def test_u2_explicit_no_marker_scans_whole_text():
@@ -962,8 +965,8 @@ def _u2_boot():
 
 def _u2_generation():
     def runner(argv, cwd):
-        return subprocess.CompletedProcess(argv, 0 if argv[2]=='999' else 1,
-                                           _U2_START if argv[2]=='999' else '', '')
+        return subprocess.CompletedProcess(argv, 0 if argv[argv.index('-p') + 1]=='999' else 1,
+                                           _U2_START if argv[argv.index('-p') + 1]=='999' else '', '')
     return dict(expected_pid=999, expected_start=_U2_START, prior_pid=111,
                 prior_start='old-start', runner=runner)
 
@@ -1248,3 +1251,181 @@ def test_apply_post_activation_retains_prior_digest_on_bootstrap_failure(monkeyp
     assert stamp.get("post_activation_error", "").startswith("DeployError")
     assert stamp["launchd_plist_digest"] == "DPRIOR"  # NOT advanced on a failed bootstrap
     assert "daemon_boot_readback" not in stamp
+
+
+@pytest.mark.parametrize("unload_after,unknown", [(3.0, False), (1e9, False), (0.0, True)])
+def test_web_reload_requires_positive_unloaded_state(tmp_path, unload_after, unknown):
+    label = "com.example.disposable-web"
+    descriptor = tmp_path / "web.plist"
+    descriptor.write_bytes(plistlib.dumps({"Label": label}))
+    launchd = _GracefulLaunchd(unload_after_s=unload_after)
+    def runner(cmd, cwd):
+        if unknown and cmd[1] == "print":
+            launchd.calls.append(("print", launchd.now))
+            return subprocess.CompletedProcess(cmd, 1, "", "synthetic inspection failure")
+        return launchd.runner(cmd, cwd)
+    if unload_after > 10 or unknown:
+        with pytest.raises(deploy_mod.DeployError, match="unloaded|inspection failure"):
+            deploy_mod.reload_web(label, descriptor, runner, timeout_s=10,
+                                  sleep=launchd.sleep, monotonic=launchd.monotonic)
+        assert not any(verb == "bootstrap" for verb, _ in launchd.calls)
+        assert launchd.now <= 10.25
+    else:
+        result = deploy_mod.reload_web(label, descriptor, runner, timeout_s=10,
+                                       sleep=launchd.sleep, monotonic=launchd.monotonic)
+        assert result["unloaded"] is True
+        assert [at for verb, at in launchd.calls if verb == "bootstrap"] == [3.0]
+
+
+def test_web_reload_refuses_descriptor_identity_before_mutation(tmp_path):
+    descriptor = tmp_path / "web.plist"
+    descriptor.write_bytes(plistlib.dumps({"Label": "com.example.foreign"}))
+    launchd = _GracefulLaunchd(unload_after_s=0)
+    with pytest.raises(deploy_mod.DeployError, match="Label"):
+        deploy_mod.reload_web("com.example.owned", descriptor, launchd.runner)
+    assert not launchd.calls
+
+
+@pytest.mark.parametrize('kind', ['keepalive_timeout', 'overflow', '1011_close'])
+def test_keepalive_kind_receipt_and_exit_stay_failed(kind, monkeypatch, capsys):
+    force = dict(initiator='server', cause='liveness', cause_source='protocol_close')
+    close = dict(close_code=1011, close_reason='keepalive_ping_timeout', queue_depth=1)
+    if kind == 'overflow':
+        force.update(cause='slow_consumer', cause_source='server_policy')
+    elif kind == '1011_close':
+        force = None
+        close.update(close_reason='unknown')
+    lines = ([_u2_line('force_close', **force)] if force else []) + [_u2_line('close', **close)]
+    scan = deploy_mod.classify_slow_consumer_lines(lines)
+    assert scan['outcome'] == deploy_mod.SLOW_CONSUMER_FAILED
+    assert [r['kind'] for r in scan['failures']] == [kind]
+    assert scan['kinds'] == {kind: 1}
+    if kind == 'keepalive_timeout':
+        assert scan['class'] == scan['failures'][0]['class'] == 'liveness'
+        assert scan['failures'][0]['queue_depth'] == 1
+        assert scan['failures'][0]['queue_max'] == 256
+        assert scan['failures'][0]['line'] == lines[-1]
+    stamp = dict(sha=TARGET_SHA,
+                 daemon_boot_readback={'outcome': deploy_mod.BOOT_OBSERVED},
+                 daemon_runtime_readback={'outcome': deploy_mod.RUNTIME_SHA_OBSERVED, 'sha': TARGET_SHA},
+                 slow_consumer=scan, fleet_smoke={'outcome': deploy_mod.FLEET_SMOKE_PASSED})
+    code, _, err = _run_main(monkeypatch, capsys, stamp=stamp)
+    assert code == deploy_mod.EXIT_SLOW_CONSUMER_FAILED == 8
+    assert kind in err and 'kinds=' in err
+
+
+@pytest.mark.parametrize('field', ['close_reason', 'close_sent_reason'])
+def test_keepalive_reason_without_force_classifies_liveness(field):
+    scan = deploy_mod.classify_slow_consumer_lines([
+        _u2_line('close', **{field: 'keepalive_ping_timeout', 'close_code': 1011})])
+    assert scan['kinds'] == {'keepalive_timeout': 1}
+
+
+def test_keepalive_preceding_force_and_connection_priority():
+    force = _u2_line('force_close', initiator='server', cause='liveness', cause_source='protocol_close')
+    close = _u2_line('close', close_code=1011, close_reason='unknown')
+    scan = deploy_mod.classify_slow_consumer_lines([force, close])
+    assert scan['kinds'] == {'keepalive_timeout': 1}
+    assert deploy_mod.classify_slow_consumer_lines([close, force])['kinds'] == {'1011_close': 1}
+    overflow = _u2_line('force_close')
+    for lines in ([overflow, force, close], [force, close, overflow]):
+        assert deploy_mod.classify_slow_consumer_lines(lines)['kinds'] == {'overflow': 1}
+    peer = _u2_line('force_close', initiator='peer', cause='liveness')
+    assert deploy_mod.classify_slow_consumer_lines([peer, force, close])['kinds'] == {'peer_liveness': 1}
+    other = _u2_line('close', conn_id='other-connection', close_code=1011)
+    assert deploy_mod.classify_slow_consumer_lines([force, other])['kinds'] == {'1011_close': 1}
+
+
+@pytest.mark.parametrize('parent_tz', [None, '', 'UTC0', 'America/Chicago'])
+def test_process_identity_uses_one_timezone(parent_tz, monkeypatch, capsys, tmp_path):
+    import os
+    import main as daemon_main
+    if parent_tz is None:
+        monkeypatch.delenv('TZ', raising=False)
+    else:
+        monkeypatch.setenv('TZ', parent_tz)
+    utc = 'Tue Nov  3 12:00:00 2026'
+    local = 'Tue Nov  3 06:00:00 2026'
+    def birth(env):
+        return utc if env.get('TZ') == 'UTC0' and env.get('LC_ALL') == 'C' else local
+    def fake_ps(cmd, **kw):
+        assert cmd[0] == 'ps'
+        return birth(kw.get('env', os.environ))
+    def runner(cmd, cwd):
+        assert tuple(cmd[-5:]) == ('ps', '-p', str(os.getpid()), '-o', 'lstart=')
+        env = dict(os.environ)
+        if cmd[0] == 'env':
+            env.update(part.split('=', 1) for part in cmd[1:-5])
+        return subprocess.CompletedProcess(cmd, 0, birth(env), '')
+    monkeypatch.setattr(daemon_main.subprocess, 'check_output', fake_ps)
+    daemon_main._emit_boot_marker('hostx', 1234)
+    output = capsys.readouterr()
+    # Compare actual emitted markers with an independently normalized deploy read.
+    expected = deploy_mod._process_start(os.getpid(), runner)
+    assert expected == ' '.join(utc.split())
+    groups = []
+    for name, text in [('out', output.out), ('err', output.err)]:
+        path = tmp_path / name
+        path.write_text(text)
+        groups.append([deploy_mod.freeze(path)])
+    _, _, markers = deploy_mod.generation_ranges(groups, os.getpid(), expected)
+    assert markers[0]['identity'] == markers[1]['identity']
+    assert not deploy_mod._prior_writer_exited(os.getpid(), expected, runner)
+
+
+def test_process_identity_timezone_mismatch_red_control(monkeypatch, capsys, tmp_path):
+    import os
+    import main as daemon_main
+    utc = 'Tue Nov 3 12:00:00 2026'
+    local = 'Tue Nov 3 06:00:00 2026'
+    monkeypatch.setenv('TZ', 'America/Chicago')
+    def fake_ps(cmd, **kw):
+        return utc if kw.get('env', os.environ).get('TZ') == 'UTC0' else local
+    monkeypatch.setattr(daemon_main.subprocess, 'check_output', fake_ps)
+    daemon_main._emit_boot_marker('hostx', 1234)
+    output = capsys.readouterr()
+    monkeypatch.setenv('TZ', 'UTC0')
+    def runner(cmd, cwd):
+        return subprocess.CompletedProcess(cmd, 0, utc, '')
+    expected = deploy_mod._process_start(os.getpid(), runner)
+    groups = []
+    for name, text in [('out', output.out), ('err', output.err)]:
+        path = tmp_path / name
+        path.write_text(text)
+        groups.append([deploy_mod.freeze(path)])
+    deploy_mod.generation_ranges(groups, os.getpid(), expected)
+
+
+@pytest.mark.parametrize('rc,value,error,exited', [(0, 'birth', '', False), (0, 'other', '', True),
+    (1, '', '', True), (0, '', '', False), (1, '', 'denied', False), (2, '', '', False)])
+def test_prior_writer_exit_remains_fail_closed(rc, value, error, exited):
+    def runner(cmd, cwd):
+        return subprocess.CompletedProcess(cmd, rc, value, error)
+    assert deploy_mod._prior_writer_exited(123, 'birth', runner) is exited
+
+
+@pytest.mark.parametrize('fault', ['pid', 'birth', 'uuid', 'malformed', 'missing', 'mixed', 'rotated'])
+def test_process_identity_bad_proofs_still_refuse(fault, tmp_path):
+    identity = {'pid': 123, 'start': 'Tue Nov 3 12:00:00 2026',
+                'boot_uuid': '00000000-0000-4000-8000-000000000001'}
+    def line(value):
+        return 'generation=' + json.dumps(value) + ' chat_streamd_v2 listening on hostx:1234\n'
+    left, right = line(identity), line(identity)
+    expected_pid, expected_start = 123, identity['start']
+    if fault == 'pid': expected_pid = 124
+    elif fault == 'birth': expected_start = 'Tue Nov 3 12:01:00 2026'
+    elif fault == 'uuid': right = line({**identity, 'boot_uuid': '00000000-0000-4000-8000-000000000002'})
+    elif fault == 'malformed': right = 'generation={} chat_streamd_v2 listening on hostx:1234\n'
+    elif fault == 'missing': right = 'no marker\n'
+    elif fault == 'mixed': right += line({**identity, 'pid': 124})
+    groups = []
+    for name, text in [('out', left), ('err', right)]:
+        path = tmp_path / name
+        path.write_text(text)
+        groups.append([deploy_mod.freeze(path)])
+    if fault == 'rotated':
+        path.rename(tmp_path / 'old')
+        path.write_text(right)
+    from deploy.packet.log_scan import IncompleteScan
+    with pytest.raises((deploy_mod.AttributionAmbiguous, IncompleteScan)):
+        deploy_mod.generation_ranges(groups, expected_pid, expected_start)

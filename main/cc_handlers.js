@@ -216,11 +216,20 @@ function createCcHandlers({
     });
     target.handle('chat-stream:send', (_event, host, sessionName, text, requestId, optimisticId, attachments, reply = {}) =>
       command(async () => {
-        const receipt = await chatStreamClient.sendMessage({ host, sessionName, streamId: reply?.stream_id, text, requestId, optimisticId, attachments, meta: reply?.meta, replyToMessageId: reply?.reply_to_message_id, replyToQuestionId: reply?.reply_to_question_id, urgent: reply?.urgent });
+        // Operator IPC always uses ordinary intake, including requests from stale tabs.
+        // Intentional agent/CLI/wake urgency remains below this producer boundary.
+        if (reply?.urgent === true) console.info('[send_now]', {
+          subsystem: 'send_now', bug_ref: 'send_now_interrupt_loss_2026_10_28',
+          origin: 'operator_ipc', action: 'drop_urgency', route: 'ordinary_intake', cancel_dispatches: 0,
+          request_hash: require('node:crypto').createHash('sha256').update(String(requestId || '')).digest('hex').slice(0, 16),
+        });
+        const receipt = await chatStreamClient.sendMessage({ host, sessionName, streamId: reply?.stream_id, text, requestId, optimisticId, attachments, meta: reply?.meta, replyToMessageId: reply?.reply_to_message_id, replyToQuestionId: reply?.reply_to_question_id });
         return { ...receipt, ok: receipt.delivery === 'landed' || receipt.action_committed === true,
           ...(receipt.delivery === 'not_landed' && !receipt.action_committed ? { error: receipt.reason || 'Message was not delivered' } : {}) };
       }));
     target.handle('chat-stream:request-stream-events', (_event, args) => command(() => chatStreamClient.requestStreamEvents(args)));
+    target.handle('chat-stream:queued-send-now', (_event, host, sessionName, originalRequestId, optimisticId, expectedSessionGeneration) =>
+      command(() => chatStreamClient.queuedSendNow({ host, sessionName, originalRequestId, optimisticId, expectedSessionGeneration })));
     target.handle('chat-stream:interrupt', (_event, host, sessionName, expectedSessionGeneration) =>
       command(() => chatStreamClient.interruptMessage({ host, sessionName, expectedSessionGeneration })));
     target.handle('chat-stream:dismiss-question', (_event, host, sessionName, payload = {}) =>
@@ -255,6 +264,16 @@ function createCcHandlers({
       try { return { ...(await chatStreamClient.transcribeBlob(payload || {})), ok: true }; }
       catch (error) { return { ok: false, error_code: error?.error_code || error?.code || normalizeChatStreamError(error) }; }
     });
+    for (const [channel, call] of [
+      ['chat-stream:outbound-commit', payload => chatStreamClient.outboundCommit(payload || {})],
+      ['chat-stream:outbound-get', operationId => chatStreamClient.outboundGet(operationId)],
+      ['chat-stream:outbound-cancel', operationId => chatStreamClient.outboundCancel(operationId)],
+    ]) {
+      target.handle(channel, async (_event, arg) => {
+        try { return { ...(await call(arg)), ok: true }; }
+        catch (error) { return { ok: false, error_code: error?.error_code || error?.code || normalizeChatStreamError(error) }; }
+      });
+    }
     target.handle('chat-stream:fetch-blob', (_event, blobSha) => fetchBlobReply(chatStreamClient, blobSha));
 
     registerAssetIpcHandlers(target, chatStreamClient, normalizeChatStreamError, assetPopouts);

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from store_host_transfer import effective_ruling
 import asyncio
+from contextlib import nullcontext
 import hashlib
 import json
 import logging
@@ -16,9 +17,10 @@ import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
-from store_assistant_binding import _seat_conn
+from store_assistant_binding import _binding_conn, _seat_conn
 from store_lifecycle_authority import MAX_REASON, scrub
 from store_watch_wake import coalesce_notice_conn
 from _shared.spawn_objective import resolve_objective
@@ -47,7 +49,8 @@ CREATE TABLE IF NOT EXISTS v2_assistant_lane_rulings (
     ruling_key TEXT,
     ruling_digest TEXT,
     outcome_json TEXT,
-    mirror_sent INTEGER NOT NULL DEFAULT 0
+    mirror_sent INTEGER NOT NULL DEFAULT 0,
+    covered INTEGER NOT NULL DEFAULT 0
 )
 """
 ASSISTANT_LANE_OWNERSHIP_DDL = """
@@ -74,8 +77,8 @@ CREATE TABLE IF NOT EXISTS v2_assistant_lane_ruling_audit (
 """
 
 _STREAM_RE = re.compile(r"^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$")
-_ACTION_KINDS = {"spawn", "session_close", "composite_admit", "composite_close"}
-_TERMINAL = {"done", "denied", "revised", "approved_but_not_closed", "release_blocked"}
+_ACTION_KINDS = {"spawn", "send", "session_close", "composite_admit", "composite_close", "question"}
+_TERMINAL = {"done", "denied", "revised", "approved_but_not_closed", "release_blocked", "withdrawn"}
 #: Reasons the daemon itself records when a request leaves `pending` without a ruling.
 _UNRULED_REASONS = ("deadline", "authority_unavailable", "authority_disabled")
 #: kv record of the authority loss already told to the front desk.
@@ -90,6 +93,9 @@ def _compact_outcome(outcome: Any) -> dict[str, Any] | None:
     fields = ("type", "ok", "state", "stream_id", "error", "error_code", "reason",
               "already_closed", "admitted_count", "admitted_scope", "admitted_set_authoritative")
     compact = {key: outcome[key] for key in fields if key in outcome}
+    if outcome.get("type") == "send.result":
+        compact.update({key: outcome[key] for key in ("delivery", "receipt_id", "request_id", "reconcile")
+                        if key in outcome})
     if isinstance(outcome.get("admitted_sessions"), list):
         compact["admitted_sessions"] = [
             seat if isinstance(seat, str) else seat["stream_id"]
@@ -111,6 +117,42 @@ def _canonical(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode()).hexdigest()
+
+
+def _commission_digest(intent: dict[str, Any]) -> str:
+    excluded = {"request_id", "idempotency_key", "retry", "timeout", "stream_token",
+                "_auth_context", "_ruling_release", "_ruling_packet"}
+    return _digest({key: value for key, value in intent.items() if key not in excluded})
+
+
+def _question_digest(intent: dict[str, Any]) -> str:
+    from notify import Notify
+    material = Notify._prompt_notice_material(intent["envelope"], intent["actions"])
+    return _commission_digest({**material, "severity": intent["severity"]})
+
+
+def _work_item(spec_id: str) -> tuple[dict[str, Any], str | None]:
+    item = {"spec_id": spec_id, "title": "", "status": "", "lane_ids": [],
+            "agent_authored_goal": "", "origin": None, "origin_missing": True}
+    try:
+        from _shared.spec_reader import SpecReader
+        status, _, _, text = SpecReader(None).read(spec_id)
+        item["status"] = status
+        match = re.search(r"(?m)^title:\s*['\"]?(.+?)['\"]?\s*$", text)
+        if match:
+            item["title"] = match.group(1)
+        goal = re.search(r"(?ims)^## Goal\s*\n(.*?)(?=^## |\Z)", text)
+        if goal:
+            item["agent_authored_goal"] = goal.group(1).strip()[:600]
+        tracking = re.search(r"(?ims)^## Tracking\s*\n(.*?)(?=^## |\Z)", text)
+        if tracking:
+            origin = re.search(r'(?im)^- Operator request(?: \([^\n)]*\))?: ["“]([^"”\n]*)["”]', tracking.group(1))
+            if origin:
+                item.update(origin=origin.group(1)[:600], origin_missing=False,
+                            origin_line=origin.group(0)[:600])
+        return item, None
+    except Exception as exc:
+        return item, type(exc).__name__
 
 
 def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -185,14 +227,61 @@ class AssistantLaneRulings:
         return {"state": "ready" if available else "unavailable", "source": source,
                 "stream_id": selected, "generation": generation}
 
-    async def configure(self, value: str, *, actor_stream_id: str, actor_generation: str) -> dict[str, Any]:
+    async def record_dead_shape(self, stream: str, generation: str, seat: dict, brief_file: str,
+                                *, recorded_by: str = '') -> None:
+        try:
+            digest = hashlib.sha256(Path(brief_file).read_bytes()).hexdigest()
+        except OSError as exc:
+            raise ValueError('assistant_authority_brief_unreadable') from exc
+        def op(conn):
+            with conn:
+                current = _seat_conn(conn, stream)
+                if current is None:
+                    raise ValueError('shape_row_unavailable')
+                if current.get('session_generation') != generation or self._authority_loss_evidence(current) is None:
+                    raise ValueError('shape_generation_conflict')
+                account = current.get('account_binding')
+                if isinstance(account, str):
+                    try:
+                        account = json.loads(account)
+                    except ValueError:
+                        account = None
+                shape = {'stream_id': stream, 'generation': generation, 'provider': current.get('provider'),
+                    'model': current.get('effective_model') or current.get('requested_model'),
+                    'effort': current.get('effective_effort') or current.get('requested_effort'),
+                    'role': current.get('role'), 'visibility': current.get('visibility'),
+                    'spec_id': current.get('spec_id'), 'account_observed':
+                    ({k: account.get(k) for k in ('alias','provider','host')} if isinstance(account, dict) else None),
+                    'parent_mode': 'assistant', 'brief_path': brief_file, 'brief_sha256': digest,
+                    'recorded_at': time.time(), 'recorded_by': recorded_by}
+                conn.execute('INSERT OR REPLACE INTO kv(k,v) VALUES(?,?)', ('assistant.authority.shape', _canonical(shape)))
+        await self.store.submit(op)
+
+    async def configure(self, value: str, *, actor_stream_id: str, actor_generation: str,
+                        brief_file: str | None = None, service: object = None,
+                        expected_old: tuple[str, str] | None = None,
+                        frozen_brief_sha: str | None = None,
+                        restore_episode: dict | None = None,
+                        expected_primary: tuple[str, str] | None = None) -> dict[str, Any]:
+        from assistant_authority_restore import SERVICE_CAPABILITY
+        is_service = service is SERVICE_CAPABILITY
         composite = self._composite()
-        if composite is None or (actor_stream_id, actor_generation) != (
+        if composite is None or (not is_service and (actor_stream_id, actor_generation) != (
             composite.config.direct_primary_stream_id, composite.config.direct_primary_generation,
-        ):
+        )):
             raise ValueError("assistant_authority_config_unauthorized")
         if value != "disabled" and value and not _STREAM_RE.fullmatch(value):
             raise ValueError("assistant_authority_stream_id_invalid")
+        if value != "disabled" and not brief_file:
+            raise ValueError("assistant_authority_brief_required: agent-orch assistant authority --set <stream_id> --brief-file <path>")
+        brief_sha = ""
+        if is_service and frozen_brief_sha:
+            brief_sha = frozen_brief_sha
+        elif brief_file:
+            try:
+                brief_sha = hashlib.sha256(Path(brief_file).read_bytes()).hexdigest()
+            except OSError as exc:
+                raise ValueError("assistant_authority_brief_unreadable") from exc
         if value and value != "disabled":
             host, _, name = value.partition(":")
             seat = await self.store.fetch_session(host, name)
@@ -200,11 +289,94 @@ class AssistantLaneRulings:
                     or seat.get("pane_status") != "pane_alive"
                     or not seat.get("session_generation")):
                 raise ValueError("assistant_authority_target_unavailable")
+        disabled_rows = []
         async with self._authority_lock:
-            await self.store.put("assistant.authority.stream_id", value)
+            def configure_conn(conn: sqlite3.Connection) -> None:
+                with conn:
+                    if is_service:
+                        primary = _binding_conn(conn, composite._env_binding(), name=composite.env_config.name,
+                                                include_target=False)
+                        if not expected_primary or (primary.get('stream_id'), primary.get('generation')) != expected_primary:
+                            raise ValueError('assistant_authority_primary_changed')
+                        current = conn.execute("SELECT v FROM kv WHERE k='assistant.authority.stream_id'").fetchone()
+                        selected = current[0] if current else composite.env_config.authority_stream_id
+                        old = _seat_conn(conn, expected_old[0]) if expected_old else None
+                        if (not expected_old or selected != expected_old[0] or
+                            (old and (old.get('session_generation') != expected_old[1] or
+                                      self._authority_loss_evidence(old) is None))):
+                            raise ValueError('binding_moved')
+                    elif conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='v2_authority_restore_episode'").fetchone():
+                        conn.execute("UPDATE v2_authority_restore_episode SET state='superseded',last_error='binding_moved',updated_at=? WHERE state IN ('pending','spawning','unresolved','exhausted')", (time.time(),))
+                    conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
+                                 ("assistant.authority.stream_id", value))
+                    if value and value != "disabled" and value != composite.config.direct_primary_stream_id:
+                        authority = _seat_conn(conn, value)
+                        if (authority is None or authority.get("status") != "open"
+                                or authority.get("pane_status") != "pane_alive" or not authority.get("session_generation")):
+                            raise ValueError("assistant_authority_target_unavailable")
+                        generation = authority["session_generation"]
+                        if is_service and generation != actor_generation:
+                            raise ValueError('assistant_authority_target_generation_changed')
+                        account = authority.get("account_binding")
+                        if isinstance(account, str):
+                            try:
+                                account = json.loads(account)
+                            except ValueError:
+                                account = None
+                        observed = ({k: account.get(k) for k in ("alias", "provider", "host")}
+                                    if isinstance(account, dict) else None)
+                        shape = {"stream_id": value, "generation": generation,
+                                 "provider": authority.get("provider"),
+                                 "model": authority.get("effective_model") or authority.get("requested_model"),
+                                 "effort": authority.get("effective_effort") or authority.get("requested_effort"),
+                                 "role": authority.get("role"), "visibility": authority.get("visibility"),
+                                 "spec_id": authority.get("spec_id"), "account_observed": observed,
+                                 "parent_mode": "assistant", "brief_path": brief_file,
+                                 "brief_sha256": brief_sha, "recorded_at": time.time(),
+                                 "recorded_by": actor_stream_id}
+                        conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
+                                     ("assistant.authority.shape", _canonical(shape)))
+                        if is_service:
+                            if not restore_episode:
+                                raise ValueError('assistant_authority_restore_episode_required')
+                            episode_id, seq = restore_episode['episode_id'], restore_episode['attempt_seq']
+                            changed = conn.execute("UPDATE v2_authority_restore_episode SET state='restored',successor=?,last_error=NULL,updated_at=? WHERE episode_id=? AND attempt_seq=? AND state IN ('spawning','unresolved')",
+                                (value, time.time(), episode_id, seq)).rowcount
+                            if not changed:
+                                raise ValueError('assistant_authority_restore_episode_changed')
+                            conn.execute("INSERT INTO v2_authority_restore_audit(episode_id,attempt_seq,event,detail,created_at) VALUES(?,?,'adopted',?,?)",
+                                (episode_id, seq, _canonical({'account_binding': account, 'generation': generation}), time.time()))
+                            notice_id = f'authority-restore:authority_restored:{episode_id}'
+                            notice = dict(notice_id=notice_id, kind='assistant_lane_ruling_result', dedupe_key=notice_id,
+                                recipient_stream_id=composite.config.direct_primary_stream_id, tell_id=notice_id,
+                                source_stream_id=actor_stream_id, episode_id=None, created_at=None,
+                                body='[Assistant lane ruling] ' + _canonical({'event': 'authority_restored',
+                                    'old': expected_old[0], 'new': value, 'generation': generation, 'attempt_seq': seq}),
+                                metadata={'authority_generation': composite.config.direct_primary_generation})
+                            coalesce_notice_conn(conn, notice, None)
+                        rows = list(conn.execute("SELECT * FROM v2_assistant_lane_rulings WHERE covered=1 AND state='pending'"))
+                        for raw in rows:
+                            row = dict(raw)
+                            conn.execute("UPDATE v2_assistant_lane_rulings SET authority_stream_id=?,authority_generation=? WHERE ruling_request_id=?",
+                                         (value, generation, row["ruling_request_id"]))
+                            notice_id = f"assistant-lane-ruling:{row['ruling_request_id']}:{generation}"
+                            notice = dict(notice_id=notice_id, kind="assistant_lane_ruling_request", dedupe_key=notice_id,
+                                recipient_stream_id=value, tell_id=notice_id, source_stream_id=row["requester_stream_id"],
+                                episode_id=None, created_at=None, body=json.loads(row["intent_json"])["_ruling_packet"],
+                                metadata={"authority_generation": generation, "ruling_request_id": row["ruling_request_id"]})
+                            coalesce_notice_conn(conn, notice, None)
+                    elif value != "disabled":
+                        conn.execute("UPDATE v2_assistant_lane_rulings SET authority_stream_id='',authority_generation='' WHERE covered=1 AND state='pending'")
+            await self.store.submit(configure_conn)
             result = await self.binding()
             if result["state"] in {"disabled", "unconfigured", "same_primary"}:
-                await self._disable_pending()
+                disabled_rows = await self._disable_pending(include_covered=result["state"] == "disabled")
+        # Publication acquires the producer lifecycle lock; never wait for it
+        # while holding the authority lock needed by a fresh ask.
+        for request in disabled_rows:
+            await self._release(request)
+            if request["action"] != "question":
+                await self._notify_unruled(request)
         self._ensure_worker()
         return {"type": "assistant.authority.ok", **result}
 
@@ -214,21 +386,116 @@ class AssistantLaneRulings:
                 if key not in {"stream_token", "_auth_context", "_ruling_release",
                                "_ruling_report", "_ruling_report_waiver"}}
 
-    async def request_spawn(self, msg: dict[str, Any]) -> dict[str, Any] | None:
+    async def _known_covered(self, key: str, auth: dict[str, Any]) -> bool:
+        if not auth.get("token_verified"):
+            return False
+        row = await self.store.submit(lambda conn: conn.execute(
+            "SELECT requester_stream_id,requester_generation,covered FROM v2_assistant_lane_rulings WHERE request_key=?",
+            (key,)).fetchone())
+        return bool(row and row["covered"] and (row["requester_stream_id"], row["requester_generation"]) ==
+                    (auth.get("stream_id"), auth.get("session_generation")))
+
+    async def question_row(self, producer: str, generation: str, question_id: str) -> dict[str, Any] | None:
+        key = f"question:{producer}:{generation}:{question_id}"
+        return await self.store.submit(lambda conn: _row(conn.execute(
+            "SELECT * FROM v2_assistant_lane_rulings WHERE request_key=?", (key,)).fetchone()))
+
+    async def question_row_by_id(self, question_id: str) -> dict[str, Any] | None:
+        return await self.store.submit(lambda conn: _row(conn.execute(
+            "SELECT * FROM v2_assistant_lane_rulings WHERE action='question' AND json_extract(intent_json,'$.envelope.question_id')=? ORDER BY created_at DESC LIMIT 1", (question_id,)).fetchone()))
+
+    async def withdraw_question(self, producer: str, generation: str, question_id: str) -> dict[str, Any] | None:
+        key = f"question:{producer}:{generation}:{question_id}"
+        def op(conn: sqlite3.Connection) -> dict[str, Any] | None:
+            with conn:
+                row = conn.execute("SELECT * FROM v2_assistant_lane_rulings WHERE request_key=?", (key,)).fetchone()
+                if row is None:
+                    return None
+                conn.execute("UPDATE v2_assistant_lane_rulings SET state='withdrawn' WHERE request_key=? AND state='pending'", (key,))
+                changed = conn.execute("SELECT changes()").fetchone()[0]
+                result = dict(conn.execute("SELECT * FROM v2_assistant_lane_rulings WHERE request_key=?", (key,)).fetchone())
+                if changed:
+                    self._audit_conn(conn, result["ruling_request_id"], "withdrawn", producer, generation)
+                    rid = result["ruling_request_id"]
+                    notice_id = "assistant-lane-ruling-withdrawn:" + rid
+                    if result["authority_stream_id"] and result["authority_generation"]:
+                        coalesce_notice_conn(conn, dict(notice_id=notice_id, kind="assistant_lane_ruling_result",
+                            dedupe_key=notice_id, recipient_stream_id=result["authority_stream_id"], tell_id=notice_id,
+                            source_stream_id=producer, episode_id=None, created_at=None,
+                            body=f"[Assistant lane ruling] {rid} withdrawn", metadata={"authority_generation": result["authority_generation"], "ruling_request_id": rid}), None)
+                result["_withdrawn_now"] = bool(changed)
+                return result
+        row = await self.store.submit(op)
+        return row
+
+    async def request_question(self, frozen: dict[str, Any], auth: dict[str, Any], *, spec_omitted: bool) -> dict[str, Any] | None:
         composite = self._composite()
-        if composite is None or not composite.enabled or not composite.config.direct_primary:
+        producer = str(auth.get("stream_id") or "")
+        generation = str(auth.get("session_generation") or "")
+        qid = str(frozen["envelope"].get("question_id") or "")
+        known = await self.question_row(producer, generation, qid)
+        if not auth.get("token_verified") or (not known and (
+                composite is None or not composite.enabled or not composite.config.direct_primary
+                or (producer, generation) != (composite.config.direct_primary_stream_id,
+                                               composite.config.direct_primary_generation))):
             return None
+        if known and spec_omitted:
+            original = json.loads(known["intent_json"])["envelope"]
+            frozen = {**frozen, "envelope": {**frozen["envelope"], "spec_id": original.get("spec_id")}}
+        spec = str(frozen["envelope"].get("spec_id") or "")
+        item, error = _work_item(spec) if spec else (None, "no_spec")
+        if item is not None:
+            item["lane_ids"] = [lane["lane_id"] for lane in await self.store.open_lanes_for_spec(spec)]
+        questions = await self.server.notify._db.call("list_agent_questions", producer_stream_id=producer)
+        from datetime import datetime, timezone, timedelta
+        threshold = datetime.now(timezone.utc) - timedelta(hours=24)
+        recent = {"open": sum(q.get("state") == "open" for q in questions),
+                  "last_24h": sum(datetime.fromisoformat(q["created_at"].replace("Z", "+00:00")) >= threshold for q in questions)}
+        request = await self._create(action="question", key=f"question:{producer}:{generation}:{qid}",
+            intent=frozen, requester=producer, requester_generation=generation, binding=await self.binding(),
+            target=producer, target_generation="", covered=True, work_item=item, work_item_error=error,
+            recent_cards=recent)
+        if request["state"] == "bypassed":
+            # prompt.ask holds the producer lifecycle lock throughout admission.
+            await self._release(request, lifecycle_locked=True)
+            request = await self._fetch(request["ruling_request_id"])
+        elif request["state"] == "pending":
+            await self._enqueue_notice(request)
+            self._ensure_worker()
+        return self.question_reply(request)
+
+    @staticmethod
+    def question_reply(row: dict[str, Any]) -> dict[str, Any]:
+        state = row["state"]
+        rid = row["ruling_request_id"]
+        if state == "done" and row.get("outcome_json"):
+            return json.loads(row["outcome_json"])
+        if state in {"pending", "approved", "bypassed", "unruled_disabled"}:
+            result = {"type": "prompt.ask.held", "ruling_request_id": rid, "ruling_state": state}
+            if state in {"bypassed", "unruled_disabled"}:
+                result["publishing"] = True
+            return result
+        result = {"type": "prompt.ask.ruled", "ruling_request_id": rid, "ruling_state": state,
+                  "reason": row.get("reason"), "conditions": row.get("conditions")}
+        if state == "release_blocked":
+            result["error"] = json.loads(row.get("outcome_json") or "{}")
+        return result
+
+    async def request_spawn(self, msg: dict[str, Any]) -> dict[str, Any] | None:
+        from spawnctl import new_work_commission
+        composite = self._composite()
         auth = msg.get("_auth_context") or {}
-        if (not auth.get("token_verified") or msg.get("handoff")
-                or str(msg.get("role") or "").lower() not in {"lead", "nexus"}
+        key = str(msg.get("idempotency_key") or msg.get("request_id") or "")
+        known = await self._known_covered("spawn:" + key, auth) if key else False
+        if not known and (composite is None or not composite.enabled or not composite.config.direct_primary
+                or not new_work_commission(msg, resume=msg.get("resume_session_id") is not None)
+                or str(msg.get("role") or "").lower() == "qa"
                 or (auth.get("stream_id"), auth.get("session_generation")) != (
                     composite.config.direct_primary_stream_id,
                     composite.config.direct_primary_generation,
                 )):
             return None
         binding = await self.binding()
-        if binding["state"] in {"disabled", "unconfigured", "same_primary"}:
-            return None
         message = self._safe_intent(msg)
         if not str(message.get("objective") or "").strip():
             brief_reader = getattr(self.server.spawnctl, "_brief_from_message", None)
@@ -242,7 +509,6 @@ class AssistantLaneRulings:
                 raise ValueError(error)
             message["objective"] = objective
             message["objective_source"] = source
-        key = str(message.get("idempotency_key") or message.get("request_id") or "")
         if not key:
             raise ValueError("assistant_ruling_spawn_key_required")
         # A CLI retry carries a fresh RPC request ID. Keep the daemon intent
@@ -252,22 +518,33 @@ class AssistantLaneRulings:
             message["session_name"] = "v2-" + hashlib.sha256(key.encode()).hexdigest()[:12]
         target = f"{message.get('host') or self.server.local_host}:{message['session_name']}"
         # R4: item (1)'s task link is checked when a new ruling request is admitted, not at release.
-        known = await self.store.submit(lambda conn: conn.execute(
-            "SELECT 1 FROM v2_assistant_lane_rulings WHERE request_key=?", ("spawn:" + key,)).fetchone())
+        if binding["state"] == "disabled" and not known:
+            return None
         spawnctl = self.server.spawnctl
-        if known is None and hasattr(spawnctl, "_work_link_refusal"):
-            from spawnctl import new_work_commission
-            if new_work_commission(msg, resume=False):
+        spec_id = str(message.get("spec_id") or "")
+        if not known:
+            if hasattr(spawnctl, "_work_link_refusal"):
                 host, name = target.split(":", 1)
-                authenticated = {**message, "_auth_context": auth}
-                refusal = await spawnctl._work_link_refusal(
-                    authenticated, await spawnctl._resolve_spec_binding(authenticated, host, name))
+                authenticated = {**message, "_auth_context": {**auth, "covered_admission": True}}
+                spec_binding = await spawnctl._resolve_spec_binding(authenticated, host, name)
+                spec_id = str(spec_binding.get("assigned_spec_id") or "")
+                if not spec_id:
+                    from sessions import VerbError
+                    raise VerbError("work_assignment_required", f"{auth['stream_id']} requires an assigned spec")
+                refusal = await spawnctl._work_link_refusal(authenticated, spec_binding)
                 if refusal is not None:
                     raise refusal
+            elif not spec_id:
+                from sessions import VerbError
+                raise VerbError("work_assignment_required", f"{auth['stream_id']} requires an assigned spec")
+        item, item_error = _work_item(spec_id)
+        if spec_id and hasattr(self.store, "open_lanes_for_spec"):
+            item["lane_ids"] = [lane["lane_id"] for lane in await self.store.open_lanes_for_spec(spec_id)]
         request = await self._create(
             action="spawn", key="spawn:" + key, intent=message,
             requester=str(auth["stream_id"]), requester_generation=str(auth["session_generation"]),
-            binding=binding, target=target, target_generation="",
+            binding=binding, target=target, target_generation="", covered=True,
+            work_item=item, work_item_error=item_error,
         )
         if request["state"] == "bypassed":
             return None
@@ -277,19 +554,73 @@ class AssistantLaneRulings:
         if request["state"] in {"denied", "revised", "release_blocked"}:
             return {"type": "spawn.ruling_refused", "ruling_request_id": request["ruling_request_id"],
                     "state": request["state"], "reason": request["reason"]}
-        if request["_binding_state"] == "unavailable":
-            await self._expire(request["ruling_request_id"], "authority_unavailable")
-            completed = await self._fetch(request["ruling_request_id"])
-            if completed and completed["state"] == "done" and completed["outcome_json"]:
-                return {**json.loads(completed["outcome_json"]), "ruling_request_id": request["ruling_request_id"],
-                        "unruled": True}
-            return {"type": "spawn.ruling_release_blocked", "ruling_request_id": request["ruling_request_id"],
-                    "state": completed["state"] if completed else "unknown"}
         await self._enqueue_notice(request)
         self._ensure_worker()
         return {"type": "spawn.pending_ruling", "ruling_request_id": request["ruling_request_id"],
                 "state": request["state"], "stream_id": target,
                 "spawn_request_id": message.get("request_id")}
+
+    async def request_send(self, msg: dict[str, Any], *, target: str) -> dict[str, Any] | None:
+        from comms import validate_send_attachments, sanitize_injectable
+        from sessions import VerbError
+        from store import effective_assignment
+        composite = self._composite()
+        auth = msg.get("_auth_context") or {}
+        host, _, name = target.partition(":")
+        seat = await self.store.fetch_session(host, name)
+        if not seat:
+            return None
+        generation = str(seat.get("session_generation") or "")
+        key = f"send:{target}:{generation}:{msg.get('msg_id', 0)}"
+        known = await self._known_covered(key, auth)
+        policy = getattr(self.server.sessions, "assistant", None)
+        if not known and (composite is None or not composite.enabled or not composite.config.direct_primary
+                or auth.get("ruled_release") or msg.get("qa_spec_id") is not None
+                or not auth.get("token_verified") or seat.get("status") != "open"
+                or target == auth.get("stream_id") or (policy is not None and policy.protects(seat))
+                or (auth.get("stream_id"), auth.get("session_generation")) != (
+                    composite.config.direct_primary_stream_id, composite.config.direct_primary_generation)):
+            return None
+        binding = await self.binding()
+        if binding["state"] == "disabled" and not known:
+            return None
+        spec_id = effective_assignment(seat) if not known else None
+        if not known and not spec_id:
+            raise VerbError("work_assignment_required", f"{target} requires an assigned spec")
+        if "text" in msg and "message" in msg and msg["text"] != msg["message"]:
+            raise VerbError("assistant_ruling_send_body_ambiguous", "assistant_ruling_send_body_ambiguous")
+        body = msg.get("message") if "message" in msg else msg.get("text")
+        body = "" if body is None else str(body)
+        if msg.get("sanitize"):
+            body = sanitize_injectable(body)
+        raw_attachments = msg.get("attachments")
+        try:
+            attachments = validate_send_attachments(raw_attachments) if raw_attachments else []
+        except ValueError as exc:
+            raise VerbError("attachment_invalid", str(exc)) from exc
+        intent = {"to_stream_id": target, "target_generation": generation, "msg_id": msg.get("msg_id", 0),
+                  "body": body, "inbox": msg.get("inbox"), "attachments": attachments,
+                  "from_stream_id": str(msg.get("from_stream_id") or auth["stream_id"])}
+        item, error = _work_item(str(spec_id)) if spec_id else (None, None)
+        if item is not None:
+            item["lane_ids"] = [lane["lane_id"] for lane in await self.store.open_lanes_for_spec(spec_id)]
+        request = await self._create(action="send", key=key,
+            intent=intent, requester=str(auth["stream_id"]), requester_generation=str(auth["session_generation"]),
+            binding=binding, target=target, target_generation=generation, covered=True, work_item=item,
+            work_item_error=error)
+        if request["state"] == "bypassed":
+            return None
+        rid = request["ruling_request_id"]
+        if request["state"] in {"approved", "done"} and request.get("outcome_json"):
+            return {**json.loads(request["outcome_json"]), "ruling_request_id": rid}
+        if request["state"] in {"denied", "revised", "release_blocked"}:
+            return {"type": "send.ruling_refused", "ruling_request_id": rid,
+                    "state": request["state"], "reason": request["reason"]}
+        await self._enqueue_notice(request)
+        self._ensure_worker()
+        return {"type": "send.result", "delivery": "not_landed", "queued_for_redelivery": True,
+                "submission_confirmed": False, "action_committed": True, "reason": "pending_ruling",
+                "ruling_request_id": rid}
 
     async def request_close(self, msg: dict[str, Any], *, target_stream_id: str,
                             target_generation: str, auth: dict[str, Any]) -> dict[str, Any] | None:
@@ -455,12 +786,14 @@ class AssistantLaneRulings:
     async def _create(
         self, *, action: str, key: str, intent: dict[str, Any], requester: str,
         requester_generation: str, binding: dict[str, Any], target: str,
-        target_generation: str, linked_from: str = "",
+        target_generation: str, linked_from: str = "", covered: bool = False,
+        work_item: dict[str, Any] | None = None, work_item_error: str | None = None,
+        recent_cards: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         if action not in _ACTION_KINDS:
             raise ValueError("assistant_ruling_action_invalid")
         request_id = "ruling-" + uuid.uuid4().hex
-        intent_digest = _digest(intent)
+        intent_digest = _question_digest(intent) if action == "question" else (_commission_digest(intent) if covered else _digest(intent))
         now = time.time()
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
             with conn:
@@ -471,9 +804,11 @@ class AssistantLaneRulings:
                     if (existing["intent_digest"] != intent_digest
                             or existing["requester_stream_id"] != requester
                             or existing["requester_generation"] != requester_generation):
-                        raise ValueError("assistant_ruling_request_key_conflict")
+                        raise ValueError("assistant_ruling_intent_changed" if covered else "assistant_ruling_request_key_conflict")
                     return existing
-                if not linked_from:
+                if action == "question":
+                    prior_link = ""
+                elif not linked_from:
                     prior = conn.execute(
                         "SELECT ruling_request_id FROM v2_assistant_lane_rulings WHERE action=? "
                         "AND target_stream_id=? AND requester_stream_id=? AND state='revised' "
@@ -482,14 +817,43 @@ class AssistantLaneRulings:
                     prior_link = str(prior[0]) if prior else ""
                 else:
                     prior_link = linked_from
+                stored_intent = dict(intent)
+                if covered:
+                    packet = {"ruling_request_id": request_id, "action": action, "target": target,
+                              "deadline": now + self.sla_s, "intent_digest": intent_digest,
+                              "requester": requester, "covered": True, "work_item": work_item}
+                    if work_item_error:
+                        packet["work_item_error"] = work_item_error
+                    if action == "send":
+                        packet.update(target_generation=target_generation, msg_id=intent.get("msg_id"),
+                                      prompt_excerpt=str(intent.get("body") or "")[:1600],
+                                      attachment_count=len(intent.get("attachments") or []))
+                    elif action == "question":
+                        envelope = intent["envelope"]
+                        packet["question"] = {key: envelope.get(key) for key in (
+                            "question_id", "title", "body", "context", "response_mode", "options",
+                            "allow_custom", "ttl_seconds", "spec_id")}
+                        packet["question"]["severity"] = intent["severity"]
+                        packet["recent_cards"] = recent_cards
+                    else:
+                        packet["brief"] = {key: intent[key] for key in
+                            ("objective", "provider", "model", "effort", "spec_id", "role", "budget", "eta") if key in intent}
+                        packet["brief"]["acceptance"] = _acceptance_brief(intent)
+                        if intent.get("initial_prompt"):
+                            packet["brief"]["brief_excerpt"] = str(intent["initial_prompt"])[:1600]
+                    stored_intent["_ruling_packet"] = "[Assistant lane ruling request]\n" + _canonical(packet)
                 conn.execute(
                     "INSERT INTO v2_assistant_lane_rulings (ruling_request_id,request_key,action,intent_digest,intent_json,"
                     "requester_stream_id,requester_generation,authority_stream_id,authority_generation,target_stream_id,"
-                    "target_generation,linked_from,created_at,deadline,state) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (request_id, key, action, intent_digest, _canonical(intent), requester,
+                    "target_generation,linked_from,created_at,deadline,state,covered) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (request_id, key, action, intent_digest, _canonical(stored_intent), requester,
                      requester_generation, binding["stream_id"], binding["generation"], target,
-                     target_generation, prior_link or None, now, now + self.sla_s, "pending"),
+                     target_generation, prior_link or None, now, now + self.sla_s,
+                     "bypassed" if action == "question" and binding["state"] in {"disabled", "unconfigured"} else "pending", int(covered)),
                 )
+                if action == "question" and binding["state"] in {"disabled", "unconfigured"}:
+                    conn.execute("UPDATE v2_assistant_lane_rulings SET reason='bypassed' WHERE ruling_request_id=?", (request_id,))
+                    self._audit_conn(conn, request_id, "bypassed", requester, requester_generation)
                 self._audit_conn(conn, request_id, "request", requester, requester_generation, action)
                 if isinstance(intent.get("_ruling_report_waiver"), dict):
                     self._audit_conn(conn, request_id, "report_prerequisite_waived", requester,
@@ -499,8 +863,13 @@ class AssistantLaneRulings:
                 ).fetchone())
         async with self._authority_lock:
             binding = await self.binding()
-            if binding["state"] in {"disabled", "unconfigured", "same_primary"}:
-                return {"state": "bypassed"}
+            if binding["state"] == "disabled" or (not covered and binding["state"] in {"unconfigured", "same_primary"}):
+                existing = await self.store.submit(lambda conn: conn.execute(
+                    "SELECT 1 FROM v2_assistant_lane_rulings WHERE request_key=?", (key,)).fetchone())
+                if existing is None and action != "question":
+                    return {"state": "bypassed"}
+            if covered and binding["state"] in {"unconfigured", "same_primary"}:
+                binding = {**binding, "stream_id": "", "generation": ""}
             request = await self.store.submit(op)
             request["_binding_state"] = binding["state"]
             return request
@@ -518,7 +887,13 @@ class AssistantLaneRulings:
         ).fetchone()))
         if row is None:
             return None
+        question_id = json.loads(row["intent_json"]).get("envelope", {}).get("question_id") if row["action"] == "question" else None
+        held = await self.store.submit(lambda conn: [dict(r) for r in conn.execute(
+            "SELECT ruling_request_id,state,intent_json FROM v2_assistant_lane_rulings WHERE action='question' AND requester_stream_id=? AND state IN ('pending','approved','unruled_disabled','bypassed') ORDER BY created_at DESC", (target_stream_id,))])
         return {"ruling_request_id": row["ruling_request_id"], "action": row["action"],
+                "held_questions": [{"ruling_request_id": q["ruling_request_id"], "state": q["state"],
+                                    "question_id": json.loads(q["intent_json"])["envelope"]["question_id"]} for q in held],
+                **({"question_id": question_id} if question_id else {}),
                 "state": row["state"], "ruling": row["ruling"], "reason": row["reason"],
                 "authority_stream_id": row["authority_stream_id"],
                 "authority_generation": row["authority_generation"],
@@ -556,6 +931,17 @@ class AssistantLaneRulings:
 
     async def _enqueue_notice(self, request: dict[str, Any]) -> None:
         rid = request["ruling_request_id"]
+        if request.get("covered"):
+            if not request.get("authority_stream_id") or not request.get("authority_generation"):
+                return
+            notice_id = f"assistant-lane-ruling:{rid}:{request['authority_generation']}"
+            body = json.loads(request["intent_json"])["_ruling_packet"]
+            await self.store.enqueue_outbound_notice(
+                notice_id=notice_id, kind="assistant_lane_ruling_request", dedupe_key=notice_id,
+                recipient_stream_id=request["authority_stream_id"], tell_id=notice_id,
+                source_stream_id=request["requester_stream_id"], body=body,
+                metadata={"authority_generation": request["authority_generation"], "ruling_request_id": rid})
+            return
         # The ruling intent is immutable. Its notice already owns the original
         # body/source and delivery history; transfer projects only undelivered
         # recipient custody. Rebuilding from an effective ruling would rewrite
@@ -615,15 +1001,16 @@ class AssistantLaneRulings:
                 if (advisor is None or advisor.get("status") != "open"
                         or advisor.get("session_generation") != actor_generation):
                     raise ValueError("assistant_ruling_authority_unavailable")
-                if _digest(json.loads(request["intent_json"])) != request["intent_digest"]:
+                intent = json.loads(request["intent_json"])
+                if (_question_digest(intent) if request["action"] == "question" else (_commission_digest(intent) if request.get("covered") else _digest(intent))) != request["intent_digest"]:
                     raise ValueError("assistant_ruling_intent_corrupt")
                 if request["ruling_key"]:
                     if request["ruling_key"] == key and request["ruling_digest"] == digest:
                         return {**request, "duplicate": True}
                     raise ValueError("assistant_ruling_conflict")
-                if request["state"] != "pending" or now >= request["deadline"]:
+                if request["state"] != "pending" or (not request.get("covered") and now >= request["deadline"]):
                     raise ValueError("assistant_ruling_stale")
-                if request["target_generation"]:
+                if request["target_generation"] and (not request.get("covered") or ruling == "approve"):
                     target = _seat_conn(conn, request["target_stream_id"])
                     if target is None or target.get("session_generation") != request["target_generation"]:
                         raise ValueError("assistant_ruling_target_generation_changed")
@@ -638,7 +1025,13 @@ class AssistantLaneRulings:
                     "SELECT * FROM v2_assistant_lane_rulings WHERE ruling_request_id=?", (rid,)
                 ).fetchone())
         try:
-            request = await self.store.submit(op)
+            async with self._authority_lock:
+                row = await self._fetch(rid)
+                if row is not None and row.get("covered"):
+                    binding = await self.binding()
+                    if (actor_stream_id, actor_generation) != (binding["stream_id"], binding["generation"]):
+                        raise ValueError("assistant_ruling_authority_unverified")
+                request = await self.store.submit(op)
         except ValueError as exc:
             await self._audit(rid, "refused", actor_stream_id, actor_generation, str(exc))
             raise
@@ -682,7 +1075,7 @@ class AssistantLaneRulings:
             with conn:
                 conn.execute(
                     "UPDATE v2_assistant_lane_rulings SET state='unruled',reason=? "
-                    "WHERE ruling_request_id=? AND state='pending'", (reason, rid),
+                    "WHERE ruling_request_id=? AND state='pending' AND covered=0", (reason, rid),
                 )
                 if conn.execute("SELECT changes()").fetchone()[0]:
                     actor = conn.execute("SELECT authority_stream_id,authority_generation FROM "
@@ -728,13 +1121,17 @@ class AssistantLaneRulings:
         rid = request["ruling_request_id"]
         line = (f"Astra unavailable; {outcome}: {request['action']} "
                 f"{request['target_stream_id']} ({rid}; {request.get('reason') or 'deadline'}).")
+        # ISO like every other composite row: the preview contract rejects a numeric timestamp.
+        now = time.time()
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + f".{int(now % 1 * 1000):03d}Z"
         event = {"stream_id": composite.config.stream_id, "provider": "composite",
                  "kind": "ASSIST_TEXT", "text": line, "publish_kind": "status",
-                 "timestamp": time.time(), "attachments": [],
+                 "timestamp": stamp, "attachments": [],
                  "raw": {"assistant_composite": True, "ruling_request_id": rid}}
         event_id = await self.store.append_session_event(
             composite.config.stream_id, event, identity="ruling-unruled:" + rid, limit=100,
         )
+        inserted = event_id is not None
         if event_id is None:
             previous = await self.store.submit(lambda conn: conn.execute(
                 "SELECT event_id,event_json FROM session_event_tail WHERE identity=?",
@@ -744,6 +1141,8 @@ class AssistantLaneRulings:
                 raise ValueError("assistant_ruling_mirror_receipt_missing")
             event_id = int(previous["event_id"])
             event = json.loads(previous["event_json"])
+        if inserted:
+            composite._advance_summary({**event, "daemon_seq": event_id})
         if self.server.broadcast is not None:
             await self.server.broadcast({"type": "chat.event", "event": {**event, "daemon_seq": event_id}})
         def mark_mirrored(conn: sqlite3.Connection) -> None:
@@ -805,15 +1204,48 @@ class AssistantLaneRulings:
             told = json.loads(raw) if raw else {}
         except ValueError:
             told = {}
+        if binding["state"] in {"unconfigured", "same_primary"}:
+            state = binding["state"]
+            if told.get("open") and told.get("state") == state:
+                return
+            epoch = int(told.get("epoch") or 0) + 1
+            notice_id = f"assistant-authority-lost:{state}:{epoch}"
+            notice = dict(notice_id=notice_id, kind="assistant_lane_ruling_result", dedupe_key=notice_id,
+                recipient_stream_id=composite.config.direct_primary_stream_id, tell_id=notice_id,
+                source_stream_id="", episode_id=None, created_at=None,
+                body="[Assistant lane ruling] " + _canonical({"event": "authority_unconfigured", "state": state}),
+                metadata={"authority_generation": composite.config.direct_primary_generation})
+            record = _canonical({"state": state, "epoch": epoch, "open": True})
+            def unconfigured(conn):
+                with conn:
+                    coalesce_notice_conn(conn, notice, None)
+                    conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", (_AUTHORITY_LOSS_KEY, record))
+            await self.store.submit(unconfigured)
+            return
         if binding["state"] != "unavailable":
+            if getattr(self.server, "authority_restore", None):
+                await self.server.authority_restore.recovered()
             if told.get("open"):
                 await self.store.put(_AUTHORITY_LOSS_KEY, _canonical({**told, "open": False}))
             return
         stream_id, generation = binding["stream_id"], binding["generation"]
         host, _, name = stream_id.partition(":")
-        evidence = self._authority_loss_evidence(await self.store.fetch_session(host, name))
+        seat = await self.store.fetch_session(host, name)
+        evidence = self._authority_loss_evidence(seat)
         if evidence is None:
+            restore = getattr(self.server, "authority_restore", None)
+            if restore:
+                restore.clear_loss()
             return
+        restore = getattr(self.server, "authority_restore", None)
+        if restore:
+            await restore.observe(stream_id, generation, evidence, seat)
+            if not await restore.primary():
+                return
+            if seat is None and not generation:
+                shape = await restore.shape()
+                if shape and shape.get('stream_id') == stream_id:
+                    generation = shape.get('generation') or ''
         pending = await self.store.submit(lambda conn: [row[0] for row in conn.execute(
             "SELECT ruling_request_id FROM v2_assistant_lane_rulings "
             "WHERE state='pending' AND authority_stream_id=? AND authority_generation=?",
@@ -832,8 +1264,8 @@ class AssistantLaneRulings:
             body="[Assistant lane ruling] " + _canonical({
                 "event": "authority_unavailable", "authority": stream_id, "generation": generation,
                 "evidence": evidence,
-                "effect": "lane spawns, closes and operations are released without a ruling until "
-                          "the authority is rebound or replaced",
+                "effect": "covered new work remains pending; other lane actions may release unruled",
+                "restore": await restore.status() if restore else {"state": "disabled", "episode_id": None, "next_attempt_at": None},
             }),
             metadata={"authority_generation": composite.config.direct_primary_generation},
         )
@@ -873,14 +1305,32 @@ class AssistantLaneRulings:
                 conn.execute("UPDATE v2_assistant_lane_rulings SET mirror_sent=1 WHERE ruling_request_id=?", (rid,))
         await self.store.submit(mark)
 
-    async def _release(self, request: dict[str, Any]) -> None:
+    async def _release(self, request: dict[str, Any], *, lifecycle_locked: bool = False) -> None:
+        # A question must be published while its producer is still the current
+        # open generation. Handoff/close hold this same lock across question
+        # transfer and retirement. Take it before the release lock: an immediate
+        # bypass already holds it in prompt.ask, so reversing the order deadlocks.
+        lifecycle = nullcontext()
+        if request["action"] == "question" and not lifecycle_locked:
+            sessions = self.server.sessions
+            lock_factory = getattr(sessions, "_lifecycle_lock", None)
+            producer = str(request["requester_stream_id"])
+            if callable(lock_factory) and ":" in producer:
+                lifecycle = lock_factory(*producer.split(":", 1))
+        async with lifecycle:
+            await self._release_serial(request)
+
+    async def _release_serial(self, request: dict[str, Any]) -> None:
         rid = request["ruling_request_id"]
         lock = self._release_locks.setdefault(rid, asyncio.Lock())
         async with lock:
             current = await self._fetch(rid)
-            if current is None or current["state"] not in {"approved", "unruled", "unruled_disabled"}:
+            if current is None or current["state"] not in {"approved", "unruled", "unruled_disabled", "bypassed"}:
+                return
+            if current.get("covered") and current["state"] == "unruled":
                 return
             intent = json.loads(current["intent_json"])
+            intent.pop("_ruling_packet", None)
             original = current.get('_original_custody', {})
             for key in ('parent_stream_id','handoff_from_stream_id','from_stream_id'):
                 for who in ('requester','target'):
@@ -898,7 +1348,15 @@ class AssistantLaneRulings:
                 await self._mark(rid, "release_blocked", {"error": "requester_generation_changed"})
                 return
             try:
-                if current["action"] == "spawn":
+                if current["action"] == "question":
+                    intent.pop("_auth_context", None)
+                    # Ruling recovery starts alongside the notification store.
+                    await self.server.notify._await_ready()
+                    result = await self.server.notify._prompt_publish(intent, request_id=f"ruled-question:{rid}")
+                    if result.get("type") != "prompt.ask.ok":
+                        await self._mark(rid, "release_blocked", result)
+                        return
+                elif current["action"] == "spawn":
                     result = await self.server.spawnctl.spawn(intent, self.server.local_host)
                     if result.get("type") != "spawn.ok":
                         await self._mark(rid, "release_blocked", result)
@@ -908,6 +1366,45 @@ class AssistantLaneRulings:
                     seat = await self.store.fetch_session(host, name)
                     if seat and seat.get("session_generation"):
                         await self._record_ownership(current, stream_id, seat["session_generation"])
+                elif current["action"] == "send":
+                    target_host, _, target_name = current["target_stream_id"].partition(":")
+                    target = await self.store.fetch_session(target_host, target_name)
+                    if not target or target.get("status") != "open" or target.get("session_generation") != current["target_generation"]:
+                        await self._mark(rid, "release_blocked", {"error": "target_generation_changed"})
+                        return
+                    request_id = f"ruled-send:{rid}"
+                    receipt = await self.store.get_send_receipt(current["target_stream_id"], request_id, include_submission_identity=True)
+                    if receipt is None:
+                        message = {"to_stream_id": current["target_stream_id"], "text": intent["body"],
+                                   "attachments": intent["attachments"], "inbox": intent["inbox"],
+                                   "msg_id": intent["msg_id"], "from_stream_id": intent["from_stream_id"],
+                                   "request_id": request_id, "_auth_context": intent["_auth_context"]}
+                        await self.server._send_to_resolved_session(message, target_host, target_name,
+                                                                    current["target_stream_id"], None)
+                        receipt = await self.store.get_send_receipt(current["target_stream_id"], request_id, include_submission_identity=True)
+                    if receipt is None:
+                        await self._mark(rid, "release_blocked", {"error": "send_receipt_missing", "request_id": request_id})
+                        return
+                    outcome = {"type": "send.result", "delivery": receipt.get("delivery"),
+                               "receipt_id": receipt.get("receipt_id"), "request_id": request_id}
+                    command = f"agent-orch send-receipt {current['target_stream_id']} {request_id}"
+                    if receipt.get("delivery") == "landed":
+                        await self._mark(rid, "done", outcome)
+                    elif receipt.get("delivery") == "not_landed":
+                        await self._mark(rid, "release_blocked", {**outcome, "error": "send_not_landed", "reconcile": command})
+                    else:
+                        from datetime import datetime
+                        created = datetime.fromisoformat(str(receipt["first_created_at"]).replace("Z", "+00:00")).timestamp()
+                        if time.time() - created >= self.sla_s:
+                            await self._mark(rid, "release_blocked", {**outcome, "error": "delivery_unproven", "reconcile": command})
+                            notice_id = f"assistant-lane-ruling-unproven:{rid}"
+                            await self.store.enqueue_outbound_notice(notice_id=notice_id, kind="assistant_lane_ruling_result",
+                                dedupe_key=notice_id, recipient_stream_id=current["requester_stream_id"], tell_id=notice_id,
+                                source_stream_id=current["authority_stream_id"], body=f"Delivery unproven; reconcile with {command}",
+                                metadata={"authority_generation": current["requester_generation"]})
+                        elif current.get("outcome_json") != _canonical(outcome):
+                            await self._mark(rid, "approved", outcome)
+                    return
                 elif current["action"] == "session_close":
                     target_host, _, target_name = current["target_stream_id"].partition(":")
                     target = await self.store.fetch_session(target_host, target_name)
@@ -977,7 +1474,7 @@ class AssistantLaneRulings:
         def op(conn: sqlite3.Connection) -> None:
             with conn:
                 conn.execute(
-                    "UPDATE v2_assistant_lane_rulings SET state=?,outcome_json=? WHERE ruling_request_id=?",
+                    "UPDATE v2_assistant_lane_rulings SET state=?,outcome_json=? WHERE ruling_request_id=? AND state IN ('approved','unruled','unruled_disabled','bypassed')",
                     (state, _canonical(outcome), rid),
                 )
                 actor = conn.execute("SELECT requester_stream_id,requester_generation FROM "
@@ -989,20 +1486,19 @@ class AssistantLaneRulings:
             if request is not None:
                 await self._result_notice(request)
 
-    async def _disable_pending(self) -> None:
+    async def _disable_pending(self, *, include_covered: bool = True) -> list[dict[str, Any]]:
         def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             with conn:
+                eligible = "state='pending'" if include_covered else "state='pending' AND covered=0"
                 pending = list(conn.execute("SELECT ruling_request_id,authority_stream_id,authority_generation "
-                                            "FROM v2_assistant_lane_rulings WHERE state='pending'"))
+                                            "FROM v2_assistant_lane_rulings WHERE " + eligible))
                 conn.execute("UPDATE v2_assistant_lane_rulings SET state='unruled_disabled',reason='authority_disabled' "
-                             "WHERE state='pending'")
+                             "WHERE " + eligible)
                 for rid, stream_id, generation in pending:
                     self._audit_conn(conn, rid, "disabled", stream_id, generation)
                 return [effective_ruling(conn, row) for row in conn.execute(
                     "SELECT * FROM v2_assistant_lane_rulings WHERE state='unruled_disabled'")]
-        for request in await self.store.submit(op):
-            await self._release(request)
-            await self._notify_unruled(request)
+        return await self.store.submit(op)
 
     async def tick(self) -> None:
         try:
@@ -1014,20 +1510,37 @@ class AssistantLaneRulings:
         # whose outcome line was not written yet (a crash between the two).
         rows = await self.store.submit(lambda conn: [effective_ruling(conn, row) for row in conn.execute(
             "SELECT * FROM v2_assistant_lane_rulings WHERE state='pending' "
-            "OR state IN ('approved','unruled','unruled_disabled') "
+            "OR state IN ('approved','unruled','unruled_disabled','bypassed') "
             "OR (mirror_sent=0 AND ruling IS NULL AND reason IN (?,?,?) "
-            "    AND state IN ('done','release_blocked','approved_but_not_closed'))",
+            "    AND action != 'question' AND state IN ('done','release_blocked','approved_but_not_closed'))",
             _UNRULED_REASONS,
         )])
         for row in rows:
             if row["state"] == "pending":
-                if row["deadline"] <= now:
+                if row.get("covered"):
+                    await self._enqueue_notice(row)
+                    if row["deadline"] <= now:
+                        rid = row["ruling_request_id"]
+                        message = "ruling overdue, request still pending; nothing was started"
+                        for recipient, generation, notice_id in (
+                            (row["authority_stream_id"], row["authority_generation"],
+                             f"assistant-lane-ruling:{rid}:overdue:{row['authority_generation']}"),
+                            (row["requester_stream_id"], row["requester_generation"],
+                             f"assistant-lane-ruling-overdue:{rid}:{row['requester_generation']}" if row["action"] == "question" else f"assistant-lane-ruling-overdue:{rid}")):
+                            if recipient and generation:
+                                await self.store.enqueue_outbound_notice(notice_id=notice_id,
+                                    kind="assistant_lane_ruling_result", dedupe_key=notice_id,
+                                    recipient_stream_id=recipient, tell_id=notice_id,
+                                    source_stream_id=row["requester_stream_id"],
+                                    body=message + "\n" + json.loads(row["intent_json"])["_ruling_packet"],
+                                    metadata={"authority_generation": generation, "ruling_request_id": rid})
+                elif row["deadline"] <= now:
                     await self._expire(row["ruling_request_id"], "deadline")
                 else:
                     await self._enqueue_notice(row)
             else:
                 await self._release(row)
-                if row["ruling"] is None and row["reason"] in _UNRULED_REASONS:
+                if row["action"] != "question" and row["ruling"] is None and row["reason"] in _UNRULED_REASONS:
                     await self._notify_unruled(row)
 
     def _ensure_worker(self) -> None:

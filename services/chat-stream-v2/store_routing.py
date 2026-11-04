@@ -386,7 +386,7 @@ def _record_publication_conn(conn: sqlite3.Connection, *, stream_id, publication
         except ValueError as exc:
             raise ValueError("assistant_publish_provenance_unverified") from exc
         if (dispatch_id or publish_kind not in {"prose", "status"}
-                or attachment_ids or reply_to_message_id or reply_to_question_id):
+                or reply_to_message_id or reply_to_question_id):
             raise ValueError("assistant_publish_payload_invalid")
     elif actor_generation is not None:
         _assistant_actor_conn(conn, actor_stream_id, actor_generation)
@@ -966,8 +966,12 @@ class _RoutingStoreMixin:
         direct_binding: dict[str, Any] | None = None,
         binding_env: dict[str, str] | None = None,
         voice_answers: dict[str, Any] | None = None,
+        expected_origin_generation: str | None = None,
     ) -> dict[str, Any]:
         """Atomically append the visible USER event and its routing receipt.
+
+        ``expected_origin_generation`` (voice/outbound operations) is compared
+        with the target's current generation inside this same transaction.
 
         ``voice_answers`` is a binding prepared by the composite (voice_answers.v1);
         it is stored, and its status written onto the USER event, in this same
@@ -1106,6 +1110,14 @@ class _RoutingStoreMixin:
                     "SELECT created_at,status,provider FROM sessions WHERE host=? AND session_name=?",
                     (host, session_name),
                 ).fetchone()
+                if expected_origin_generation is not None:
+                    current = conn.execute(
+                        "SELECT generation FROM v2_session_generations WHERE host=? AND session_name=?",
+                        (host, session_name),
+                    ).fetchone()
+                    if (session is None or session["status"] != "open" or current is None
+                            or current["generation"] != expected_origin_generation):
+                        raise ValueError("voice_origin_generation_conflict")
                 if session is None or session["status"] != "open" or session["provider"] != "composite":
                     raise ValueError("assistant_composite_projection_unavailable")
                 timestamp = _routing_iso_now()
@@ -2003,7 +2015,8 @@ class _RoutingStoreMixin:
                 conn.rollback()
                 raise
 
-        return await self.submit(_op)
+        async with self.session_graph_lock:
+            return await self.submit(_op)
 
     async def complete_assistant_composite_lane(
         self, *, stream_id: str, lane_id: str, dispatch_id: str,

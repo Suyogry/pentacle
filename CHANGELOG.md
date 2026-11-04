@@ -13,14 +13,33 @@ backfilled. Changes that land between releases accumulate under `Unreleased`.
 
 ## Unreleased
 
+### Removed
+
+- Upstream removed its Settings provider re-login flow. This fork retains the corrected [provider sign-in controls](docs/provider_relogin.md), including same-origin admission, private PTY ownership and the Claude URL parser fix. Daemon account health and `agent-orch account relogin` remain available.
+
+## 2026-11-02
+
 ### Added
 
+- Opt-in release seam admission unions installed baselines, rejects stale or incomplete proof, and keeps affected canary invocation and verdict scopes aligned. One finite client wire/render/model tuple is registered; other surfaces remain unqualified.
 - Advisory change-to-test reports name affected boundaries, existing test targets and coverage gaps without changing required gates.
 - Installations can hide whole providers from advertised New Chat choices with empty `available_models` lists; web respects visibility and saved-choice fallbacks while explicit launches stay compatible. Legacy mobile UI support requires a later app release.
 - Daemon stats show current admission usage and held verbs with opaque holder ids; diagnostic reads have isolated bounded capacity that cannot consume ping credits.
 - Front-desk account health revalidation with an exact native identity proof, revision fence and durable audit receipt; ordinary probes keep existing health flags.
 
 ### Fixed
+
+- The literal `assistant` CLI destination reaches the current assistant when the daemon also has a configured assistant name.
+- Saved assistant composite chats keep their pane and conversation after a web reload.
+- Initial CLI pin readiness excludes verified closed or missing input holders while preserving live and unknown obligations; durable tell custody prevents promotion across an unrecorded paste.
+- Same-ID tell retries can settle late native input proof without sending the message again; missing or ambiguous original proof stays pending.
+- The front-desk seat now stays hidden through every handoff, resume, restore and rebind: the daemon hides the bound seat and any parentless seat carrying the configured recovery work item, and a hidden qualified front-desk seat may rebind the primary assistant.
+- Long assistant message text wraps within the chat width; image paste keeps accompanying text and uses the existing attachment preview and send flow.
+- Existing unbound sessions keep accepting input before the first fleet CLI pin; initialized or inconsistent pin state still refuses that input.
+- Initial fleet CLI pin activation prepares and proves every serving home before enforcing the pair, preserving compatible running seats. Home-scoped maintenance fences survive restarts and expiry, with authenticated proof-backed recovery and managed launcher attribution.
+- Oversized retained exchange receipts no longer crash daemon startup; repair processes each oversized receipt in its own checkpointed transaction.
+- Assistant backing sessions stay out of the normal chat list across spawn, resume and recovery while their composite chat remains available.
+- Central Codex usage collection follows the host's healthy default account after account switches and redeploys, retaining stale data honestly when the default is unavailable.
 
 - New image sends with decomposed Unicode captions retain their caption and image after chat reload.
 

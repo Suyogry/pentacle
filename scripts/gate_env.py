@@ -15,6 +15,7 @@ Stdlib only; runs on any python3 >= 3.9, the prepared venv carries 3.13.
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -32,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
 import gate_attempts as ga  # noqa: E402
+from instruction_snapshot import ENV_NAME, instruction_snapshot  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
@@ -91,6 +93,9 @@ def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
                     problems.append("capability set of " + tname)
                 if target.get("npm_build") and (not isinstance(target["npm_build"], list) or any(b not in ("prestart", "build:web") for b in target["npm_build"])):
                     problems.append("npm_build of " + tname)
+                required = target.get("required_select", [])
+                if not isinstance(required, list) or any(not isinstance(item, str) for item in required):
+                    problems.append("required_select of " + tname)
                 limits = target.get("tier_timeouts")
                 if limits is not None and (target.get("gate") != "merge" or not isinstance(limits, dict) or set(limits) != {"unit", "smoke"} or any(type(v) is not int or v <= 0 for v in limits.values()) or sum(limits.values()) != target["timeout_s"]):
                     problems.append("tier_timeouts of " + tname)
@@ -253,7 +258,10 @@ def build_env(config: Dict[str, Any], profile: Dict[str, Any], target: Dict[str,
         env["PENTACLE_PYTHON"] = str(venv / "bin" / "python") if venv else ""
         env["PENTACLE_WEB_GATE_REPORT_ROOT"] = str(evidence / "gate" / "web")
     if target["kind"] == "npm_test":
-        env["PENTACLE_TEST_FILE_TIMEOUT_MS"] = "60000"
+        env["PENTACLE_TEST_FILE_TIMEOUT_MS"] = str(target.get("test_file_timeout_ms", 60000))
+        if venv is not None:
+            env["PENTACLE_PYTHON"] = str(venv / "bin" / "python")
+            env["PENTACLE_WEB_GATE_REPORT_ROOT"] = str(evidence / "gate" / "web")
         env["PENTACLE_TEST_RUN_TIMEOUT_MS"] = str(int(target["timeout_s"]) * 1000)
     allowed = set(target.get("pass_env", []))
     for name, value in pass_env.items():
@@ -366,7 +374,8 @@ def ensure_npm_env(run, checkout: Path, prepared: Path, env: Dict[str, str], pro
         return {}, [fail("dependencies", "npm ci failed: " + " | ".join((out.stdout + out.stderr).strip().splitlines()[-5:])[:400], "inspect the npm log; no manual node_modules edits")]
     prepared.mkdir(parents=True, exist_ok=True)
     ga.atomic_write(marker, json.dumps({"lock": want, "installed": file_digest(installed) if installed.exists() else None}, sort_keys=True).encode())
-    return {"reused": False, "lock": want}, []
+    return {"reused": False, "lock": want,
+            "ci_output_tail": " | ".join((out.stdout + out.stderr).strip().splitlines()[-5:])[-400:]}, []
 
 
 # ------------------------------------------------------------ preflight
@@ -469,14 +478,16 @@ def validate_selection(target: Dict[str, Any], select: List[str], checkout: Path
     pattern = re.compile(spec["pattern"])
     out = []
     root = checkout / spec.get("root", "")
-    for item in select:
+    for item in [*select, *target.get("required_select", [])]:
         if item.startswith("-") or ".." in Path(item).parts or item.startswith("/") or not pattern.match(item):
             raise SetupFailure([fail("selection", "selector %r does not match the target's declared pattern" % item, "")])
         file_part = item.split("::", 1)[0]
         declared_directory = file_part in target.get("directory_select", []) and (root / file_part).is_dir()
         if "*" not in file_part and not (root / file_part).is_file() and not declared_directory:
             raise SetupFailure([fail("selection", "selector %r names no existing file" % item, "")])
-        out.append(item)
+        if not any(item == chosen or item.startswith(chosen + "::")
+                   or ((root / chosen).is_dir() and item.startswith(chosen + "/")) for chosen in out):
+            out.append(item)
     return out
 
 
@@ -610,7 +621,7 @@ UNKNOWN = ga.UNKNOWN
 
 def harness_identity() -> str:
     h = hashlib.sha256()
-    for p in (Path(__file__), HERE / "lib" / "gate_attempts.py", CONFIG_PATH):
+    for p in (Path(__file__), HERE / "lib" / "gate_attempts.py", HERE / "lib" / "instruction_snapshot.py", CONFIG_PATH):
         h.update(p.read_bytes())
     return h.hexdigest()
 
@@ -747,6 +758,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     owner: Optional[OwnedProcesses] = None
     target: Optional[Dict[str, Any]] = None
     resolved_selection: Optional[List[str]] = None
+    instruction_input = None
     try:
         if args.history_complete and (missing_identity or args.prior_attempt):
             raise SetupFailure([fail("identity_args", "--history-complete requires full identity and no prior attempt")])
@@ -777,11 +789,31 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise SetupFailure([fail("selection", "--timeout-seconds %d exceeds the target maximum %d" % (timeout_s, target["max_timeout_s"]))])
         selection = validate_selection(target, args.select, checkout) if target["kind"] != "prepare" else []
         resolved_selection = list(selection)  # retained even when setup fails before prepared
+        # This explicitly selected integration file boots the same fixture as web-gate.
+        # Reuse its declared prerequisites before preparing the exact child context.
+        selected_files = {str(Path(file).relative_to(checkout))
+                          for pattern in selection for file in glob.glob(str(checkout / pattern), recursive=True)} if target["kind"] == "npm_test" else set()
+        interrupt_selected = "test/e2e/web_gate_interrupt.test.js" in selected_files
+        web_selected = bool(selected_files & {
+            "test/e2e/web_gate_interrupt.test.js", "test/e2e/web_wrap_paste_gate.test.js",
+            "test/e2e/web_wrap_paste_served.test.js"})
+        if web_selected:
+            web = profile["targets"]["web-gate"]
+            target = dict(target, npm_build=web["npm_build"], test_file_timeout_ms=web["timeout_s"] * 1000)
+        if interrupt_selected:
+            target = dict(target, **{key: web[key] for key in ("needs", "capabilities", "npm_build")},
+                          test_file_timeout_ms=web["timeout_s"] * 1000)
         pass_env = {}
         for name in args.pass_env:
             if name not in os.environ:
                 raise SetupFailure([fail("selection", "pass-env %s is not set in the caller's environment" % name)])
             pass_env[name] = os.environ[name]
+
+        if args.target == "cli-pytest" and ENV_NAME in pass_env:
+            try:
+                instruction_input = instruction_snapshot(pass_env.get(ENV_NAME))
+            except ValueError as exc:
+                raise SetupFailure([fail("dependencies", str(exc), "supply the frozen read-only CLI instruction snapshot")]) from exc
 
         failures: List[Dict[str, str]] = []
         for d in (home, basetemp, tmp, tmp_root):
@@ -830,6 +862,29 @@ def main(argv: Optional[List[str]] = None) -> int:
                 failures += check_capabilities(subprocess.run, venv / "bin" / "python", env, service_dir / "tests", caps)
         if target.get("process_listing"):
             failures += check_process_listing(subprocess.run, env)
+        if args.command == "run" and (args.target == "web-gate" or web_selected):
+            # Optional npm dependencies can be silently dropped by a successful install.
+            # Probe from the exact checkout on both fresh and reused preparations.
+            terminal_failure = None
+            try:
+                probe = subprocess.run(["node", "-e", "require('node-pty')"],
+                                       cwd=str(checkout), env=env, capture_output=True, text=True, timeout=10)
+                if probe.returncode:
+                    terminal_failure = "node-pty is unavailable: " + probe.stderr[-400:]
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                tail = getattr(exc, "stderr", "") or ""
+                if isinstance(tail, bytes):
+                    tail = tail.decode("utf-8", errors="replace")
+                terminal_failure = "node-pty probe failed (%s): %s" % (type(exc).__name__, tail[-400:])
+            if terminal_failure:
+                if not npm_info.get("reused") and "ci_output_tail" in npm_info:
+                    state["extra"]["npm"] = {"ci_output_tail": npm_info["ci_output_tail"]}
+                failures.append(fail("dependencies", terminal_failure))
+        if args.command == "run" and web_selected:
+            probe = subprocess.run(["node", "-e", "require('./test/e2e/web_gate').resolveChrome()"],
+                                   cwd=str(checkout), env=env, capture_output=True, text=True, timeout=30)
+            if probe.returncode or not (checkout / "renderer/dist/web/web.html").is_file():
+                failures.append(fail("dependencies", "selected web integration needs Chrome and the web build: " + probe.stderr[-400:]))
         if target.get("preflight_script") and not failures:
             failures += run_preflight_script(subprocess.run, checkout / target["preflight_script"], env)
         if failures:
@@ -837,6 +892,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         writer.emit("prepared", toolchain={k: {"version": v["version"], "sha256": v["sha256"], "realpath": v["realpath"]} for k, v in toolchain.items()},
                     locale=locale_name, dependency=dep_info, npm=npm_info, prepared_key=prepared_dir.name,
                     effective_selection=selection,
+                    **({"passed_environment": {ENV_NAME: instruction_input}} if instruction_input else {}),
                     env_names=sorted(env), capabilities_checked=config["capability_sets"].get(target.get("capabilities") or "", []))
         log("preflight ok")
 
@@ -871,7 +927,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         state["evidence"] = evidence_refs(evidence / "gate")
     except SetupFailure as exc:
         state.update(outcome="setup_failure", first_failure={"stage": "setup", "code": exc.failures[0]["code"]},
-                     extra={"failures": exc.failures})
+                     extra=dict(state["extra"], failures=exc.failures))
     except Cancelled:
         if proc is not None and proc.poll() is None:
             stop_group(proc)
@@ -924,6 +980,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     state["secondary"]["cleanup"] = "failed"
         if state["secondary"].get("cleanup") == "failed" and state["outcome"] == "pass":
             state["outcome"] = "cleanup_failure"
+        if instruction_input is not None:
+            try:
+                if instruction_snapshot(instruction_input["root"]) != instruction_input:
+                    raise ValueError("instruction snapshot identity changed")
+                state["secondary"]["passed_environment"] = {ENV_NAME: instruction_input}
+            except ValueError as exc:
+                state.update(outcome="harness_failure", first_failure={"stage": "cleanup", "code": "instruction_input_drift"})
+                state["secondary"]["instruction_input_error"] = str(exc)
         if not writer.terminal:
             try:
                 writer.emit("terminal", outcome=state["outcome"], first_failure=state["first_failure"], secondary=state["secondary"],

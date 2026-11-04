@@ -1530,6 +1530,8 @@ def spawn_freeze(args: argparse.Namespace) -> int:
         payload["host"] = args.host
     if getattr(args, "ttl", None) is not None:
         payload["ttl_s"] = float(args.ttl)
+    for name in ("input_provider","input_account","expected_login_generation","maintenance_id","expected_hold_digest"):
+        if getattr(args,name,None) is not None:payload[name]=getattr(args,name)
     try:
         response = asyncio.run(spawn_freeze_once(
             load_config(), payload, timeout=float(getattr(args, "timeout", 30.0) or 30.0),
@@ -1549,6 +1551,8 @@ def spawn_unfreeze(args: argparse.Namespace) -> int:
     payload: dict[str, object] = {"type": "spawn_unfreeze"}
     if getattr(args, "host", None):
         payload["host"] = args.host
+    for name in ("maintenance_id","expected_maintenance_digest","expected_hold_digest"):
+        if getattr(args,name,None) is not None:payload[name]=getattr(args,name)
     try:
         response = asyncio.run(spawn_freeze_once(
             load_config(), payload, timeout=float(getattr(args, "timeout", 30.0) or 30.0),
@@ -1565,7 +1569,7 @@ def spawn_unfreeze(args: argparse.Namespace) -> int:
 
 
 def send(args: argparse.Namespace) -> int:
-    alias = args.stream_id == ASSISTANT_ALIAS
+    alias = args.stream_id in ("assistant", ASSISTANT_ALIAS)
     if not alias and not _require_stream_id("send", args.stream_id):
         return 2
     config = load_config()
@@ -1575,7 +1579,7 @@ def send(args: argparse.Namespace) -> int:
         return 2
     if alias:
         # Raw alias target only: no host/session split and no optimistic ID.
-        target_fields: dict[str, object] = {"to_stream_id": ASSISTANT_ALIAS}
+        target_fields: dict[str, object] = {"to_stream_id": args.stream_id}
     else:
         parsed_stream = args.stream_id.split(":", 1)
         if len(parsed_stream) != 2 or not parsed_stream[0] or not parsed_stream[1]:
@@ -1715,7 +1719,7 @@ def send_cancel(args: argparse.Namespace) -> int:
 
 
 def tell(args: argparse.Namespace) -> int:
-    if args.peer_stream_id != ASSISTANT_ALIAS and not _require_stream_id("tell", args.peer_stream_id):
+    if args.peer_stream_id not in ("assistant", ASSISTANT_ALIAS) and not _require_stream_id("tell", args.peer_stream_id):
         return 2
     ttl_seconds = int(args.ttl)
     if ttl_seconds < TELL_TTL_MIN_SECONDS or ttl_seconds > TELL_TTL_MAX_SECONDS:
@@ -1807,9 +1811,9 @@ def assistant_publish(args: argparse.Namespace) -> int:
     reply_ids = [item for value in (getattr(args, "reply_to_message_ids", None) or [])
                  for item in value.split(",") if item]
     if (proactive and (args.dispatch_id or args.reply_to_message_id or args.reply_to_question_id or reply_ids
-                       or attachment_ids or args.publish_kind not in {"prose", "status"})
+                       or args.publish_kind not in {"prose", "status"})
             or not proactive and (not args.dispatch_id or not args.reply_to_message_id)):
-        print("agent-orch assistant publish: use --proactive for prose/status without dispatch, reply or attachments; otherwise dispatch/reply IDs are required", file=sys.stderr)
+        print("agent-orch assistant publish: use --proactive for prose/status without dispatch or reply IDs; otherwise dispatch/reply IDs are required", file=sys.stderr)
         return 2
     payload: dict[str, object] = {
         "type": "assistant.publish",
@@ -1960,10 +1964,12 @@ def assistant_authority(args: argparse.Namespace) -> int:
     value = "disabled" if args.disable else args.set
     payload: dict[str, object] = {
         "type": "assistant.authority", "request_id": args.request_id or f"assistant-authority-{uuid.uuid4()}",
-        "action": "set" if value is not None else "read",
+        "action": "restore" if args.restore else "retry" if args.retry else "set" if value is not None else "read",
     }
     if value is not None:
         payload["value"] = value
+    if args.brief_file:
+        payload["brief_file"] = args.brief_file
     return _assistant_call(args, payload)
 
 
@@ -2626,54 +2632,61 @@ def _prompt_envelope_from_args(args: argparse.Namespace) -> dict[str, object]:
 
 
 def prompt_ask(args: argparse.Namespace) -> int:
+    envelope = None
+    durable = None
+    ruling_request_id = None
     try:
         envelope = _prompt_envelope_from_args(args)
-        payload = {
-            "type": "prompt.ask",
-            "envelope": envelope,
-            "actions": prompt_protocol.notification_actions(envelope),
-            "severity": "info",
-        }
+        payload = {"type": "prompt.ask", "envelope": envelope,
+                   "actions": prompt_protocol.notification_actions(envelope), "severity": "info"}
         config = load_config()
         timeout = float(getattr(args, "timeout", 30.0) or 30.0)
+        deadline = time.monotonic() + timeout
         response = asyncio.run(prompt_ask_once(config, payload, timeout=timeout))
-        if response.get("type") != "prompt.ask.ok":
+        if response.get("type") in {"prompt.ask.held", "prompt.ask.ruled", "prompt.ask.ok"}:
+            durable = response
+            ruling_request_id = response.get("ruling_request_id")
+        kind = response.get("type")
+        if kind == "prompt.ask.ruled":
+            print(json.dumps(response, separators=(",", ":")))
+            return 76
+        if kind == "prompt.ask.held" and not getattr(args, "await_answer", False):
+            print(json.dumps(response, separators=(",", ":")))
+            return 75
+        while kind == "prompt.ask.held" and time.monotonic() < deadline:
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            status = asyncio.run(prompt_status_once(config, str(envelope["question_id"]), timeout=remaining))
+            if status.get("type") != "prompt.status.ok":
+                raise RuntimeError(str(status.get("error_code") or "status_failed"))
+            if status.get("state") == "held":
+                response = {"type": "prompt.ask.held", **{k: v for k, v in status.items() if k not in {"type", "state", "ok", "request_id"}}}
+                if status.get("ruling_state") in {"denied", "revised", "withdrawn", "release_blocked"}:
+                    response["type"] = "prompt.ask.ruled"
+                durable = response
+            else:
+                response = asyncio.run(prompt_ask_once(config, payload, timeout=max(0.01, deadline - time.monotonic())))
+                durable = response
+            kind = response.get("type")
+        if kind == "prompt.ask.held":
+            print(json.dumps(response, separators=(",", ":")))
+            return 75
+        if kind == "prompt.ask.ruled":
+            print(json.dumps(response, separators=(",", ":")))
+            return 76
+        if kind != "prompt.ask.ok":
             error_code = str(response.get("error_code") or response.get("error") or "prompt_publish_failed")
-            if error_code in {"notification_store_unavailable", "notification_store_error"}:
-                fallback = prompt_protocol.fallback_response(
-                    envelope,
-                    error_code=error_code,
-                    message=str(response.get("message") or "durable prompt publish failed before creation"),
-                )
-                print(json.dumps(fallback, separators=(",", ":")))
-                print(fallback["inline_prompt"], file=sys.stderr)
-                return 0
             print(json.dumps(response, separators=(",", ":")))
             return 2 if error_code == "prompt_invalid" else 1
-        notice_delivery = (
-            response.get("notice_delivery")
-            if isinstance(response.get("notice_delivery"), dict)
-            else None
-        )
-        notice_target = str(
-            response.get("to_stream_id")
-            or (notice_delivery or {}).get("to_stream_id")
-            or ""
-        )
-        if notice_target and not (
-            notice_delivery is not None
-            and _notice_delivery_is_authoritative(
-                notice_delivery, to_stream_id=notice_target,
-            )
-        ):
+        notice_delivery = response.get("notice_delivery") if isinstance(response.get("notice_delivery"), dict) else None
+        notice_target = str(response.get("to_stream_id") or (notice_delivery or {}).get("to_stream_id") or "")
+        if notice_target and not (notice_delivery is not None and _notice_delivery_is_authoritative(notice_delivery, to_stream_id=notice_target)):
             print(json.dumps(response, separators=(",", ":")))
-            print(
-                "agent-orch prompt ask: live-session notice not delivered: "
-                f"{(notice_delivery or {}).get('error_code') or (notice_delivery or {}).get('delivery_status') or 'missing_notice_delivery'} "
-                f"to {notice_target} "
-                f"correlation {(notice_delivery or {}).get('tell_id') or 'unknown'}; reconcile with prompt status",
-                file=sys.stderr,
-            )
+            print("agent-orch prompt ask: live-session notice not delivered: "
+                  f"{(notice_delivery or {}).get('error_code') or (notice_delivery or {}).get('delivery_status') or 'missing_notice_delivery'} "
+                  f"to {notice_target} correlation {(notice_delivery or {}).get('tell_id') or 'unknown'}; reconcile with prompt status", file=sys.stderr)
             return 1
         if not getattr(args, "await_answer", False):
             print(json.dumps(response, separators=(",", ":")))
@@ -2683,38 +2696,32 @@ def prompt_ask(args: argparse.Namespace) -> int:
         if not notification_id:
             print(json.dumps(response, separators=(",", ":")))
             return 1
-        await_response = asyncio.run(
-            notification_await_once(config, notification_id, timeout=timeout)
-        )
-        if await_response.get("type") != "notification.await.ok":
-            print(json.dumps(await_response, separators=(",", ":")))
+        remaining = deadline - time.monotonic()
+        waited = asyncio.run(notification_await_once(config, notification_id, timeout=remaining)) if remaining > 0 else {"type": "notification.await.timeout"}
+        if waited.get("type") == "notification.await.timeout":
+            print(json.dumps({**response, "answer": None, "awaited": False}, separators=(",", ":")))
+            return 0
+        if waited.get("type") != "notification.await.ok":
+            print(json.dumps(waited, separators=(",", ":")))
             return 1
-        status_response = asyncio.run(
-            prompt_status_once(config, str(envelope["question_id"]), timeout=timeout)
-        )
-        print(json.dumps(status_response, separators=(",", ":")))
-        return 0 if status_response.get("type") == "prompt.status.ok" else 1
+        status = asyncio.run(prompt_status_once(config, str(envelope["question_id"]), timeout=max(0.01, deadline - time.monotonic())))
+        print(json.dumps(status, separators=(",", ":")))
+        return 0 if status.get("type") == "prompt.status.ok" else 1
     except prompt_protocol.PromptValidationError as exc:
-        response = {
-            "type": "prompt.error",
-            "ok": False,
-            "error_code": "prompt_invalid",
-            "error": "prompt_invalid",
-            "message": str(exc),
-        }
-        print(json.dumps(response, separators=(",", ":")))
+        print(json.dumps({"type": "prompt.error", "ok": False, "error_code": "prompt_invalid", "error": "prompt_invalid", "message": str(exc)}, separators=(",", ":")))
         print(f"agent-orch prompt ask: validation failed: {exc}", file=sys.stderr)
         return 2
     except ServiceCredentialUnavailable:
         raise
     except Exception as exc:
-        envelope = _prompt_envelope_from_args(args)
+        if durable is not None and envelope is not None:
+            print(json.dumps({"type": durable.get("type"), "question_id": envelope["question_id"],
+                "ruling_request_id": durable.get("ruling_request_id") or ruling_request_id, "wait_error": str(exc),
+                "reconcile": f"agent-orch prompt status {envelope['question_id']}"}, separators=(",", ":")))
+            return 75
+        envelope = envelope or _prompt_envelope_from_args(args)
         response, _exit_code, message = _direct_rpc_transport_error("prompt", None, exc)
-        fallback = prompt_protocol.fallback_response(
-            envelope,
-            error_code=str(response.get("error_code") or response.get("error") or "daemon_unreachable"),
-            message=message,
-        )
+        fallback = prompt_protocol.fallback_response(envelope, error_code=str(response.get("error_code") or response.get("error") or "daemon_unreachable"), message=message)
         print(json.dumps(fallback, separators=(",", ":")))
         print(fallback["inline_prompt"], file=sys.stderr)
         return 0
@@ -5475,6 +5482,11 @@ def build_parser() -> argparse.ArgumentParser:
     spawn_freeze_parser.add_argument("--reason", default="")
     spawn_freeze_parser.add_argument("--ttl", type=float, default=900.0, help="hold TTL seconds; self-expires.")
     spawn_freeze_parser.add_argument("--timeout", type=float, default=30.0)
+    spawn_freeze_parser.add_argument("--input-provider", choices=["claude","codex"])
+    spawn_freeze_parser.add_argument("--input-account")
+    spawn_freeze_parser.add_argument("--expected-login-generation")
+    spawn_freeze_parser.add_argument("--maintenance-id")
+    spawn_freeze_parser.add_argument("--expected-hold-digest")
     spawn_freeze_parser.set_defaults(func=spawn_freeze)
 
     spawn_unfreeze_parser = subparsers.add_parser(
@@ -5483,6 +5495,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     spawn_unfreeze_parser.add_argument("--host")
     spawn_unfreeze_parser.add_argument("--timeout", type=float, default=30.0)
+    spawn_unfreeze_parser.add_argument("--maintenance-id")
+    spawn_unfreeze_parser.add_argument("--expected-maintenance-digest")
+    spawn_unfreeze_parser.add_argument("--expected-hold-digest")
     spawn_unfreeze_parser.set_defaults(func=spawn_unfreeze)
 
     schedule_parser = subparsers.add_parser("schedule")
@@ -5656,6 +5671,8 @@ def build_parser() -> argparse.ArgumentParser:
     file_source.add_argument("--upload-id")
     file_source.add_argument("--from-receipt", help="Inline JSON or receipt file; only upload_id is used")
     send_file_parser.add_argument("--to", help="Target assistant composite for authorized publication")
+    send_file_parser.add_argument("--proactive", action="store_true",
+        help="With --to: publish prose/status without dispatch/reply IDs from the current direct-primary binding; request ID defaults to send-file:<upload-id>")
     send_file_parser.add_argument("--dispatch-id")
     send_file_parser.add_argument("--reply-to-message-id")
     send_file_parser.add_argument("--reply-to-question-id")
@@ -5733,7 +5750,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     assistant_publish_parser.add_argument("--request-id", required=True)
     assistant_publish_parser.add_argument("--composite-stream-id", required=True)
-    assistant_publish_parser.add_argument("--proactive", action="store_true", help="publish prose/status from the current direct-primary binding")
+    assistant_publish_parser.add_argument("--proactive", action="store_true", help="publish prose/status, optionally with attachments, from the current direct-primary binding")
     assistant_publish_parser.add_argument("--dispatch-id")
     assistant_publish_parser.add_argument("--reply-to-message-id")
     assistant_publish_parser.add_argument(
@@ -5810,6 +5827,9 @@ def build_parser() -> argparse.ArgumentParser:
     authority_change = assistant_authority_parser.add_mutually_exclusive_group()
     authority_change.add_argument("--set", metavar="STREAM_ID")
     authority_change.add_argument("--disable", action="store_true")
+    authority_change.add_argument("--restore", action="store_true")
+    authority_change.add_argument("--retry", action="store_true")
+    assistant_authority_parser.add_argument("--brief-file")
     assistant_authority_parser.add_argument("--request-id")
     assistant_authority_parser.add_argument("--timeout", type=float, default=30.0)
     assistant_authority_parser.set_defaults(func=assistant_authority)
