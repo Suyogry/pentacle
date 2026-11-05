@@ -2,11 +2,12 @@
 id: spec_pentacle__upstream_sync_20261105_2
 title: Integrate coordinated helper deployment and launcher verification updates
 type: spec
-status: in_progress
+status: completed
 canonical: false
 created_at: '2026-11-05'
 updated_at: '2026-11-05'
-source_path: work/in_progress/pentacle__upstream_sync_20261105_2/spec.md
+completed_at: '2026-11-05'
+source_path: work/completed/pentacle__upstream_sync_20261105_2/spec.md
 machine: local
 owner: maintainer
 tags:
@@ -67,11 +68,28 @@ push. Remove only the owned worktree and leave personal main clean.
 ## Acceptance
 
 - [x] Scope, identity and independent plan review established.
-- [ ] Official source integrated and fork contracts preserved.
-- [ ] Scoped gates and independent final QA accepted.
-- [ ] Personal fork pushed normally with clean and live-service readbacks.
+- [x] Official source integrated and fork contracts preserved.
+- [x] Scoped gates and independent final QA accepted.
+- [x] Personal fork pushed normally with clean and live-service readbacks.
 
-## Checkpoint
+## Closure — shipped
 
-Conflict-free isolated merge prepared; protected preimages unchanged. Next:
-scoped account/deployment/auth checks, isolated desktop proof and final review.
+Independent final QA accepted frozen source
+`541c5ba5f0d23b86e14d48c48ca2b332c9c10da9`; 34 independently selected cases
+and a real macOS own-process path/hash probe passed. Personal main was fast-
+forwarded and pushed normally. Desktop/web assets rebuilt successfully for next
+launch. All selected source gates passed; no custom compatibility fix was needed.
+Live readback after promotion confirms the same daemon PID/configuration and
+healthy authenticated usage delivery. No daemon restart or helper deployment
+occurred, and no new runtime activation is claimed. Validation and private
+receipt digests are in `_artifacts/validation.md` and `_artifacts/evidence.json`.
+This closure changes process metadata only.
+
+## Retro
+
+Source integration and coordinated runtime deployment are separate operations.
+Use disposable resource guards to test release machinery, preserve existing
+security fixes by content identity, and check source-mode service continuity
+without mislabeling it as a newly activated version. Eager imports do not make
+dynamic source-byte identity readers immutable. Auxiliary observers must use
+the correct snapshot mode and the authority appropriate to each endpoint.

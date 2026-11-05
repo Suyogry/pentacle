@@ -165,6 +165,26 @@
     "completed_at": "2026-11-05"
   },
   {
+    "id": "spec_pentacle__upstream_sync_20261105_2",
+    "path": "work/completed/pentacle__upstream_sync_20261105_2/spec.md",
+    "title": "Integrate coordinated helper deployment and launcher verification updates",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-11-05",
+    "source_path": "work/completed/pentacle__upstream_sync_20261105_2/spec.md",
+    "tags": [
+      "pentacle"
+    ],
+    "summary": "Merge three official updates while preserving fork security and the running local services.",
+    "related": [
+      "work_pentacle__upstream_sync_20261105_2"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-11-05"
+  },
+  {
     "id": "spec_provider_signin_format_20261027",
     "path": "work/completed/pentacle__provider_signin_format_20261027/spec.md",
     "title": "Recognize the installed Claude CLI authorization URL format",
@@ -409,6 +429,26 @@
     "summary": "Merge official updates while preserving fork security and existing provider workflows.",
     "related": [
       "spec_pentacle__upstream_sync_20261105"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-11-05"
+  },
+  {
+    "id": "work_pentacle__upstream_sync_20261105_2",
+    "path": "work/completed/pentacle__upstream_sync_20261105_2/summary.md",
+    "title": "Integrate coordinated helper deployment and launcher verification updates",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-11-05",
+    "source_path": "work/completed/pentacle__upstream_sync_20261105_2/summary.md",
+    "tags": [
+      "pentacle"
+    ],
+    "summary": "Merge three official updates while preserving fork security and the running local services.",
+    "related": [
+      "spec_pentacle__upstream_sync_20261105_2"
     ],
     "status": "completed",
     "machine": "local",
