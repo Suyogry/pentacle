@@ -164,7 +164,10 @@ class Repl:
                     for line in _safe(text).splitlines():
                         self.line('│ ' + line)
             elif kind == 'tool_call':
-                self.line('│ tool ' + str(record.get('subtype', '')))
+                # Tool metadata is provider output too. Sanitize controls and
+                # prefix each line so it cannot impersonate input receipts.
+                for line in _safe(str(record.get('subtype', ''))).splitlines() or ['']:
+                    self.line('│ tool ' + line)
 
     def input(self, text: str):
         render_draft = False

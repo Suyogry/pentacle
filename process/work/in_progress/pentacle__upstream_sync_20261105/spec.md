@@ -74,5 +74,18 @@ fixture or cleanup and recover only affected cells, preserving accepted evidence
 
 ## Checkpoint
 
-Conflict-free integration prepared; critical preimages unchanged. Next: scoped
-source gates, isolated desktop proof, final QA and normal promotion.
+Merge and scoped Cursor repair prepared; critical preimages unchanged. Full
+JavaScript gate passed. Next: final daemon/CLI gates, isolated desktop proof,
+independent acceptance and normal promotion.
+
+## Bounded Cursor receipt repair
+
+Independent review reproduced an upstream tool-subtype display flaw: embedded
+newlines or terminal controls could imitate input-admission receipts without
+input being admitted. New direct production-output/predicate regressions were
+RED (four failures), then GREEN (ten passes) after sanitizing the subtype and
+prefixing every logical display line. The raw transcript stays unchanged.
+Assistant text retains the same existing framing contract. Real tmux capture
+joins wrapped lines with `-J`; no new receipt grammar or authority is introduced.
+The final daemon manifest includes all new negatives and the original native
+PTY/queue/interrupt/default-shell and retained-shell provider workflows.
