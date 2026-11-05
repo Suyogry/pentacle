@@ -138,6 +138,7 @@ function visibilityPicker(available, preferences = {}, selection = null) {
     claude: { 'claude-default': { efforts: ['high'] }, 'claude-visible': { efforts: ['low'] } },
     codex: { 'codex-default': { efforts: ['high'] } },
     gemini: { 'gemini-default': { efforts: ['default'] } },
+    cursor: { auto: { efforts: ['default'] } },
   };
   const catalog = {
     profiles: { desktop_manual: Object.fromEntries(Object.entries(models).map(([p, entries]) => [p, [Object.keys(entries)[0], Object.values(entries)[0].efforts[0]]])) },
@@ -488,4 +489,34 @@ test('explicit Gemini picker selection uses its model and the CLI default effort
   model.value = 'gemini-3.8-flash';
   model.dispatchEvent(new dom.window.Event('change'));
   assert.deepEqual(emissions, [{ provider: 'gemini', model: 'gemini-3.8-flash' }]);
+});
+
+test('Cursor uses existing catalog slots and provider/model names', () => {
+  const modelLabel = loadModelLabel();
+  assert.equal(modelLabel('auto'), 'Cursor Auto');
+  assert.equal(modelLabel('cursor-auto'), 'Cursor Auto');
+  const providerLabel = new Function(`${extractFunction('providerLabelForHero')}; return providerLabelForHero;`)();
+  assert.equal(providerLabel('cursor'), 'Cursor');
+  const picker = visibilityPicker({ cursor: { auto: { efforts: ['default'] } } });
+  assert.deepEqual(picker.catalogProviders(picker.catalog()), ['cursor']);
+  assert.deepEqual(picker.selectionForProvider('cursor'), { provider: 'cursor', model: 'auto', effort: 'default' });
+  const hidden = visibilityPicker({ cursor: {} });
+  assert.deepEqual(hidden.catalogProviders(hidden.catalog()), []);
+  assert.equal(hidden.catalogTuple('cursor'), null);
+});
+
+test('Cursor hero resolves the canonical provider through the real slot DOM update', () => {
+  const document = new JSDOM('<div id="header-0"><span class="cell-label">Chat</span></div>').window.document;
+  const state = {
+    slots: [{ name: 'v2-cursor', hostId: 'local' }], botSlots: [],
+    chatStream: { sessions: [{ session_name: 'v2-cursor', host: 'local', provider: 'cursor' }] },
+  };
+  new Function('state', 'document', 'streamHostForHostId', 'isCompositeSlot', `
+    ${extractFunction('providerForSession')}
+    ${extractFunction('providerLabelForHero')}
+    ${extractFunction('updateSlotProviderTag')}
+    updateSlotProviderTag(0);
+  `)(state, document, value => value, () => false);
+  assert.equal(document.querySelector('.cell-provider-tag').textContent, 'Cursor');
+  assert.equal(document.querySelectorAll('.cell-provider-tag').length, 1);
 });

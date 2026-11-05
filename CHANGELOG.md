@@ -13,6 +13,10 @@ backfilled. Changes that land between releases accumulate under `Unreleased`.
 
 ## Unreleased
 
+### Added
+
+- Cursor CLI seats with the existing provider picker, queued terminal input, streamed chat/tool events, and pinned-release admission checks.
+
 ### Removed
 
 - Upstream removed its Settings provider re-login flow. This fork retains the corrected [provider sign-in controls](docs/provider_relogin.md), including same-origin admission, private PTY ownership and the Claude URL parser fix. Daemon account health and `agent-orch account relogin` remain available.
