@@ -2,11 +2,12 @@
 id: spec_pentacle__upstream_sync_20261105
 title: Integrate official Cursor and Codex updates
 type: spec
-status: in_progress
+status: completed
 canonical: false
 created_at: '2026-11-05'
 updated_at: '2026-11-05'
-source_path: work/in_progress/pentacle__upstream_sync_20261105/spec.md
+completed_at: '2026-11-05'
+source_path: work/completed/pentacle__upstream_sync_20261105/spec.md
 machine: local
 owner: maintainer
 tags:
@@ -68,16 +69,28 @@ fixture or cleanup and recover only affected cells, preserving accepted evidence
 ## Acceptance
 
 - [x] Scope, identity and independent plan QA established.
-- [ ] Official main integrated and supported fork contracts preserved.
-- [ ] Required scoped gates and independent final QA accepted.
-- [ ] Personal main/fork pushed normally and clean readback verified.
+- [x] Official main integrated and supported fork contracts preserved.
+- [x] Required scoped gates and independent final QA accepted.
+- [x] Personal main/fork pushed normally and clean readback verified.
 
-## Checkpoint
+## Closure — shipped
 
-Source and bounded repairs complete; critical preimages unchanged. JavaScript
-210 files and full CLI 8068 tests pass. Daemon run has 719 passes and four
-fixture failures, all recovered by a 76-pass selection of the three repaired
-files. Next: isolated desktop proof, final independent acceptance and promotion.
+Independent final QA accepted source
+`56d0eb78c06e20c5d6f94a5e0f8575a31fff1ab3`, including 93 independent focused
+tests and receipt/provenance checks. Personal main was fast-forwarded and pushed
+normally. Desktop/web assets rebuilt successfully in the laptop checkout for
+next launch. All acceptance criteria are satisfied within the documented source
+scope. Validation and receipt hashes are in `_artifacts/validation.md` and
+`_artifacts/evidence.json`. No personal runtime restart was performed.
+
+## Retro
+
+A conflict-free merge still needs behavioral review. The new Cursor adapter's
+provider-output framing defect was caught before promotion and repaired with
+actual egress/predicate regressions. Authentication fixtures must prove authority
+rather than assume localhost exemption. Keep negative assertions and failed raw
+receipts, narrow timing fixtures to the operation under test, and reuse passing
+coverage only within unchanged input bounds.
 
 ## Bounded Cursor receipt repair
 
