@@ -85,6 +85,26 @@
     "completed_at": "2026-10-26"
   },
   {
+    "id": "spec_pentacle__limits_runtime_20261105",
+    "path": "work/completed/pentacle__limits_runtime_20261105/spec.md",
+    "title": "Restore live Claude and Codex Limits delivery",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-11-05",
+    "source_path": "work/completed/pentacle__limits_runtime_20261105/spec.md",
+    "tags": [
+      "pentacle"
+    ],
+    "summary": "Restore authenticated daemon delivery of healthy collected provider quotas to the installed desktop.",
+    "related": [
+      "work_pentacle__limits_runtime_20261105"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-11-05"
+  },
+  {
     "id": "spec_pentacle__provider_usage_setup_20261027",
     "path": "work/completed/pentacle__provider_usage_setup_20261027/spec.md",
     "title": "Restore provider quota updates across desktop launches",
@@ -314,6 +334,26 @@
     "machine": "local",
     "owner": "maintainer",
     "completed_at": "2026-10-26"
+  },
+  {
+    "id": "work_pentacle__limits_runtime_20261105",
+    "path": "work/completed/pentacle__limits_runtime_20261105/summary.md",
+    "title": "Restore live Claude and Codex Limits delivery",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-11-05",
+    "source_path": "work/completed/pentacle__limits_runtime_20261105/summary.md",
+    "tags": [
+      "pentacle"
+    ],
+    "summary": "Restore authenticated daemon delivery of healthy collected provider quotas to the installed desktop.",
+    "related": [
+      "spec_pentacle__limits_runtime_20261105"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-11-05"
   },
   {
     "id": "work_pentacle__provider_usage_setup_20261027",

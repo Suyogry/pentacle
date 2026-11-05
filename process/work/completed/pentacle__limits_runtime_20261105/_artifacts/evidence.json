@@ -1,0 +1,30 @@
+{
+  "external_bundle": "Maintainer private usage-limits-20261105 evidence bundle",
+  "runtime_source": "07ba5e6b4d020e29acec8358fb655ecd29b84d6c",
+  "service_config_sha256": "572a4dc56213d6b5417c8583cd3fa7b95d5271e54a08b2b7cf65c39114333866",
+  "sha256": {
+    "spec.md": "f84efd9ca78f85b3ee987d4f2f4daef1ab603aa18ba61e05aad189413cfb67b3",
+    "spec-qa.md": "3e997c80b46e16509de51f5e998b3a2973deffcf43d92db945efe2a29fb45e22",
+    "identity.json": "8a90bc526cc7d73bb4d9b2d3017276b7f94445e62e7baec356e89cb95d1b890a",
+    "preflight.json": "e6b323e260c6a1f7b10bd0f0e4246be0e7a0e19ebc8cec0c960188e22ec9cd19",
+    "prerequisites.json": "48ed534323aad5de02fcc91610ea1f5da3ef74ea7861bfd9fcc4534a03e5b650",
+    "artifact-preimage.json": "221d341ca8a047d57e061241d1ff3fbad3d4a61103b4ca760329ca2cc394061d",
+    "activation.json": "2c36f108dca3ff5b6c4782b6a506ff2287541a47485e1e9c1d4c68232f0856d8",
+    "daemon-activated.plist": "572a4dc56213d6b5417c8583cd3fa7b95d5271e54a08b2b7cf65c39114333866",
+    "wire-readback.json": "9735bf974f12ef248bb0699a283a19eb2007cd67625fd5db8ebb628f30586ff4",
+    "fresh-delivery.json": "75a1f22434d9a759a68c4250a642702285a74dd8c85a9fef4eee68279807f6dc",
+    "ui-readback.json": "013c06825598f14a6eea008064f4894970e800273e9072f4acf53c981bbbc181",
+    "runtime-readback.json": "2e0a384323adfa1d2d2e5a3dce802e059531f39945c09bea4a4a936b9a3c673d",
+    "collector-refresh.json": "7a5a061882daea43de0a3162ff08cca872e62de06ee1a921c6022a757613f4c2",
+    "service-final.txt": "3284d4df1807780c79509c2cdd7814a79c749a4ac01fe1aef9001a1eca857ff3",
+    "observer-correction.json": "c8c8d82de6dd000e05bcae48d9d7920fdb31209c2ff39beb3d2aed4eca0634f2",
+    "screen-observer-recovery.json": "33e61e71d89805eea211614fbc2d7e168b7abd2b70b936a1de8585b69266e9b6",
+    "qa-final.md": "7d37eb7d6250e16066f4c63668376141901689602f2a21cd9bee1bea7cc949ab",
+    "qa-final-evidence-sha256.txt": "0aab40b27ad35ff2a16c7907a3032a9013b382628c066bfced8201b6d05340a1",
+    "final-evidence.json": "f9f6e7c854b6f8415c8c5022856c4c4c5366c48bc3662ba40edbe2dc0e1a0bd7",
+    "private-guide-readback.json": "fcd790cddbdd02e69790ad9dfeca3bc92b66bb75266299c9adccc9d161431ba7",
+    "catalog.log": "85b67e320b3f3b37b5cf00db7817f155579e444dc2c751a157924dd028dd3eef",
+    "metadata-full.log": "1da90caff7c60d1f52cdd54ffb6d3f1d23e74658142874e39455937a46f06011",
+    "metadata-source.log": "82444ecb15f8cf1e3cab38e39c1d7ef9b469512b54a4763c49cb0f86d902703f"
+  }
+}
