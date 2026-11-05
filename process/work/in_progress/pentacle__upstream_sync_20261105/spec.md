@@ -74,9 +74,10 @@ fixture or cleanup and recover only affected cells, preserving accepted evidence
 
 ## Checkpoint
 
-Merge and scoped Cursor repair prepared; critical preimages unchanged. Full
-JavaScript gate passed. Next: final daemon/CLI gates, isolated desktop proof,
-independent acceptance and normal promotion.
+Source and bounded repairs complete; critical preimages unchanged. JavaScript
+210 files and full CLI 8068 tests pass. Daemon run has 719 passes and four
+fixture failures, all recovered by a 76-pass selection of the three repaired
+files. Next: isolated desktop proof, final independent acceptance and promotion.
 
 ## Bounded Cursor receipt repair
 
@@ -89,3 +90,14 @@ Assistant text retains the same existing framing contract. Real tmux capture
 joins wrapped lines with `-J`; no new receipt grammar or authority is introduced.
 The final daemon manifest includes all new negatives and the original native
 PTY/queue/interrupt/default-shell and retained-shell provider workflows.
+
+## Fixture recovery
+
+The original 38-file daemon result remains recorded as failed. Two catalog
+fixtures now prove issued operator credentials through the production hello
+challenge and reject anonymous forged context. A token-telemetry fixture expects
+the mandatory boundary's earlier denial while retaining all reason/count/log/
+no-placeholder assertions and proving invalid requests never enter its handler.
+The Cursor timeout fixture shortens only the intended status probe, retaining
+the version probe's normal bound. All three files pass together (76 tests).
+No production authentication or timeout rule changed to satisfy these fixtures.

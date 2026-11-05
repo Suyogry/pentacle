@@ -100,9 +100,10 @@ def test_local_visibility_round_trips_through_client_projections(monkeypatch, tm
 
 
 @pytest.mark.parametrize('hello_client, forged_client', [('pentacle-mobile', 'pentacle'), ('pentacle', 'pentacle-mobile')])
-def test_real_dispatch_uses_hello_label_and_strips_rpc_auth_context(catalog, hello_client, forged_client):
+def test_real_dispatch_uses_hello_label_and_strips_rpc_auth_context(tmp_path, catalog, hello_client, forged_client):
     import json
     from server import Server
+    from _shared import operator_auth
 
     class Socket:
         remote_address = ('127.0.0.1', 12345)
@@ -110,9 +111,26 @@ def test_real_dispatch_uses_hello_label_and_strips_rpc_auth_context(catalog, hel
     async def run():
         daemon = Server()
         socket = Socket()
+        daemon.operator_credential_registry = operator_auth.OperatorCredentialRegistry(tmp_path / 'operators.json')
+        _, envelope = daemon.operator_credential_registry.issue(hello_client)
+        credential = operator_auth.decode_envelope(envelope)
         daemon.handlers['spawn_catalog_get'] = uiverbs.UIVerbs(None, None, None).spawn_catalog_get
         try:
-            await daemon._dispatch_inner(json.dumps({'type': 'hello', 'client': hello_client, 'snapshot': False}), websocket=socket)
+            denied = await daemon._dispatch_inner(json.dumps({
+                'type': 'spawn_catalog_get', '_auth_context': {'operator_authenticated': True,
+                                                            'connection_client': hello_client},
+            }), websocket=socket)
+            assert denied[0]['error_code'] == 'authentication_required'
+            nonce, expires = operator_auth.new_nonce()
+            daemon._operator_challenges[socket] = (nonce, expires)
+            proof = operator_auth.make_proof(credential['proof_key'], nonce,
+                                             credential['credential_id'], credential['client_kind'])
+            hello = await daemon._dispatch_inner(json.dumps({
+                'type': 'hello', 'client': hello_client, 'snapshot': False,
+                'auth_v2': {'scheme': operator_auth.AUTH_SCHEME,
+                            'credential_id': credential['credential_id'], 'proof': proof},
+            }), websocket=socket)
+            assert not any(frame.get('type') == 'hello.error' for frame in hello)
             frames = await daemon._dispatch_inner(json.dumps({
                 'type': 'spawn_catalog_get', 'request_id': 'real-dispatch',
                 '_auth_context': {'connection_client': forged_client},

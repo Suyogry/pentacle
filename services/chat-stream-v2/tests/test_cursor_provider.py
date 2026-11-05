@@ -121,7 +121,8 @@ def test_admission_timeouts_are_bounded(tmp_path, fake_agent, monkeypatch):
     machine = launch.local_machine('local', cwd=str(tmp_path), cursor_agent_bin=str(fake_agent))
     real = cursor_admission.subprocess.run
     def short(*args, **kwargs):
-        kwargs['timeout'] = .15
+        if args[0][1:2] == ['status']:
+            kwargs['timeout'] = .15
         return real(*args, **kwargs)
     monkeypatch.setattr(cursor_admission.subprocess,'run',short)
     monkeypatch.setenv('CURSOR_FAKE_MODE','status_timeout')

@@ -343,9 +343,11 @@ def test_token_verification_reason_codes_and_no_placeholder_telemetry(
                 STREAM_TOKEN_HASH_VERSION,
             )
             server = Server(store=store, sessions=sessions)
+            admitted = []
 
             async def gate(msg: dict) -> dict:
                 context = msg["_auth_context"]
+                admitted.append(context.get("reason_code"))
                 if not context["token_verified"]:
                     raise VerbError(
                         "routing_integrity_actor_token_unverified",
@@ -376,12 +378,19 @@ def test_token_verification_reason_codes_and_no_placeholder_telemetry(
                 ]
                 replies = []
                 for message, reason in cases:
+                    before = server.token_telemetry.snapshot()["recent"]
                     replies.append((await server._dispatch(json.dumps(message), websocket=_LocalPeer()))[0])
                     if reason == "verified":
                         assert replies[-1]["type"] == "unpark.ok"
                     else:
-                        assert replies[-1]["error_code"] == "routing_integrity_actor_token_unverified"
-                        assert replies[-1]["token_reason_code"] == reason
+                        assert replies[-1]["error_code"] == "authentication_required"
+                        assert admitted == []
+                    recent = server.token_telemetry.snapshot()["recent"]
+                    if reason == "absent":
+                        assert recent == before, 'absent credentials must not create placeholder telemetry'
+                    else:
+                        assert recent[-1]["reason_code"] == reason
+                assert admitted == ["verified"]
 
                 broken = Server(
                     store=_BrokenTokenStore(),
@@ -395,7 +404,9 @@ def test_token_verification_reason_codes_and_no_placeholder_telemetry(
                         websocket=_LocalPeer(),
                     )
                 )[0]
-                assert broken_reply["token_reason_code"] == "internal-error"
+                assert broken_reply["error_code"] == "authentication_required"
+                assert admitted == ["verified"], 'invalid proof must never reach the handler'
+                assert server.token_telemetry.snapshot()["recent"][-1]["reason_code"] == "internal-error"
 
             stats = (await server._dispatch(json.dumps({"type": "daemon.stats"})))[0]
             telemetry = stats["stats"]["seat_tokens"]
