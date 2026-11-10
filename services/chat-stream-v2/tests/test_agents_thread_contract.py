@@ -369,14 +369,14 @@ def test_real_rpc_admission_and_verified_parent_from_committed_fixture():
                 bad_spawn = next(case["request"] for case in fixture["spawn_cases"] if case["label"] == "missing_objective")
                 # Parented child: strict objective admission still rejects before effects.
                 result = await rpc({**bad_spawn, "objective_supported": True,
-                                    "parent_stream_id": "hosta:parent", "request_id": "rpc-objective"})
+                                    "parent_stream_id": "hosta:parent", "stream_token": token, "request_id": "rpc-objective"})
                 assert result["type"] == "spawn.error" and result["error_code"] == "objective_required"
                 assert not await store.reservations()
                 request = dict(type="thread.read", request_id="rpc-thread", child_stream_id="hosta:child", stream_token=token)
                 assert (await rpc(request))["type"] == "thread.read.ok"
                 assert (await rpc({**request, "parent_stream_id": "hosta:other"}))["error_code"] == "not_direct_child"
                 assert (await rpc({**request, "child_stream_id": "hosta:grandchild"}))["error_code"] == "not_direct_child"
-                assert (await rpc({**request, "stream_token": "forged", "_auth_context": {"token_verified": True}}))["error_code"] == "unauthorized"
+                assert (await rpc({**request, "stream_token": "forged", "_auth_context": {"token_verified": True}}))["error_code"] == "authentication_required"
         finally:
             if daemon:
                 await daemon.close()

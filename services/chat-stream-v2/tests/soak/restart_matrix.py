@@ -178,9 +178,24 @@ class RestartDaemon:
         self.proc = None
 
 
-def rpc(url: str, payload: dict[str, Any], *, timeout: float = 10.0) -> dict[str, Any]:
+def _authenticate_fixture_operator(ws, token_path: Path) -> None:
+    from _shared.operator_client import operator_hello
+    welcome = json.loads(ws.recv(timeout=5))
+    request_id = "fixture-operator-hello"
+    ws.send(json.dumps(operator_hello(welcome, token_path=token_path, request_id=request_id)))
+    while True:
+        frame = json.loads(ws.recv(timeout=5))
+        if frame.get("request_id") == request_id:
+            if frame.get("type") not in {"hello", "ready"}:
+                raise RuntimeError("fixture operator authentication failed")
+            return
+
+
+def rpc(url: str, payload: dict[str, Any], *, timeout: float = 10.0, token_path: Path | None = None) -> dict[str, Any]:
     payload = {"request_id": f"rm-{uuid.uuid4().hex[:12]}", **payload}
     with connect(url, open_timeout=5, max_size=None) as ws:
+        if token_path is not None:
+            _authenticate_fixture_operator(ws, token_path)
         ws.send(json.dumps(payload))
         deadline = time.monotonic() + timeout
         while True:
@@ -195,8 +210,9 @@ def rpc(url: str, payload: dict[str, Any], *, timeout: float = 10.0) -> dict[str
 class PendingRpc:
     """A request whose reply may never arrive (the daemon dies under it)."""
 
-    def __init__(self, url: str, payload: dict[str, Any]) -> None:
+    def __init__(self, url: str, payload: dict[str, Any], *, token_path: Path | None = None) -> None:
         self.payload = payload
+        self.token_path = token_path
         self.reply: dict[str, Any] | None = None
         self.error: str | None = None
         self.sent = threading.Event()
@@ -207,6 +223,8 @@ class PendingRpc:
     def _run(self, url: str) -> None:
         try:
             with connect(url, open_timeout=5, max_size=None) as ws:
+                if self.token_path is not None:
+                    _authenticate_fixture_operator(ws, self.token_path)
                 ws.send(json.dumps(self.payload))
                 self.sent.set()
                 while True:

@@ -200,6 +200,10 @@ def test_duplicate_request_and_ruling_reuse_approved_deferred_intent():
 
 
 def test_close_client_lost_response_replays_original_id_after_restart(tmp_path, monkeypatch):
+    # The transport double supplies verified primary-seat auth to the handler;
+    # the real client boundary must also have that seat's credential available.
+    monkeypatch.delenv("AGENT_ORCH_STREAM_TOKEN_FILE", raising=False)
+    monkeypatch.setenv("AGENT_ORCH_STREAM_TOKEN", "fixture-primary-seat-token")
     from agent_orch import wsclient
     from agent_orch.config import Config
 

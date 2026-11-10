@@ -391,6 +391,12 @@ def test_real_pane_checkpoint_survives_private_daemon_restart(tmp_path, aperture
     request = "checkpoint-request"
     evidence = Path(os.environ.get("PENTACLE_GATE_EVIDENCE_DIR", str(tmp_path / "evidence"))) / f"adoption-crash-{aperture}"
     with rm.cell_env(tmp_path / "checkpoint", evidence) as cell:
+        from _shared.operator_auth import OperatorCredentialRegistry
+        registry = OperatorCredentialRegistry(cell.daemon.home / ".config/pentacle-stream/operator-credentials.json")
+        _, envelope = registry.issue("pentacle", label="owned restart checkpoint fixture")
+        credential = cell.root / "operator.token"
+        credential.write_text(envelope)
+        credential.chmod(0o600)
         if aperture == "before_generation":
             async def prior_row():
                 store = Store(cell.daemon.db)
@@ -419,7 +425,7 @@ def test_real_pane_checkpoint_survives_private_daemon_restart(tmp_path, aperture
             cell.set_mode("hold_ready")
             marker = cell.control / f"{name}.booting"
         cell.daemon.start()
-        pending = rm.PendingRpc(cell.daemon.url, rm.spawn_payload(name, "", "checkpoint-key", request))
+        pending = rm.PendingRpc(cell.daemon.url, rm.spawn_payload(name, "", "checkpoint-key", request), token_path=credential)
         assert rm.wait_for(marker.exists, 15), f"spawn did not reach checkpoint: {pending.reply} {pending.error}"
         if aperture == "promptless_starting":
             assert rm.wait_for(lambda: any(r["status"] == "open" and r["bootstrap_state"] == "starting"
@@ -438,8 +444,8 @@ def test_real_pane_checkpoint_survives_private_daemon_restart(tmp_path, aperture
         settled = rm.wait_for(lambda: cell.outcomes(name), 30)
         assert settled, "private daemon did not reconcile the persisted checkpoint"
         after = cell.snapshot("recovered", name)
-        awaited = rm.rpc(cell.daemon.url, {"type": "await_spawn", "spawn_request_id": request})
-        status = rm.rpc(cell.daemon.url, {"type": "spawn_status", "idempotency_key": "checkpoint-key"})
+        awaited = rm.rpc(cell.daemon.url, {"type": "await_spawn", "spawn_request_id": request}, token_path=credential)
+        status = rm.rpc(cell.daemon.url, {"type": "spawn_status", "idempotency_key": "checkpoint-key"}, token_path=credential)
         cell.note("checkpoint-proof", aperture=aperture, identity=identity, stop=stop,
                   generation=generation, awaited=awaited, status=status)
         assert cell.inputs(name) == [], "promptless adoption must not fabricate provider input"
