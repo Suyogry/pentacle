@@ -220,7 +220,7 @@ def prepare_archive(state_dir: Path, source_archive_path: Path | None = None, *,
 
 
 @asynccontextmanager
-async def _connection(port, stream, token, operator=None):
+async def _connection(port, stream, token, operator=None, *, allow_hello_refusal=False):
     import websockets
     async with websockets.connect(f"ws://127.0.0.1:{port}", max_size=None) as socket:
         welcome = json.loads(await socket.recv())
@@ -254,7 +254,9 @@ async def _connection(port, stream, token, operator=None):
             stream_token=token, from_stream_id=stream, **proof,
             capabilities={"work_lanes_v1": True, "assistant_composite_v1": True},
             subscribe={"snapshot": False, "mode": "rpc", "include_subagents": True})
-        require(hello.get("type") in {"hello", "ready"}, "socket:hello")
+        require(hello.get("type") in {"hello", "ready"} or (
+            allow_hello_refusal and hello.get("type") == "hello.error" and bool(hello.get("error_code"))
+        ), "socket:hello")
         yield rpc
 
 
@@ -443,7 +445,9 @@ async def run_drill(state_dir: Path, *, composite_stream: str, binding_name: str
             result["rpc"] = await _projections(rpc, expected, composite_stream)
             before = await rpc("assistant.binding", "binding")
             for foreign, identity, credential in (("foreign", DRILL_STREAM, drill_token), ("stale", DRILL_STREAM, stale_token)):
-                async with _connection(port, identity, credential) as refused_rpc:
+                # A stale seat can be refused at hello on authenticated forks;
+                # do not require anonymous loopback admission to test refusal.
+                async with _connection(port, identity, credential, allow_hello_refusal=foreign == "stale") as refused_rpc:
                     refused = await refused_rpc("assistant.rebind", foreign, expected_revision=before.get("revision") or 0,
                         target_stream_id=DRILL_STREAM, target_generation=drill["session_generation"])
                     require(refused.get("type") != "assistant.rebind.ok" and bool(refused.get("error_code")),
