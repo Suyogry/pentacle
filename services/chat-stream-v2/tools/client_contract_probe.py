@@ -80,6 +80,7 @@ _REQUIRED_FIELDS = ("stream_id", "kind", "timestamp")
 def _recv_reply(
     ws, *, timeout: float, pushes: list[dict] | None = None,
     wire_sizes: list[int] | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """One correlated reply, skipping unsolicited pushes (incl. `welcome`)."""
     while True:
@@ -87,7 +88,7 @@ def _recv_reply(
         if wire_sizes is not None:
             wire_sizes.append(len(raw) if isinstance(raw, bytes) else len(raw.encode("utf-8")))
         frame = json.loads(raw)
-        if frame.get("type") in _PUSH_TYPES:
+        if frame.get("type") in _PUSH_TYPES or (request_id is not None and frame.get("request_id") != request_id):
             if pushes is not None:
                 pushes.append(frame)
             continue
@@ -384,7 +385,7 @@ def desktop_handshake_fetch_reply_observed(
         while True:
             raw = ws.recv(timeout=timeout)
             frame = json.loads(raw)
-            if frame.get("type") in _PUSH_TYPES:
+            if frame.get("type") in _PUSH_TYPES or frame.get("request_id") != "probe-events":
                 pushes.append(frame)
                 continue
             wire_size = len(raw) if isinstance(raw, bytes) else len(raw.encode("utf-8"))
@@ -418,7 +419,7 @@ def desktop_handshake_fetch_reply_observed(
             "type": "inspect_stream", "request_id": "probe-authority",
             "stream_id": stream_id, "event_tail": inspect_tail,
         }))
-        inspected = _recv_reply(ws, timeout=timeout, pushes=pushes)
+        inspected = _recv_reply(ws, timeout=timeout, pushes=pushes, request_id="probe-authority")
         if inspected.get("type") != "inspect_stream.ok":
             raise RuntimeError(f"authoritative inspect failed: {inspected}")
         authoritative_events = inspected.get("recent_events")

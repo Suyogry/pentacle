@@ -47,6 +47,10 @@ class ReconTmux:
         self.kill_calls = 0
         self.nonces: dict[str, str] = {}
         self.kill_works = kill_works
+        self.staged = {}
+
+    async def stage_text(self, path, data):
+        self.staged[path] = data
 
     async def has_session(self, name: str) -> bool:
         return name in self.live

@@ -74,6 +74,9 @@ def test_receive_time_preserves_nonce_and_credential_rejections(daemon, monkeypa
 def test_non_handshake_count_covers_the_whole_connection(daemon, caplog, delivery):
     async def run():
         async with connected(daemon) as (socket, welcome, _):
+            if delivery in {"broadcast", "before_rejection"}:
+                _, authorized = signed_hello(daemon, welcome)
+                assert (await socket.rpc(authorized))["type"] == "ready"
             if delivery == "direct":
                 await daemon._send_direct(socket, [{"type": "counter.fixture"}])
                 await socket.receive(kind="counter.fixture")
@@ -85,5 +88,6 @@ def test_non_handshake_count_covers_the_whole_connection(daemon, caplog, deliver
                 hello["auth_v2"]["proof"] = operator_auth.encode_b64url(b"x" * operator_auth.AUTH_PROOF_BYTES)
                 assert (await socket.rpc(hello))["type"] == "hello.error"
         close = one(caplog, "close")
-        assert close["non_handshake_tx"] == (0 if delivery == "handshake" else 1)
+        # Authenticated RPC hello also sends one capability/catalog frame.
+        assert close["non_handshake_tx"] == (0 if delivery == "handshake" else 2 if delivery in {"broadcast", "before_rejection"} else 1)
     asyncio.run(run())

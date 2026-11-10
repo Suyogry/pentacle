@@ -22,6 +22,8 @@ def test_direct_inventory_waiting_for_send_lock_cannot_land_after_rejection(daem
     async def run():
         await sensitive_frames(daemon)
         async with connected(daemon, peer("native")) as (socket, welcome, _):
+            _, authorized = signed_hello(daemon, welcome)
+            assert (await socket.rpc(authorized))["type"] == "ready"
             pending, rejected = asyncio.Event(), asyncio.Event()
             original_send = daemon._send_direct
             original_failed = daemon._diag_auth_failure

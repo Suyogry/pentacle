@@ -46,7 +46,7 @@ def sent_since(socket, start):
 
 
 @pytest.mark.parametrize("transport", ["remote", "native", "origin"])
-@pytest.mark.parametrize("stage", ["no_hello", "delayed_hello", "rejected_proof"])
+@pytest.mark.parametrize("stage", ["no_hello", "delayed_hello", "rejected_proof", "authenticated"])
 def test_application_fanout_auth_matrix(daemon, monkeypatch, transport, stage):
     async def run():
         frames = await sensitive_frames(daemon)
@@ -58,6 +58,8 @@ def test_application_fanout_auth_matrix(daemon, monkeypatch, transport, stage):
                 received.set()
             monkeypatch.setattr(daemon, "_diag_rx", observed)
             _, hello = signed_hello(daemon, welcome)
+            if stage == "authenticated":
+                assert (await socket.rpc(hello))["type"] == "ready"
             if stage == "rejected_proof":
                 hello["auth_v2"]["proof"] = operator_auth.encode_b64url(b"x" * operator_auth.AUTH_PROOF_BYTES)
                 assert (await socket.rpc(hello))["error_code"] == "operator_auth_invalid"
@@ -71,7 +73,7 @@ def test_application_fanout_auth_matrix(daemon, monkeypatch, transport, stage):
                     await daemon.broadcast(frame)
                 await flush(daemon)
                 delivered = sent_since(socket, start)
-                eligible = transport == "native" and stage != "rejected_proof"
+                eligible = stage == "authenticated"
                 if eligible:
                     assert [f["type"] for f in delivered] == [f["type"] for f in frames]
                     assert delivered[0]["sessions"]
@@ -92,16 +94,16 @@ def test_application_fanout_auth_matrix(daemon, monkeypatch, transport, stage):
     asyncio.run(run())
 
 
-def test_fresh_native_no_claim_hello_still_gets_bootstrap_ready(daemon):
+def test_fresh_native_no_claim_hello_requires_authentication(daemon):
     async def run():
         await sensitive_frames(daemon)
         async with connected(daemon, peer("native")) as (socket, _, _):
             reply = await socket.rpc({"type": "hello", "client": "native-bootstrap",
                                       "subscribe": {"mode": "rpc", "snapshot": False}})
-            assert reply["type"] == "ready"
+            assert reply["type"] == "hello.error"
             inventory = await socket.rpc({"type": "list_sessions"})
-            assert inventory["type"] == "list_sessions.ok"
-            assert any(row["stream_id"] == "fixture:seat" for row in inventory["active"])
+            assert inventory["error_code"] == "authentication_required"
+            assert not inventory.get("active")
     asyncio.run(run())
 
 
@@ -125,6 +127,8 @@ def test_queued_native_inventory_is_dropped_after_rejection_while_writer_waits(d
     async def run():
         frames = await sensitive_frames(daemon)
         async with connected(daemon, peer("native")) as (socket, welcome, _):
+            _, authorized = signed_hello(daemon, welcome)
+            assert (await socket.rpc(authorized))["type"] == "ready"
             dequeued, rejected = asyncio.Event(), asyncio.Event()
             queue = daemon._client_send_queues[socket]
             removed = daemon._diag_removed
@@ -187,7 +191,9 @@ class OrderedPeers(set):
 def test_mixed_native_group_never_reuses_eligible_projection_for_rejected_peer(daemon, rejected_first):
     async def run():
         frames = await sensitive_frames(daemon)
-        async with connected(daemon) as (eligible, _, _), connected(daemon) as (rejected, welcome, _):
+        async with connected(daemon) as (eligible, good_welcome, _), connected(daemon) as (rejected, welcome, _):
+            _, authorized = signed_hello(daemon, good_welcome)
+            assert (await eligible.rpc(authorized))["type"] == "ready"
             _, hello = signed_hello(daemon, welcome)
             hello["auth_v2"]["proof"] = operator_auth.encode_b64url(b"x" * operator_auth.AUTH_PROOF_BYTES)
             assert (await rejected.rpc(hello))["error_code"] == "operator_auth_invalid"

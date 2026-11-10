@@ -28,6 +28,11 @@ NAME = "v2-phantom"
 
 
 class BootReadyTmux:
+    async def stage_text(self, path, data):
+        if not hasattr(self, "staged"):
+            self.staged = {}
+        self.staged[path] = data
+
     """A pane that boots (capture shows the READY marker) and dies on kill."""
 
     def __init__(self) -> None:
