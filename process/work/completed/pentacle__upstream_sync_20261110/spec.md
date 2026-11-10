@@ -2,11 +2,12 @@
 id: spec_pentacle__upstream_sync_20261110
 title: Merge official updates while preserving fork workflows
 type: spec
-status: in_progress
+status: completed
 canonical: false
 created_at: '2026-11-10'
 updated_at: '2026-11-10'
-source_path: work/in_progress/pentacle__upstream_sync_20261110/spec.md
+completed_at: '2026-11-10'
+source_path: work/completed/pentacle__upstream_sync_20261110/spec.md
 machine: local
 owner: maintainer
 tags: [pentacle, integration]
@@ -63,49 +64,53 @@ source-mode identity caveats without claiming new runtime activation.
 - [x] Independent spec QA accepts scope and evidence plan before resolution.
 - [x] Merge includes official history; explicit desktop retention and all fork
   security contracts survive; no conflict markers or accidental PIMR merge.
-- [ ] Dedicated Python 3.14 and exact-lock Node environment. Full CLI and root
+- [x] Dedicated Python 3.14 and exact-lock Node environment. Full CLI and root
   Node suites, changed daemon tests plus auth/account/spawn/assistant/lane/
   deployment regressions, core tests/typecheck, mic security tests, desktop/web
   builds. Audit dependencies without automatic fixes. Pin tested manifests.
-- [ ] Run isolated real desktop/daemon/native PTY smoke with synthetic provider
+- [x] Run isolated real desktop/daemon/native PTY smoke with synthetic provider
   and private temp state, plus web checks where changed. Preserve RED receipts;
   compare failures with exact untouched upstream/base before classifying them.
   No passing claim for skipped or pre-existing failing gates. Do not execute
   production/fleet deployment tools or infer live provider correctness.
-- [ ] Independent final source/test/cold-doc QA on frozen candidate and receipt
+- [x] Independent final source/test/cold-doc QA on frozen candidate and receipt
   hashes; no claim of full fleet/runtime certification from source checks.
-- [ ] Refetch before normal main fast-forward/push, verify personal main/config/
+- [x] Refetch before normal main fast-forward/push, verify personal main/config/
   daemon continuity and unchanged PIMR branch. Keep current installed desktop
   untouched. Clean only owned test resources/worktree; close with exact evidence.
 
 ## Checkpoint
 
-Source integration complete on the isolated branch; both official histories
-are ancestors. Independent plan QA accepted before resolution. Retained desktop
-entry/preload/native dependency closure, patched Electron tooling and native
-bridge tests; upstream web/backend/lane/account/auth/recovery changes integrated.
-No PIMR branch, personal configuration or service was changed.
+Disposition: **Shipped source integration**. Accepted candidate
+`a86a8524918ee0deedadf38d3ff573270fb61ac7` was fast-forwarded onto local main
+and normally pushed to `Suyogry/pentacle` main, preserving official history
+through `0b0a64f38967888c58952d9975f3403aeca8581e` and the original fork history.
+Independent final source/security review accepted its unchanged source scope;
+a bounded cold-doc rejection was repaired and independently accepted with a
+real credentialed profile-to-host-to-isolated-daemon connection, missing-token
+refusal and owned cleanup. QA receipt hashes are in `_artifacts/validation.md`.
 
-Validation: CLI 8,122 passed/13 skipped; core tests and both type checks passed;
-46 mic boundary tests passed; 491 final affected auth/account/lane/recovery/
-spawn controls passed; desktop real PTY/authenticated synthetic-provider smoke
-and six browser scenarios passed with owned cleanup. Root Node run has 206
-passing files plus two harness failures (pre-push file budget and native process
-inspection); both original files passed isolated recheck with clean cleanup,
-without changing guards. Broad daemon capture: 5,127 passed/29 failed; ten
-failures were corrected with authentic test credentials, faithful token staging,
-correlated probe reads and stale-proof refusal handling. The 19 remaining IDs
-are each reproduced on untouched official upstream or the original fork;
-`baseline-failure-classification.json` records the exact sets. They remain
-explicit failed gates, not claimed passing results. Owner maintainer retains
-follow-up before any full fleet/runtime certification.
+Validation: CLI 8,122 passed/13 skipped; core runtime tests and type checks
+passed; 46 mic boundary tests and 491 affected auth/account/lane/recovery/spawn
+controls passed. Desktop synthetic-provider/native PTY/auth/isolation smoke and
+web chat/config/voice/gallery/dashboard plus terminal type/resize/detach passed.
+Root Node has 206 passing files and two harness failures; both unchanged files
+passed isolated recheck. The broad daemon run captured 5,127 passed/29 failed;
+ten failures were repaired and passed focused controls. The 19 residual IDs each
+reproduce on untouched official upstream or original fork. These remain failed
+gates; maintainer owns follow-up before full fleet/runtime certification. No
+criterion claims those broad runs were green. Production audit zero; full audit
+six moderate tooling entries, no high/critical. Existing production dependency
+versions and all fourteen protected preimage files are unchanged.
 
-Production npm audit is zero; full audit retains six moderate tooling entries,
-no high/critical. All 14 protected preimage files and existing production lock
-versions are unchanged. Source-only integration; no runtime/fleet certification
-or live provider inference is claimed. Next: freeze candidate/evidence for
-independent final source, test and cold-documentation QA, then normal main
-fast-forward and personal-fork push if accepted.
+Main desktop/web assets rebuilt successfully. Actual daemon authenticated hello
+and spawn catalog readbacks pass before/after promotion, with the same PID and
+unchanged private wrapper/service/configuration hashes. PIMR ref is unchanged.
+No provider inference, personal service restart/activation, mic capture or
+packaged desktop replacement occurred. Main source files changed on disk; these
+readbacks establish continuity, not activation or certification of the new
+backend. Private receipts remain in bundle `upstream-sync-20261110`. Only owned
+comparison/integration worktrees are eligible for cleanup after remote readback.
 
 ## Retro
 

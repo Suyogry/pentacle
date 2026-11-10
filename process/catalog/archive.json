@@ -185,6 +185,27 @@
     "completed_at": "2026-11-05"
   },
   {
+    "id": "spec_pentacle__upstream_sync_20261110",
+    "path": "work/completed/pentacle__upstream_sync_20261110/spec.md",
+    "title": "Merge official updates while preserving fork workflows",
+    "type": "spec",
+    "canonical": false,
+    "updated_at": "2026-11-10",
+    "source_path": "work/completed/pentacle__upstream_sync_20261110/spec.md",
+    "tags": [
+      "pentacle",
+      "integration"
+    ],
+    "summary": "Merge official source, retain authenticated desktop compatibility and fork protections.",
+    "related": [
+      "work_pentacle__upstream_sync_20261110"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-11-10"
+  },
+  {
     "id": "spec_provider_signin_format_20261027",
     "path": "work/completed/pentacle__provider_signin_format_20261027/spec.md",
     "title": "Recognize the installed Claude CLI authorization URL format",
@@ -454,6 +475,27 @@
     "machine": "local",
     "owner": "maintainer",
     "completed_at": "2026-11-05"
+  },
+  {
+    "id": "work_pentacle__upstream_sync_20261110",
+    "path": "work/completed/pentacle__upstream_sync_20261110/summary.md",
+    "title": "Merge official updates while preserving fork workflows",
+    "type": "work",
+    "canonical": false,
+    "updated_at": "2026-11-10",
+    "source_path": "work/completed/pentacle__upstream_sync_20261110/summary.md",
+    "tags": [
+      "pentacle",
+      "integration"
+    ],
+    "summary": "Shipped official-source integration to fork main with desktop/auth protections and bounded QA evidence.",
+    "related": [
+      "spec_pentacle__upstream_sync_20261110"
+    ],
+    "status": "completed",
+    "machine": "local",
+    "owner": "maintainer",
+    "completed_at": "2026-11-10"
   },
   {
     "id": "work_provider_signin_format_20261027",
