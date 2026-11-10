@@ -680,6 +680,11 @@ def test_single_oversized_event_backfills_without_blocking_history(
                     reply = json.loads(wire)
                     if reply.get("type") in probe._PUSH_TYPES:
                         continue
+                    if reply.get("request_id") != "oversized-events":
+                        # Authenticated clients may receive refreshed snapshots
+                        # while this independently correlated history read runs.
+                        assert reply.get("type") == "snapshot", reply
+                        continue
                     assert reply["request_id"] == "oversized-events"
                     assert reply["type"] in {"request_stream_events.chunk", "request_stream_events.ok"}, reply
                     sizes.append(len(wire.encode("utf-8")))
