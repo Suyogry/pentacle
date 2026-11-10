@@ -131,7 +131,7 @@ test('a composite popout bootstrap cannot allocate a terminal', async (t) => {
   assert.equal(vm.runInContext('!!state.terminals[0]', h.context), false);
 });
 
-// Exercise the shipped renderer bundle -> preload -> shared IPC -> socket payload.
+// Exercise the shipped renderer bundle -> browser bridge -> shared handler -> socket payload.
 async function wireRenderer(t, compositeMode = true, {
   streamId = STREAM,
   messageKind = 'ASSIST_TEXT',
@@ -188,7 +188,7 @@ async function wireRenderer(t, compositeMode = true, {
   return { ...h, store, wires };
 }
 
-test('desktop composite composer sends exact input and identity through real IPC; ordinary sends retain their wire', async t => {
+test('composite composer sends exact input and identity through the web handler; ordinary sends retain their wire', async t => {
   for (const compositeMode of [true, false]) {
     const h = await wireRenderer(t, compositeMode);
     const literal = '  Plan this\n\nwithout changing spacing  ';

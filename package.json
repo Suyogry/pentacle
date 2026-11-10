@@ -1,7 +1,7 @@
 {
   "name": "pentacle",
   "version": "1.0.0",
-  "description": "Local-first desktop client for Pentacle.",
+  "description": "Local-first agent orchestration with web and retained desktop clients.",
   "license": "MIT",
   "private": true,
   "repository": {
@@ -52,7 +52,8 @@
     "electron": "^44.9.3",
     "electron-builder": "^26.15.3",
     "esbuild": "^0.25.0",
-    "jsdom": "^24.1.3"
+    "jsdom": "^24.1.3",
+    "playwright": "1.65.0"
   },
   "build": {
     "appId": "com.example.pentacle",

@@ -148,7 +148,8 @@ class Rehearsal:
         self.repo = self.b.root / "release"
         self.repo.mkdir(mode=0o700)
         self.process = None
-        self.fail_forward = False
+        self.fail_forward = self.fail_prior_proof = False
+        self.verified_prior = None
         self.events = []
         self.policy = self.b.root / "policy.json"
         self.ready = self.b.root / "ready.json"
@@ -176,7 +177,9 @@ class Rehearsal:
             for path in (self.controller / relative).glob("*.py"):
                 shutil.copy2(path, destination / path.name)
         shutil.copytree(source / "tools", self.repo / "services/chat-stream-v2/tools", ignore=shutil.ignore_patterns("__pycache__"))
-        for relative in ("services/chat-stream-v2/requirements.txt", "services/agent-orch/pyproject.toml",
+        for relative in ("pentacle-chat-core/lane_icons.json", "pentacle-chat-core/lane_hues.json",
+                         "pentacle-chat-core/tests/fixtures/summary_prose_cases.json",
+                         "services/_shared/spawn_defaults.json", "services/chat-stream-v2/requirements.txt", "services/agent-orch/pyproject.toml",
                          "services/agent-orch/deploy/runtime_python.py",
                          "services/chat-stream-v2/deploy/com.pentacle.usage-state-collector.plist",
                          "services/chat-stream-v2/deploy/com.pentacle.spawn-fleet-smoke.plist"):
@@ -250,6 +253,7 @@ class Rehearsal:
                 detail = Path(self.log_handle.name).read_text(errors="replace")[-1800:]
                 raise c.Invalid("disposable daemon did not become ready: " + detail)
             time.sleep(0.05)
+        self.started_ns = time.time_ns()
         self.events.append({"event": "started", "pid": self.process.pid, "sha": self.git("rev-parse", "HEAD")})
 
     def prepare(self, intent, folder):
@@ -312,6 +316,10 @@ class Rehearsal:
     def keep_stopped(self, receipt):
         self.stop(receipt)
 
+    def prior_still_running(self, receipt, identity):
+        return (self.process is not None and self.process.poll() is None and self.process.pid == identity["pid"]
+                and str(self.started_ns) == identity["birth"] and self.git("rev-parse", "HEAD") == identity["sha"])
+
     def start_verify(self, receipt, *, rollback):
         self.start()
         ready = c.read_json(self.ready)
@@ -322,7 +330,15 @@ class Rehearsal:
         if welcome.get("runtime_sha") != expected or ready["loaded_policy"] != c.file_digest(self.policy):
             raise c.Invalid("disposable runtime/policy readback mismatch")
         if self.fail_forward and not rollback: raise c.Invalid("controlled post-switch failure")
-        return {"outcome": "passed", "runtime": ready, "native_boundary": "mocked", "fleet_readiness": "not_tested"}
+        if rollback:
+            self.verified_prior = {"pid": self.process.pid, "birth": str(self.started_ns), "sha": expected}
+            if self.fail_prior_proof: raise c.Invalid("controlled prior proof failure")
+        result = {"outcome": "passed", "runtime": ready, "native_boundary": "mocked", "fleet_readiness": "not_tested"}
+        if rollback:
+            # The disposable adapter proves ordering only; native input is mocked.
+            result.update(restoration={"outcome":"passed", "scope":"disposable_ordering"},
+                          model_canary={"outcome":"not_run_by_design"})
+        return result
 
     def close(self):
         self.stop(None)

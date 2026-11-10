@@ -20,8 +20,7 @@ controls are unchanged; `panel-dashboards`, `dashboard-list` and
 Use the existing exported configuration object in a private file selected by
 `PENTACLE_CONFIG=/absolute/path/pentacle.config.local.js`; the loader does not
 merge an overlay with the example configuration. See
-[Desktop configuration](desktop_config.md). Restart the desktop, or restart the
-web host and reload its page, after profile changes.
+[Web configuration](desktop_config.md). Restart the web host and reload its page, after profile changes.
 
 | Key | Effect |
 | --- | --- |
@@ -34,6 +33,27 @@ and `dashboards.modeler3d.url` no longer control the list or hosted URL. Modeler
 is a normal hosted catalog record, with no separate built-in registration.
 Without a configured catalog or usable cache, there is no independently ordered
 built-in fallback; an empty list reads “No dashboards configured”.
+
+## Catalog refresh
+
+Returning to Dashboards immediately displays the last validated catalog from
+this connected browser and catalog scope, with a cached-age/refreshing label.
+Repeated navigation shares one background list/get request. An unchanged
+response preserves the selected board; changed catalog content reconciles it
+through normal unmount/mount cleanup. Leaving the view disposes board resources
+while a still-current catalog request can finish for the next entry.
+
+Disconnects, binding/scope changes and catalog update/removal pushes invalidate
+immediate reuse. Authoritative removal, denial, malformed or unsupported
+responses clear provisional membership. A transport outage may display validated
+cached data with an unavailable warning; restored session storage is only this
+stale fallback, never immediate authenticated authority. Hosted opening always
+checks the current daemon policy and identity mode.
+
+Automatic chat asset/question refreshes coalesce by viewer while pending.
+Inventories and pushes continue to update chat state while Dashboards is open;
+automatic chat reads wait until Chats returns, then catch up once per dirty
+viewer. Initial attachment and explicit user reads retain their normal behavior.
 
 ## Hosted URL and web admission
 

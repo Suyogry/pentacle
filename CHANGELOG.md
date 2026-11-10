@@ -13,17 +13,26 @@ backfilled. Changes that land between releases accumulate under `Unreleased`.
 
 ## Unreleased
 
+- Require a dedicated live non-FD lane lead for active work, safe drained holds and succession, and show actual work by any assigned agent beyond preview caps.
+- Add source-backed checkpoint detail, full-membership visibility counts, goal prose and current-checkpoint validation for new implementation readiness reports.
+
+- 2026-11-07: Electron desktop app removed.
+
 ### Added
 
+- README rewritten around the control-plane overview: tagline, core principles, a layer table of how Pentacle fits together, and a shorter quick start.
+- Select a named provider account across launches, schedules, recovery, desktop/web controls, and smoke/deploy callers while preserving host defaults and session bindings.
 - Cursor CLI seats with the existing provider picker, queued terminal input, streamed chat/tool events, and pinned-release admission checks.
 
 ### Fixed
 
-- Cursor tool-status output sanitizes terminal controls and prefixes every line so provider metadata cannot imitate input-submission receipts.
+- Coordinated preparation accepts a qualified plain-deployed prior with verified receipt ancestry.
+- Coordinated deployment preparation resolves smoke helper imports without a custom Python path.
+- New Chat lists healthy accounts with configurable labels, preselects the host default without a duplicate option, and retains account choice across late catalog responses.
 
 ### Removed
 
-- Upstream removed its Settings provider re-login flow. This fork retains the corrected [provider sign-in controls](docs/provider_relogin.md), including same-origin admission, private PTY ownership and the Claude URL parser fix. Daemon account health and `agent-orch account relogin` remain available.
+- Settings no longer shows the provider re-login controls, and the `provider-relogin:*` web socket and desktop IPC channels are gone; a rebuilt flow is tracked as `spec_pentacle__provider_relogin_flow_validation_2026_09`. Daemon account health and `agent-orch account relogin` are unchanged.
 
 ## 2026-11-02
 

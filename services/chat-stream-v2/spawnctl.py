@@ -53,6 +53,7 @@ import store_lifecycle_authority as lifecycle_authority
 import asyncio
 from contextlib import nullcontext
 import tmux_transport
+import spawn_creation
 import hashlib
 import json
 import logging
@@ -258,7 +259,8 @@ def new_work_commission(msg: dict[str, Any], *, resume: bool) -> bool:
     """A2/R5: a token-verified agent commissioning new work, by operation only.
 
     Handoffs, resumes, host transfers, daemon fires and recovery keep continuity
-    and are never refused. Operator chats without a seat token and trusted
+    and are not new commissions; lane-linked execution still checks ownership.
+    Operator chats without a seat token and trusted
     in-process daemon launches are independent work. Seat operator
     elevation does not exempt a token-verified caller. Text is never inspected."""
     auth = msg.get("_auth_context") or {}
@@ -592,6 +594,19 @@ class SpawnCtl:
                 for spec_id in explicit
             ]
 
+        auth = msg.get("_auth_context") or {}
+        if auth.get("service_authenticated") and auth.get("service_actor") == "daemon:scheduler":
+            # Only the scheduler's authenticated, receipt-checked projection can
+            # distinguish original explicit recovery selection from owner fallback.
+            # No public request field or retained schedule provenance is proof.
+            composite = getattr(getattr(self.sessions, "assistant", None), "front_desk", None)
+            configured = composite.env_config.rebind_authorized_spec_ids if composite else frozenset()
+            proved = auth.get("configured_recovery_explicit_spec_ids")
+            proved = set(proved) if isinstance(proved, list) and all(isinstance(s, str) for s in proved) else set()
+            for entry in provenance:
+                if entry["spec_id"] in configured and entry["spec_id"] not in proved:
+                    entry["provenance"] = "handoff_inherited" if msg.get("handoff_from_stream_id") else "parent_inherited"
+
         # The work assignment is the first explicit spec; an inherited binding carries the
         # source seat's assignment, never an arbitrary tag from its portfolio.
         if inherited and msg.get("handoff_from_stream_id") and carried_assignment(source_row) == UNASSIGNED:
@@ -625,8 +640,6 @@ class SpawnCtl:
         if ":" in caller_id:
             caller = await self.store.fetch_session(*caller_id.split(":", 1))
         policy = getattr(self.sessions, "assistant", None)
-        if not auth.get("covered_admission") and (caller_id.endswith(":assistant") or (policy is not None and policy.protects(caller))):
-            return None  # A2/R5: protected assistant and composite seats are exempt
         spec_id = binding.get("assigned_spec_id")
         if not spec_id:
             source_id = str(msg.get("parent_stream_id") or "")
@@ -648,6 +661,24 @@ class SpawnCtl:
         return VerbError("work_lane_assignment_unlinked",
                          f"{spec_id} is not a member of any open product lane; the FD adds it first: {repair}",
                          spec_id=spec_id)
+
+    async def _lane_admission(self, msg, binding, role):
+        """The same guard covers new work, supporting work, resume and scheduled fire."""
+        spec = effective_assignment(binding)
+        if not spec:
+            if msg.get("provision_only"):
+                raise VerbError("work_assignment_required", "Provision a lane lead with its --spec-id")
+            return
+        # Provision only: a verified current FD may create an ordinary lead
+        # without any task input. Binding and activation remain explicit ops.
+        provision = (role in {"lead", "nexus"} and not self._prompt_requested(msg)
+                     and not str(msg.get("command") or "").strip()
+                     and await self.store.lane_provisioning_allowed(msg.get("_auth_context") or {}))
+        if msg.get("provision_only") and not provision:
+            raise VerbError("work_lane_provisioning_forbidden", "Only the authenticated current FD may provision a promptless dedicated lead")
+        await self.store.require_lane_execution(spec, lane_id=msg.get("lane_id"), provisioning=provision,
+                                                linked_only=not msg.get("provision_only"))
+        return provision
 
     async def work_checkpoint_warning(self, msg: dict[str, Any], stream_id: str) -> dict[str, Any] | None:
         """A5: report the assignment's display deficiencies; never a refusal."""
@@ -1778,6 +1809,7 @@ class SpawnCtl:
         if brief:
             tmux_transport.assert_injectable(brief, "brief")
         binding = await self._resolve_spec_binding(msg, host, admission_name)
+        await self._lane_admission(msg, binding, msg.get("role"))
         provider = str(msg.get("provider") or "").strip()
         requested_model = msg.get("model")
         requested_effort = msg.get("effort")
@@ -1800,6 +1832,19 @@ class SpawnCtl:
         except SpawnProfileError as exc:
             raise VerbError(exc.code, str(exc)) from exc
         resolved_provider = str(resolved["provider"])
+        account_msg = await self._retain_handoff_account(msg)
+        runtime = getattr(self, "account_runtime", None)
+        if "account" in account_msg:
+            if runtime is None:
+                raise VerbError("account_feature_off", "named accounts are unavailable")
+            from provider_accounts import AccountError
+            try:
+                if resolved_provider in {"cursor", "gemini"}:
+                    raise AccountError(f"{resolved_provider}_named_accounts_unsupported")
+                await runtime.choose_launch(host=host, provider=resolved_provider,
+                    model=resolved["model"], effort=resolved["effort"], message=account_msg)
+            except AccountError as exc:
+                raise VerbError(str(exc), str(exc), **exc.context) from None
         if not str(msg.get("command") or "").strip() and self._launch_machine(host, resolved_provider) is None:
             raise VerbError("spawn_launch_unavailable", "no target-host machine profile for scheduled spawn")
         qa = await qa_dispatch.admit(self.store, msg,
@@ -1807,6 +1852,7 @@ class SpawnCtl:
             reviewer=f"{host}:{admission_name}", generation="", msg_id=0,
             check_only=True, handoff=bool(msg.get("handoff")))
         return {
+            **({"account": account_msg["account"]} if "account" in account_msg else {}),
             "qa_owner_generation": (qa or {}).get("coordinator_generation"),
             "host": host,
             "role": resolved.get("role", msg.get("role")),
@@ -1829,6 +1875,9 @@ class SpawnCtl:
         # Capability/provenance metadata must not break a pre-hotfix explicit retry.
         volatile = {"request_id", "idempotency_key", "objective_supported", "objective_source"}
         canonical = {k: msg[k] for k in sorted(msg) if k not in volatile}
+        if isinstance(canonical.get("_auth_context"), dict):
+            canonical["_auth_context"] = {key: value for key, value in canonical["_auth_context"].items()
+                                          if key != "configured_recovery_explicit_spec_ids"}
         return hashlib.sha256(
             json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str).encode()
         ).hexdigest()
@@ -2075,11 +2124,33 @@ class SpawnCtl:
         # launch resolution and reservation so an explicit but unknown item can
         # never produce a pane, intent, or misleading spawn.ok.
         spec_binding = await self._resolve_spec_binding(msg, host, name)
+        # Native resume preserves its retained assignment below. Guard that
+        # same source, rather than the fresh request's often-empty spec tags.
+        execution_binding = resume_prior_row if resume_prior_row is not None else spec_binding
         policy = getattr(self.sessions, "assistant", None)
+        # Resolve presentation only after the original wire hash is frozen. The
+        # same decision feeds launch, retained intent and first open; replay uses
+        # the already admitted artifact below rather than updating its row.
+        visibility_fields = {**tmux_transport.open_fields(msg), **spec_binding}
+        if resume_prior_row is not None:
+            visibility_fields.update({key: resume_prior_row[key] for key in RESUME_PRESERVED_FIELDS
+                                      if key in resume_prior_row and key != "visibility"})
+        effective_visibility = msg.get("visibility")
+        source_id = str(msg.get("handoff_from_stream_id") or "")
+        predecessor = (await self.store.fetch_session(*source_id.split(":", 1))
+                       if ":" in source_id else None)
+        if predecessor is not None and not visibility_fields.get("role"):
+            visibility_fields["role"] = predecessor.get("role")
+        if effective_visibility is None:
+            prior = resume_prior_row if resume_prior_row is not None else predecessor
+            effective_visibility = (prior.get("visibility") or "default") if prior is not None else visibility_fields["visibility"]
+        visibility_fields["visibility"] = effective_visibility
         if policy is not None and policy.is_front_desk_seat(
-            f"{host}:{name}", {**tmux_transport.open_fields(msg), **spec_binding},
+            f"{host}:{name}", visibility_fields,
         ):
-            msg["visibility"] = "hidden"
+            effective_visibility = "hidden"
+        if policy is not None and policy.is_daff_backend({"host": host, **visibility_fields}):
+            effective_visibility = "hidden"
 
         # Resolve provider tuples before reservation; explicit commands still win.
         # The deterministic staged path is safe to put in a launcher command
@@ -2092,20 +2163,36 @@ class SpawnCtl:
         )
         launch_msg = {
             **msg,
+            "visibility": effective_visibility,
             **({"_native_initial_prompt_path": native_prompt_path} if native_prompt_path else {}),
             **({"_resume_jsonl_path": resume_jsonl_path} if resume_jsonl_path else {}),
             **({"_resume_cwd": resume_cwd} if resume_cwd else {}),
             "_defer_launch_token_stage": True,
             **({"_account_resume_binding": resume_prior_row.get("account_binding")} if resume_prior_row else {}),
         }
-        if policy is not None and policy.is_daff_backend(resume_prior_row):
-            launch_msg["visibility"] = "hidden"
+        # Cap decisions do not relaunch or invalidate a known admitted receipt.
+        # A pending intent with no account admission still runs current checks.
+        if idempotency_key:
+            retained=await self.store.spawn_record_for_key(host,idempotency_key)
+            if retained:
+                prior=retained['row']
+                payload=prior.get('payload') or {}
+                if isinstance(payload,str): payload=json.loads(payload)
+                generation=(payload.get('open_fields') or {}).get('session_generation')
+                admitted=bool(prior.get('tmux_created') or (retained['kind']=='terminal' and prior.get('state')=='delivered'))
+                if generation and not admitted:
+                    admitted=await self.store.submit(lambda c:c.execute('SELECT 1 FROM kv WHERE k=?',
+                        (f"provider_cli.admission:{host}:{prior['session_name']}:{generation}",)).fetchone() is not None)
+                if admitted: launch_msg['_account_admitted_replay']=True
         launch_context = tmux_transport._ACTIVE_LAUNCH_TMUX.set(tmux)
         try:
             command, resolution, open_overrides = await self._resolve_launch(launch_msg, host, name)
         finally:
             tmux_transport._ACTIVE_LAUNCH_TMUX.reset(launch_context)
         deferred_launch_plan = resolution.pop("_deferred_launch_plan", None)
+        if launch_msg.get("_pool_spawn_override"):
+            resolution["pool_override"]={**launch_msg["_pool_spawn_override"],
+                                         "payload_hash":self._spawn_payload_hash(msg)}
 
         async def recorded_reply() -> dict[str, Any] | None:
             # Mirror the store's live/retained replay eligibility. A lookup
@@ -2144,13 +2231,23 @@ class SpawnCtl:
                 if replay := await recorded_reply():
                     return replay
                 raise VerbError(decision["error_code"], decision["message"], wip=decision)
-        if new_work_commission(msg, resume=resume_session_id is not None):
+        work_role = open_overrides.get("role", msg.get("role"))
+        supporting = (
+            bool(msg.get("parent_stream_id"))
+            and work_role in {None, "", "worker", "evaluator", "planner", "reviewer-advisory"}
+            and not qa_dispatch.classified(msg, {"role": work_role, "phase": msg.get("phase")})
+        )
+        # Supporting work carries the existing inherited attribution without
+        # requiring a manual assignment or lane link. Acceptance owners retain it.
+        if new_work_commission(msg, resume=resume_session_id is not None) and not supporting:
             refusal = await self._work_link_refusal(msg, spec_binding)
             if refusal is not None:
                 # As above: a same-key caller may have been admitted meanwhile.
                 if replay := await recorded_reply():
                     return replay
                 raise refusal
+
+        await self._lane_admission(msg, execution_binding, work_role)
 
         # Reserve the stream and its creation identity before any pane exists.
         # The existing atomic claim still decides concurrent NEW same-key fires.
@@ -2202,11 +2299,7 @@ class SpawnCtl:
             for field in RESUME_PRESERVED_FIELDS:
                 if field in resume_prior_row:
                     open_flds[field] = resume_prior_row[field]
-        if policy is not None and policy.is_daff_backend({"host": host, **open_flds}):
-            open_flds["visibility"] = "hidden"
-            log.info("subsystem=assistant_inventory bug_ref=daff_backend_inventory_scope action=hidden_spawn")
-        if policy is not None and policy.is_front_desk_seat(f"{host}:{name}", open_flds):
-            open_flds["visibility"] = "hidden"
+        open_flds["visibility"] = effective_visibility
         # Fence this spawn's lifecycle to a generation IT owns. Both boot-failure
         # cleanup closes below pass it as `expected_generation`, so a cleanup can
         # only ever close the row THIS spawn created — never a newer same-name
@@ -2273,6 +2366,7 @@ class SpawnCtl:
             # Graph admission ends before boot. A winning parent close makes
             # this request refuse before a pane; a winning intent blocks close.
             async with self.sessions._graph_lock:
+                lane_provisioning = await self._lane_admission(msg, execution_binding, work_role)
                 parent_normalization = None
                 parent_id = str(open_flds.get("parent_stream_id") or "")
                 if parent_id:
@@ -2292,7 +2386,10 @@ class SpawnCtl:
                     {
                         "open_fields": open_flds,
                         "brief": brief,
+                        "lane_provisioning": bool(lane_provisioning),
                         "delivery_receipt": delivery_receipt,
+                        **({spawn_creation.KEY: spawn_creation.initial()}
+                           if host != self.sessions.local_host else {}),
                         "operator_initiated_top_level": (
                             not open_flds.get("parent_stream_id")
                             and not open_flds.get("handoff_from_stream_id")
@@ -2305,6 +2402,9 @@ class SpawnCtl:
                         *((((f"{host}:{name}", spec_binding_source(resume_prior_row)),)) if resume_prior_row is not None else ()),
                     ),
                     prepared_qa=prepared_qa,
+                    lane_admission={"spec_id": effective_assignment(execution_binding), "lane_id": msg.get("lane_id"),
+                                    "provisioning": bool(lane_provisioning), "linked_only": not msg.get("provision_only"),
+                                    "provisioning_auth": msg.get("_auth_context") or {}},
                 )
             if not recorded:
                 raise VerbError("spawn_fence_lost", "spawn intent reservation expired or was cancelled")
@@ -2998,10 +3098,6 @@ class SpawnCtl:
             raise VerbError("spawn_fence_lost", "spawn no longer owns its creation intent")
         provider = str((resolution.get("resolved_launch_tuple") or {}).get("provider") or "")
         promptless_codex = provider == "codex" and not brief
-        if provider == "codex" and not str(msg.get("command") or "").strip():
-            machine = self._launch_machine(host, provider)
-            if machine is not None:
-                await tmux.pretrust_codex_cwd(str(msg.get("cwd") or machine.codex_cwd))
         if provider == "codex":
             # An explicitly reused name is a fresh pane, with its own Enter budget.
             self._native_trust_entered.discard(f"{host}:{name}")
@@ -3014,9 +3110,28 @@ class SpawnCtl:
         if account_runtime is not None and open_flds.get("account_binding"):
             from provider_accounts import AccountError
             try:
-                await account_runtime.admit_launch({**open_flds, "host":host, "stream_id":f"{host}:{name}"})
+                override=resolution.get("pool_override")
+                if override and override["payload_hash"]!=self._spawn_payload_hash(msg):
+                    raise AccountError("account_pool_override_stale")
+                await account_runtime.admit_launch({**open_flds, "host":host, "stream_id":f"{host}:{name}"},
+                    message={**msg,"_pool_spawn_override":override} if override else msg)
             except AccountError as exc:
                 raise VerbError(str(exc),str(exc),**exc.context) from None
+        if provider == "codex" and not str(msg.get("command") or "").strip():
+            machine = self._launch_machine(host, provider)
+            if machine is not None:
+                selected_home = (open_flds.get("account_binding") or {}).get("home")
+                await tmux.pretrust_codex_cwd(str(msg.get("cwd") or machine.codex_cwd),
+                    **({"code_home": selected_home} if selected_home else {}))
+        creation_attempt = ""
+        if host != self.sessions.local_host:
+            creation_attempt = uuid.uuid4().hex
+            if not await self.store.issue_remote_creation(
+                host, name, request_id=request_id, nonce=nonce,
+                owner_instance_id=self.instance_id, attempt_id=creation_attempt,
+            ):
+                raise VerbError("spawn_fence_lost", "remote creation issuance lost request ownership")
+        creation_succeeded = False
         try:
             # Inject the creation nonce into the pane's environment (spec §D1) so
             # the pane is born carrying its identity — adoptable by a restart
@@ -3025,6 +3140,7 @@ class SpawnCtl:
                 name, command, cwd=msg.get("cwd") or None,
                 env={PANE_NONCE_ENV: nonce} if nonce else None,
             )
+            creation_succeeded = True
         except VerbError as exc:
             if exc.code != "tmux_timeout":
                 raise
@@ -3047,6 +3163,14 @@ class SpawnCtl:
             # positive liveness read as creation evidence and continue the same
             # boot+delivery obligation instead of returning a false negative.
         created[0] = True  # from here on, and only here on, cleanup may kill it
+        if creation_attempt and creation_succeeded:
+            try:
+                await self.store.acknowledge_remote_creation(
+                    host, name, request_id=request_id, nonce=nonce,
+                    owner_instance_id=self.instance_id, attempt_id=creation_attempt,
+                )
+            except Exception:  # failed persistence leaves the attempt unknown
+                log.exception("remote creation acknowledgement not persisted host=%s name=%s", host, name)
         release_deadline = (
             time.monotonic() + BOOT_READY_HARD_DEADLINE_S
             if provider == "codex" else None
@@ -3252,7 +3376,7 @@ class SpawnCtl:
                 )
                 initial_proof_timeout_s = SPAWN_SUBMISSION_PROOF_BOUND_S
                 input_runtime=getattr(self,"account_runtime",None)
-                async with (input_runtime.input_guard({**open_flds,"host":host,"stream_id":stream_id})
+                async with (input_runtime.input_guard({**open_flds,"host":host,"stream_id":stream_id},phase="admitted_spawn")
                             if input_runtime is not None else nullcontext()):
                     await tmux.paste(name, brief)
             finally:
@@ -3433,11 +3557,16 @@ class SpawnCtl:
         model = resolved["model"]
         effort = resolved["effort"]
         account_binding = None
+        msg = await self._retain_handoff_account(msg)
         if provider == "cursor":
             if host != self.sessions.local_host:
                 raise VerbError("cursor_remote_unsupported", "Cursor seats are local only")
             if "account" in msg or msg.get("_account_resume_binding"):
                 raise VerbError("cursor_named_accounts_unsupported", "Cursor uses the local sign-in")
+        if provider == "gemini" and ("account" in msg or msg.get("_account_resume_binding")):
+            raise VerbError("gemini_named_accounts_unsupported", "Gemini uses the local sign-in")
+        if "account" in msg and account_runtime is None:
+            raise VerbError("account_feature_off", "named accounts are unavailable")
         if account_runtime is not None and provider != "cursor":
             from provider_accounts import AccountError
             try:
@@ -3480,10 +3609,7 @@ class SpawnCtl:
                 build_plan = functools.partial(launch.build_launch,
                     machine, provider=provider, tmux_session=name,
                     launch_model=launch_model, launch_effort=launch_effort,
-                    operator_facing=(
-                        not str(msg.get("parent_stream_id") or "").strip()
-                        and str(msg.get("visibility") or "default") != "hidden"
-                    ),
+                    operator_facing=tmux_transport.open_fields(msg)["visibility"] == "default",
                     initial_prompt_file=(
                         str(msg.get("_native_initial_prompt_path") or "")
                         if provider == "codex" and not explicit else None
@@ -3633,6 +3759,16 @@ class SpawnCtl:
         )
         resolved["_handoff_model_change_warning"] = warning
         return resolved
+
+    async def _retain_handoff_account(self, msg):
+        if "account" in msg or not msg.get("handoff"):
+            return msg
+        source_id = str(msg.get("handoff_from_stream_id") or "")
+        source = await self.store.fetch_session(*source_id.split(":", 1)) if ":" in source_id else None
+        alias = ((source or {}).get("account_binding") or {}).get("alias")
+        if not alias:
+            return msg
+        return {**msg, "account": alias}
 
     async def _record_protected_handoff(self, msg: dict[str, Any], host: str, name: str, key: str) -> None:
         """Bind a protected source's own handoff to its generation and token."""
@@ -4099,7 +4235,7 @@ class SpawnCtl:
                 if not pid or pid != str(await tmux.pane_pid(name)):
                     return "deferred"
                 started = canonical_start(res.get("pane_started_at"))
-                if res.get("pane_started_at") and (not started or started != await self._pane_started_at(pid, host=host)):
+                if not started or started != await self._pane_started_at(pid, host=host):
                     return "deferred"
             if not await self._kill_uncommitted_pane(host, name, tmux, nonce=nonce):
                 return "deferred"
@@ -4114,9 +4250,20 @@ class SpawnCtl:
                 host, name, reason="cancelled_before_bind", expected_generation=generation,
                 close_kind="spawn_rollback",
             )
-        await self.store.release_stream_id_fenced(
-            host, name, request_id, cleanup_confirmed=True,
-        )
+        if host != self.sessions.local_host:
+            owner = self.instance_id or str(res.get("owner_instance_id") or "")
+            nonce = str(res.get("nonce") or "")
+            witness = await self.store.cancelled_creation_snapshot(
+                host, name, request_id=request_id, nonce=nonce, owner_instance_id=owner,
+            )
+            if witness is None or await self._session_state_for_wait(name, tmux) != "gone":
+                return "deferred"
+            released = await self.store.release_cancelled_remote_creation(
+                host, name, request_id=request_id, nonce=nonce, owner_instance_id=owner,
+                observed_witness=witness,
+            )
+            return "released" if released else "deferred"
+        await self.store.release_stream_id_fenced(host, name, request_id, cleanup_confirmed=True)
         return "released"
 
     async def _reconcile_one_spawn_intent(self, res: dict[str, Any]) -> str:
@@ -4283,6 +4430,30 @@ class SpawnCtl:
             invalidated = "spawn_generation_changed"
         elif row and row.get("status") == "closed" and row.get("close_kind"):
             invalidated = "spawn_target_closed"
+        if (invalidated == "spawn_generation_changed" and row
+                and row.get("status") == "closed" and not row.get("close_kind")):
+            # A retained dead row cannot authorize replacing its generation.
+            # Retire only this request's exact nonce pane, keeping the prior
+            # row intact. An explicit close or an open successor stays on the
+            # existing refusal path below.
+            async with self.sessions._lifecycle_lock(host, name):
+                current = await self.store.fetch_session(host, name)
+                if (not current or current.get("status") != "closed"
+                        or current.get("close_kind")
+                        or current.get("session_generation") != row.get("session_generation")):
+                    return "deferred"
+                nonce = str(reservation.get("nonce") or "")
+                if not nonce or not await self.store.owns_spawn_intent(host, name, request_id, nonce):
+                    return "deferred"
+                cleaned = await self._kill_uncommitted_pane(host, name, tmux, nonce=nonce)
+                await self.store.set_spawn_outcome(
+                    host, name, "failed" if cleaned else "indeterminate", request_id=request_id,
+                    reason=("spawn_generation_changed: owned pre-admission pane cleaned"
+                            if cleaned else "spawn_generation_changed: owned pane cleanup unknown"),
+                    delivery_evidence="pane_cleanup_confirmed" if cleaned else "pane_cleanup_unknown",
+                    idempotency_key=idempotency_key, request_payload_hash=request_payload_hash,
+                )
+                return "released" if cleaned else "deferred"
         if invalidated:
             await self.store.set_spawn_outcome(
                 host, name, "failed", request_id=request_id, reason=invalidated,
@@ -4397,6 +4568,26 @@ class SpawnCtl:
         if (current is None or current.get("status") != "open"
                 or (expected_generation and current.get("session_generation") != expected_generation)):
             return "deferred"
+        if not brief:
+            receipt = dict(receipt) if isinstance(receipt, dict) else {}
+            receipt.update({"state": "not_requested", "delivery_status": "not_requested"})
+            if (state in {"delivered", "failed"}
+                    and str(current.get("provider") or "") in READY_PREDICATES
+                    and current.get("bootstrap_state") in {"starting", "unproven"}):
+                async with self.sessions._lifecycle_lock(host, name):
+                    ready_row = await self.store.fetch_session(host, name)
+                    if (not ready_row or ready_row.get("status") != "open"
+                            or ready_row.get("session_generation") != current.get("session_generation")):
+                        return "deferred"
+                    bootstrap = "ready" if state == "delivered" else "failed"
+                    updated = await self.store.update_session(
+                        host, name, expected_generation=str(ready_row.get("created_at") or ""),
+                        bootstrap_state=bootstrap,
+                    )
+                    if updated is None:
+                        return "deferred"
+                    self.sessions.apply_durable(f"{host}:{name}", bootstrap_state=bootstrap)
+                    receipt["bootstrap_state"] = bootstrap
         if state == "delivered" and brief:
             async with self.sessions._lifecycle_lock(host, name):
                 current = await self.store.fetch_session(host, name)
@@ -4450,6 +4641,11 @@ class SpawnCtl:
                         self.sessions.apply_durable(
                             f"{host}:{name}", bootstrap_state="starting",
                         )
+            if not brief:
+                # Delivery was never requested; uncertainty concerns bootstrap.
+                receipt.update({"state": "not_requested", "delivery_status": "not_requested",
+                                "failure_code": "boot_not_ready", "failure_reason": reason})
+                receipt.pop("delivery_failed_at", None)
             await self.store.set_spawn_outcome(
                 host, name, "indeterminate", request_id=request_id,
                 delivery_evidence=evidence, reason=reason,
@@ -4468,6 +4664,10 @@ class SpawnCtl:
                 "to_stream_id": f"{host}:{name}",
                 "delivery_ack_at": iso_now(),
             }
+        if not brief and isinstance(receipt, dict):
+            receipt.update({"state": "not_requested", "delivery_status": "not_requested"})
+            receipt.pop("delivery_ack_at", None)
+            receipt.pop("delivered_late_at", None)
         await self.store.set_spawn_outcome(
             host, name, state, request_id=request_id,
             delivery_evidence=evidence, reason=reason,
@@ -4630,6 +4830,35 @@ class SpawnCtl:
                 CODEX_RESET_BLOCKED,
                 CODEX_RESET_BLOCKED,
             )
+        if (not brief and session
+                and str(session.get("provider") or "") in READY_PREDICATES
+                and session.get("bootstrap_state") in {"starting", "unproven"}):
+            # No initial input is a delivery fact, not a provider-ready signal.
+            # Reuse the normal bounded observer without sending any input.
+            ready = await self._await_provider_ready(
+                name, str(session["provider"]), tmux,
+                absolute_deadline=time.monotonic() + ADOPTION_BOOT_DEADLINE_S,
+            )
+            if ready.ready:
+                if await self._session_state_for_wait(name, tmux) == "gone":
+                    return "failed", "pane_died_during_boot", "promptless adopted pane died after readiness observation"
+                request_id = str((resume or {}).get("request_id") or "")
+                nonce = str((resume or {}).get("nonce") or "")
+                readable, observed_nonce = await self._tmux_nonce(name, tmux)
+                if (not request_id or not nonce or not readable or observed_nonce != nonce
+                        or not await self.store.owns_spawn_intent(host, name, request_id, nonce)
+                        or not await self._current_spawn_pane_verified_alive(
+                            host, name, tmux, expected_generation=str(session.get("session_generation") or ""),
+                        )
+                        or str(await tmux.pane_pid(name)) != str(session.get("pane_pid") or "")):
+                    return ("indeterminate", "provider_identity_unproven",
+                            "adopted_after_restart: promptless readiness pane identity is unverified")
+            if not ready.ready:
+                if await self._session_state_for_wait(name, tmux) == "gone":
+                    return "failed", "pane_died_during_boot", "promptless adopted pane died before readiness"
+                return ("indeterminate", "provider_booting",
+                        "adopted_after_restart: promptless provider readiness unknown"
+                        + (f": {ready.reason}" if ready.reason else ""))
         if not brief:
             return "delivered", "not_requested", "adopted_after_restart: no brief to deliver"
         provider = str((session or {}).get("provider") or "")
@@ -4824,7 +5053,7 @@ class SpawnCtl:
         ):
             return ("indeterminate", "live_pane_unproven", "spawn_fence_lost before resumed delivery"), receipt
         input_runtime=getattr(self,"account_runtime",None)
-        async with (input_runtime.input_guard(await self.store.fetch_session(host,name) or {})
+        async with (input_runtime.input_guard(await self.store.fetch_session(host,name) or {},phase="admitted_spawn")
                     if input_runtime is not None else nullcontext()):
             await tmux.paste(name, brief)
         log.info("adoption pasted the never-delivered brief once for %s", stream_id)
@@ -5125,6 +5354,11 @@ class SpawnCtl:
                 "request_id": r.get("request_id"),
                 "idempotency_key": r.get("idempotency_key"),
                 "expires_at": r.get("expires_at"),
+                **({"cleanup": spawn_creation.cleanup_status(r.get("payload"))}
+                   if host != self.sessions.local_host and any(
+                       oc.get("state") == "cancelled" and oc.get("request_id") == r.get("request_id")
+                       for oc in resolved["tombstones"]
+                   ) else {}),
             }
             for r in resolved["reservations"]
         ]

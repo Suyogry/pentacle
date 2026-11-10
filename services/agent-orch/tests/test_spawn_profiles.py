@@ -38,7 +38,7 @@ def test_validate_v2_accepts_alias_and_returns_canonical() -> None:
         catalog_version="spawn-catalog-v2",
         resolution_source="explicit_override",
     )
-    assert resolved["model"] == "claude-fable-5-1"
+    assert resolved["model"] == "claude-fable-5-2"
     try:
         validate_v2(
             provider="claude",
@@ -267,6 +267,42 @@ def test_handoff_inherits_source_effective_tuple_not_host_defaults(monkeypatch, 
         spawn_profiles.load_spawn_config.cache_clear()
 
 
+def test_fable_5_2_is_the_fable_default_and_5_1_stays_by_full_id() -> None:
+    claude = spawn_profiles.MODELS["claude"]
+    assert claude["claude-fable-5-2"] == {
+        "aliases": ("fable", "claude-fable-5-2", "claude-fable-5"),
+        "efforts": ("low", "medium", "high", "xhigh", "max"),
+    }
+    assert claude["claude-fable-5-1"]["aliases"] == ("claude-fable-5-1",)
+    for alias, canonical in (
+        ("fable", "claude-fable-5-2"), ("claude-fable-5", "claude-fable-5-2"),
+        ("claude-fable-5-2", "claude-fable-5-2"), ("claude-fable-5-1", "claude-fable-5-1"),
+    ):
+        for effort in ("low", "medium", "high", "xhigh", "max"):
+            resolved = resolve_spawn(provider="claude", model=alias, effort=effort)
+            assert (resolved["model"], resolved["effort"]) == (canonical, effort)
+            revalidated = validate_v2(
+                provider="claude", spawn_profile="agent_orch", schema="SpawnRequestV2",
+                model=canonical, effort=effort, catalog_version="spawn-catalog-v2",
+                resolution_source="explicit_override",
+            )
+            assert revalidated["model"] == canonical
+    # the Claude profile default and the intentionally-unspawnable set are untouched
+    assert resolve_spawn(provider="claude")["model"] == "claude-opus-4-8"
+    assert "claude-fable-5" in spawn_profiles.INTENTIONALLY_UNSPAWNABLE["claude"]
+    assert "claude-fable-5-2" not in spawn_profiles.INTENTIONALLY_UNSPAWNABLE["claude"]
+
+
+def test_handoff_from_fable_5_2_source_inherits_5_2() -> None:
+    resolution = resolve_handoff(
+        source_provider="claude", source_model="claude-fable-5-2", source_effort="high",
+        provider="claude", model="fable", effort="high",
+    )
+    assert resolution.changed is False
+    assert resolution.source["model"] == "claude-fable-5-2"
+    assert resolution.spawn["model"] == "claude-fable-5-2"
+
+
 def test_handoff_canonicalizes_alias_and_identifies_exact_changes() -> None:
     same = resolve_handoff(
         source_provider="claude",
@@ -475,7 +511,7 @@ def test_available_models_installation_config_narrows_the_picker_only(monkeypatc
         # Narrowing is picker-only: a model absent from available_models still
         # resolves (compatibility / explicit / handoff launches).
         assert resolve_spawn(provider="codex", model="gpt-6-luna", effort="max")["model"] == "gpt-6-luna"
-        assert resolve_spawn(provider="claude", model="fable", effort="high")["model"] == "claude-fable-5-1"
+        assert resolve_spawn(provider="claude", model="fable", effort="high")["model"] == "claude-fable-5-2"
     finally:
         spawn_profiles.load_spawn_config.cache_clear()
 
@@ -618,3 +654,88 @@ def test_invalid_local_availability_is_rejected(installation_config, available):
 def test_null_or_empty_policy_keeps_full_catalog(installation_config, available):
     result = installation_config(available)
     assert result["available_models"] == result["models"]
+
+
+@pytest.fixture
+def test_policy_file(tmp_path, monkeypatch):
+    raw = json.loads(spawn_profiles.SPAWN_DEFAULTS_PATH.read_text())
+    path = tmp_path / "spawn_defaults.json"
+    path.write_text(json.dumps(raw))
+    monkeypatch.setattr(spawn_profiles, "SPAWN_DEFAULTS_PATH", path)
+    spawn_profiles.load_spawn_config.cache_clear()
+    yield path, raw
+    spawn_profiles.load_spawn_config.cache_clear()
+
+
+def test_test_profile_refreshes_without_changing_cached_work_defaults(test_policy_file):
+    path, raw = test_policy_file
+    ordinary = resolve_spawn(provider="codex")
+    first = spawn_profiles.resolve_test_profile()
+    assert spawn_profiles.test_prompt_tuple("codex", first) == ("gpt-6-luna", "low")
+    raw["profiles"]["test_prompt"]["codex"] = {"model": "gpt-5.6-luna", "effort": "low"}
+    path.write_text(json.dumps(raw))
+    second = spawn_profiles.resolve_test_profile()
+    assert spawn_profiles.test_prompt_tuple("codex", second) == ("gpt-5.6-luna", "low")
+    assert first["profile_sha256"] != second["profile_sha256"]
+    assert first["settings_sha256"] != second["settings_sha256"]
+    assert catalog()["profiles"]["test_prompt"]["codex"] == ("gpt-5.6-luna", "low")
+    assert resolve_spawn(provider="codex") == ordinary
+    # Frozen runs retain their exact tuple after current settings change.
+    assert spawn_profiles.test_prompt_tuple("codex", first) == ("gpt-6-luna", "low")
+
+
+def test_test_profile_overlay_replaces_complete_pair_and_ignores_picker(test_policy_file):
+    path, raw = test_policy_file
+    local = path.with_name("spawn_defaults.local.json")
+    local.write_text(json.dumps({"schema_version": 1, "available_models": {"claude": ["claude-opus-4-8"]},
+        "profiles": {"test_prompt": {"claude": {"model": "claude-haiku-5-5", "effort": "low"}}}}))
+    profile = spawn_profiles.resolve_test_profile()
+    assert spawn_profiles.test_prompt_tuple("claude", profile) == ("claude-haiku-5-5", "low")
+    assert "claude-haiku-5-5" not in catalog()["available_models"]["claude"]
+    local.write_text(json.dumps({"schema_version": 1, "profiles": {"test_prompt": {"claude": {"effort": "low"}}}}))
+    with pytest.raises(SpawnProfileError): spawn_profiles.resolve_test_profile()
+
+
+@pytest.mark.parametrize("bad", [None, {}, {"codex": {"model": "gpt-6-luna"}},
+    {"codex": {"model": "gpt-6-luna", "effort": "invalid"}}])
+def test_test_profile_never_falls_back_to_work_defaults(test_policy_file, bad):
+    path, raw = test_policy_file
+    raw["profiles"]["test_prompt"] = bad
+    path.write_text(json.dumps(raw))
+    with pytest.raises(SpawnProfileError): spawn_profiles.resolve_test_profile()
+    assert resolve_spawn(provider="codex")["effort"] == "max"
+
+
+def test_test_profile_missing_file_and_disabled_provider_refuse(test_policy_file):
+    path, _ = test_policy_file
+    with pytest.raises(SpawnProfileError, match="disabled"):
+        spawn_profiles.test_prompt_tuple("cursor")
+    path.unlink()
+    with pytest.raises(SpawnProfileError, match="missing"):
+        spawn_profiles.resolve_test_profile()
+
+
+def test_haiku_all_installed_efforts_validate_at_shared_boundary():
+    for effort in ("low", "medium", "high", "xhigh", "max"):
+        assert resolve_spawn(provider="claude", model="claude-haiku-5-5", effort=effort)["effort"] == effort
+
+
+@pytest.mark.parametrize("case", ["missing", "partial", "unsupported"])
+def test_catalog_preserves_work_profiles_when_test_policy_cannot_launch(test_policy_file, case):
+    path, raw = test_policy_file
+    if case == "missing":
+        raw["profiles"].pop("test_prompt")
+    elif case == "partial":
+        raw["profiles"]["test_prompt"] = {"codex": {"effort": "low"}}
+    else:
+        raw["profiles"]["test_prompt"]["codex"]["model"] = "unsupported-model"
+    path.write_text(json.dumps(raw))
+    result = catalog()
+    assert "test_prompt" not in result["profiles"]
+    assert "test_prompt_profile" not in result
+    assert result["test_prompt_error"]["code"]
+    assert result["profiles"]["desktop_manual"]["codex"] == ("gpt-6-luna", "max")
+    assert result["spawn_defaults"]["profiles"]["agent_orch"] == raw["profiles"]["agent_orch"]
+    assert resolve_spawn(provider="codex")["effort"] == "max"
+    with pytest.raises(SpawnProfileError):
+        spawn_profiles.test_prompt_tuple("codex")

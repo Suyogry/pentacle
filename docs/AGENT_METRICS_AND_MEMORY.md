@@ -21,6 +21,13 @@ probe performs no Keychain lookup and no network call. This is account quota,
 not session cost or requests per minute. It does not change the quota. The Fable
 row is optional and the client hides it when no Fable quota is reported.
 
+A parsed reading returns exit 0 and one JSON object on stdout, including 0% usage,
+even if dedicated-socket cleanup fails. A sanitized stderr warning carries
+`subsystem=usage_probe` and `bug_ref=cleanup_discards_reading` with the cleanup
+condition. The collector accepts that reading. Collection failures retain their
+original error and nonzero exit; cleanup context never replaces the primary
+failure. Cleanup still refuses live, changed or unowned sockets.
+
 1. As the same OS user that will run the collector, verify Claude login and
    complete the trust prompt **in the exact directory you will pass as
    `PENTACLE_USAGE_CWD`** (the probe launches the CLI there and never
@@ -87,8 +94,8 @@ row is optional and the client hides it when no Fable quota is reported.
    `StartInterval=300`, or a Linux user systemd service/timer with
    `OnBootSec=30s` and `OnUnitActiveSec=300s`. Reuse an existing owner/job rather
    than creating overlapping pollers.
-5. Enable `features.usage: true` in the private desktop config and restart the
-   desktop. The enrolled mobile app reads the same limits in Settings; do not
+5. Enable `features.usage: true` in the private web host config and restart the
+   web host. The enrolled mobile app reads the same limits in Settings; do not
    put provider credentials on the phone.
 
 Acceptance requires fresh Claude health `ok` in the state file and the observed
@@ -118,7 +125,7 @@ clients receive `hosts.stats`.
 Check that sample timestamps advance and CPU/RAM/disk values agree with the host
 OS. On Linux, CPU is the busy fraction between two `/proc/stat` reads; on macOS,
 it is `100 - idle` from the second `top` sample. Samples older than 90 seconds
-are stale. Desktop machine stats do not depend on the Claude usage toggle.
+are stale. Host machine stats do not depend on the Claude usage toggle.
 Mobile Settings preserves distinct configured host
 names and offline entries.
 

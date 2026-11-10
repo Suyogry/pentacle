@@ -46,8 +46,12 @@ The optional subscription controls visibility and event detail. Invalid event mo
 
 `request_stream_events` returns existing `request_stream_events.chunk` frames
 followed by a terminal `request_stream_events.ok`, or one terminal reply for a
-small page. Events retain their durable `daemon_seq`; `before_daemon_seq` resumes
-older history. Each UTF-8 JSON frame stays within 900 KiB, including its envelope.
+small page. The effective `limit` caps the total events across all pages;
+`chunk_limit` can reduce the per-page count. The newest eligible events are
+returned in newer pages before older pages, ascending by durable `daemon_seq`
+within each page. Resume older history with `before_daemon_seq` set to the
+smallest sequence received; the cursor is exclusive. Each UTF-8 JSON frame stays
+within 900 KiB, including its envelope.
 
 An event too large to fit alone becomes a wire-only text preview ending with
 `[Event truncated for backfill; original retained by daemon.]`. Optional payload
@@ -164,7 +168,7 @@ household store. The daemon keeps no household state, cache or broadcast.
 
 | Verb | Fields | Result |
 |---|---|---|
-| `household.snapshot` | `month?` (`YYYY-MM`, 2000-01…2100-12, default today's America/Chicago month) | `{today, month, people:{partner}, lists:{tasks,grocery,meals,chores,study}, events, server_now}`; open items only; events from that month plus today…today+7, de-duplicated |
+| `household.snapshot` | `month?` (`YYYY-MM`, 2000-01…2100-12, default today's America/Chicago month) | `{today, month, people:{partner}, lists:{tasks,grocery,meals,chores,study}, events, routines, server_now}`; open items only; events from that month plus today…today+7, de-duplicated |
 | `household.item.add` | `list`, `label` (1–1000 chars) | `{item, server_now}` |
 | `household.item.done` | `item_id` | `{item, server_now}` (Cosmo keeps it 5 s, then removes it) |
 | `household.item.remove` | `item_id` | `{item_id}` (Cosmo's 204 carries no `server_now`) |
@@ -177,11 +181,12 @@ household store. The daemon keeps no household state, cache or broadcast.
   timing out or exceeding 1 MiB); `unknown_outcome` (a change was sent but not confirmed: timeout or
   connection lost while waiting, or an unexpected status). Calls are never retried; after
   `unknown_outcome` the client reads back with `household.snapshot` instead of resending.
-- **Bounds.** Seven concurrent GETs per snapshot, 5 s per call, 8 s overall, all-or-nothing.
+- **Routines.** Additive `routines` rows come from `GET /routines` with the same neutral scope/author mapping; the read is required for a successful refresh. They carry the known `next_due`, `paused` and `item_id`, not a forecast series. Older clients ignore this field.
+- **Bounds.** Eight concurrent GETs per snapshot, 5 s per call, 8 s overall, all-or-nothing.
 
 ## Session interrupt
 
-The operator web/desktop composer uses ordinary `send` for Send, Enter and Alt+Enter; Shift+Enter inserts a newline. The operator-only `chat-stream:send` IPC handler drops urgency, including stale-tab `reply.urgent=true`. Intentional lower-level agent sends/tells and scheduled urgent wakes retain their existing urgency. Explicit Stop remains generation-fenced and cancels pending queued continuations.
+The operator web composer uses ordinary `send` for Send, Enter and Alt+Enter; Shift+Enter inserts a newline. The operator-only `chat-stream:send` IPC handler drops urgency, including stale-tab `reply.urgent=true`. Intentional lower-level agent sends/tells and scheduled urgent wakes retain their existing urgency. Explicit Stop remains generation-fenced and cancels pending queued continuations.
 
 Qualified provider-queued rows offer **Send now**, without a permanent warning. The separate `chat-stream:queued-send-now` IPC sends `send.interrupt` with `queued_send_now: { original_request_id, optimistic_id }` and `expected_session_generation`; it never repastes the original body. The daemon validates the authenticated operator, durable receipt, queue ownership, generation and installed provider/executable identity. Native intake already proved means no keypress. A durable control record in the existing `kv` store begins when ordinary intake observes provider queue ownership under the lifecycle/input locks; legacy rows without this generation binding fail closed.
 
@@ -192,7 +197,7 @@ Supported identities are held by the daemon's qualified provider/version/executa
 Old cached queued-row controls still call generic interrupt, indistinguishable from Stop. Host urgency stripping protects stale new-message urgency only. The existing build-change icon prompts a click to reload; it neither auto-reloads nor blocks an old tab. A deployment requires its authorized operator-tab refresh/closure disposition before a live claim.
 
 `send.interrupt` names a session with `host` and `session_name`. For a configured
-remote host, updated web and desktop clients also send the selected open row's
+remote host, updated web clients also send the selected open row's
 `expected_session_generation`. They capture it when the user requests Stop and
 keep that same value across asynchronous dispatch and retry. The daemon never
 fills in a missing value from the current row: a remote request without it
@@ -376,7 +381,7 @@ existing serial merge gate on the final clean committed candidate.
 
 In web mode, open the experimental Chat view and tap **Record voice message**
 in the chat composer to start a take in the viewer's browser. See the
-[web setup](../README.md#local-setup) for enabling Chat UI. The implementation
+[web setup](../README.md#quick-start) for enabling Chat UI. The implementation
 is [the browser recorder and take lifecycle](../renderer/web_voice.js), mounted
 by [the chat composer](../renderer/app.js), with voice styles in
 [chat_v3.css](../renderer/chat_v3.css).
@@ -466,7 +471,6 @@ with an explanation. Missing audio/metering capability or permission denial
 shows a retryable error; change the browser permission before retrying a denial.
 
 The chat button never toggles the host room microphone. The
-[separate room-mic path](desktop_config.md#per-chat-voice-messages) and Electron's
-existing room-mic binding are unchanged. See
+[separate room-mic path](desktop_config.md#per-chat-voice-messages) remains separate. See
 [web voice validation](E2E_HARNESS.md#web-voice-composer) for automated coverage
 and the distinction between fixture, browser and live release evidence.

@@ -372,45 +372,33 @@ def _initial_prompt_payload(
     *,
     baseline_content: str | None = None,
 ) -> tuple[dict[str, object], int]:
-    if getattr(args, "initial_prompt", None) is not None:
-        text = args.initial_prompt
-        if baseline_content is not None:
-            text = _compose_role_baseline_prompt(baseline_content, text)
-        data = text.encode("utf-8")
-        if len(data) <= INITIAL_PROMPT_INLINE_CAP_BYTES:
-            return {"initial_prompt": text}, len(data)
-        upload = asyncio.run(upload_prompt_blob_once(config, data, timeout=float(getattr(args, "timeout", None) or 30.0)))
-        if upload.get("type") != "upload_prompt_blob.ok":
-            raise RuntimeError(str(upload.get("error_code") or upload.get("type") or "upload_prompt_blob_failed"))
-        return {"initial_prompt_blob_sha": upload.get("prompt_blob_sha")}, len(data)
-    if getattr(args, "initial_prompt_file", None) is None:
-        if baseline_content is None:
-            return {}, 0
-        data = baseline_content.encode("utf-8")
-        if len(data) <= INITIAL_PROMPT_INLINE_CAP_BYTES:
-            return {"initial_prompt": baseline_content}, len(data)
-        upload = asyncio.run(upload_prompt_blob_once(config, data, timeout=float(getattr(args, "timeout", None) or 30.0)))
-        if upload.get("type") != "upload_prompt_blob.ok":
-            raise RuntimeError(str(upload.get("error_code") or upload.get("type") or "upload_prompt_blob_failed"))
-        return {"initial_prompt_blob_sha": upload.get("prompt_blob_sha")}, len(data)
-    path = Path(args.initial_prompt_file).expanduser()
-    try:
-        data = path.read_bytes()
-    except OSError as exc:
-        raise FileNotFoundError(f"initial_prompt_file_unreadable: {path}") from exc
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ValueError("prompt_blob_invalid_utf8") from exc
+    text = getattr(args, "initial_prompt", None)
+    if text is None and getattr(args, "initial_prompt_file", None) is not None:
+        path = Path(args.initial_prompt_file).expanduser()
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise FileNotFoundError(f"initial_prompt_file_unreadable: {path}") from exc
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("prompt_blob_invalid_utf8") from exc
+    if text is None and baseline_content is None:
+        return {}, 0
+    metadata: dict[str, object] = {}
     if baseline_content is not None:
+        supplied_length = len(text or "")
         text = _compose_role_baseline_prompt(baseline_content, text)
-        data = text.encode("utf-8")
+        # This composer knows exactly where the injected contract ends. The
+        # daemon uses this offset only to select display data for new packets.
+        metadata["initial_prompt_baseline_end"] = len(text) - supplied_length
+    data = text.encode("utf-8")
     if len(data) <= INITIAL_PROMPT_INLINE_CAP_BYTES:
-        return {"initial_prompt": text}, len(data)
+        return {"initial_prompt": text, **metadata}, len(data)
     upload = asyncio.run(upload_prompt_blob_once(config, data, timeout=float(getattr(args, "timeout", None) or 30.0)))
     if upload.get("type") != "upload_prompt_blob.ok":
         raise RuntimeError(str(upload.get("error_code") or upload.get("type") or "upload_prompt_blob_failed"))
-    return {"initial_prompt_blob_sha": upload.get("prompt_blob_sha")}, len(data)
+    return {"initial_prompt_blob_sha": upload.get("prompt_blob_sha"), **metadata}, len(data)
 
 
 def _capture_initial_prompt(
@@ -885,6 +873,8 @@ def schedule_recurring_add(args: argparse.Namespace) -> int:
         **prompt_payload,
     }
     self_close = _resolve_self_close_on_completion(args, visibility=visibility, parent=lineage, handoff=False)
+    if getattr(args, "account", None) is not None:
+        payload["account"] = args.account
     if self_close is not None:
         payload["self_close_on_completion"] = self_close
     spec_ids = list(args.spec_id or [])
@@ -935,6 +925,7 @@ def schedule_recurring_set(args: argparse.Namespace) -> int:
         ("provider", "provider"), ("model", "model"), ("effort", "effort"), ("host", "target_host"),
         ("role", "role"), ("phase", "phase"), ("visibility", "visibility"), ("parent", "parent"),
         ("objective", "objective"),
+        ("account", "account"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
@@ -1086,6 +1077,8 @@ def _derive_default_idempotency_key(
         "spec_ids": sorted(str(s) for s in spec_ids),
         "brief": initial_prompt_payload or {},
         "objective": payload.get("objective"),
+        "lane_id": payload.get("lane_id"),
+        "provision_only": payload.get("provision_only", False),
     }
     digest = hashlib.sha256(
         json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str).encode()
@@ -1104,9 +1097,15 @@ def spawn(args: argparse.Namespace) -> int:
     handoff = bool(getattr(args, "handoff", False))
     top_level = bool(getattr(args, "top_level", False))
     scheduled = bool(getattr(args, "at", None) or getattr(args, "delay", None))
+    if scheduled and (getattr(args,"pool_override_reason",None) or getattr(args,"pool_authority_ref",None)):
+        print("agent-orch spawn: one-spawn pool overrides require an immediate spawn",file=sys.stderr)
+        return 2
     if getattr(args, "at", None) and getattr(args, "delay", None):
         print("agent-orch spawn: validation failed: --at and --delay are mutually exclusive", file=sys.stderr)
         return 2
+    if scheduled and (getattr(args, "provision_only", False) or getattr(args, "lane_id", None)):
+        return _fresh_schedule_validation_error("lane_provisioning_not_schedulable",
+                                                "--provision-only and --lane-id require an immediate spawn")
     cwd = getattr(args, "cwd", None)
     if cwd is not None:
         if not isinstance(cwd, str) or not cwd:
@@ -1121,9 +1120,6 @@ def spawn(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-    if scheduled and getattr(args, "account", None) is not None:
-        print("agent-orch spawn: explicit account choice requires an immediate front-desk spawn", file=sys.stderr)
-        return 2
     if scheduled and not handoff:
         if getattr(args, "resume", None) is not None:
             return _fresh_schedule_validation_error(
@@ -1280,9 +1276,15 @@ def spawn(args: argparse.Namespace) -> int:
         role_source = "handoff" if handoff and not requested_role else "spawn"
         loaded_baseline = role_baseline.load_role_baseline(config, str(resolved_role))
     baseline_content = loaded_baseline.get("content") if loaded_baseline else None
+    if getattr(args, "provision_only", False):
+        if (resolved_role not in {"lead", "nexus"} or getattr(args, "initial_prompt", None) is not None
+                or getattr(args, "initial_prompt_file", None) is not None):
+            print("agent-orch spawn: --provision-only requires lead/nexus and no task prompt or command", file=sys.stderr)
+            return 2
+        baseline_content = None
     visibility = args.visibility
     if visibility is None:
-        visibility = "default" if (handoff or args.role == "nexus" or parent is None) else None
+        visibility = "default" if (not handoff and not getattr(args, "resume", None) and parent is None) else None
     raw_spec_ids = getattr(args, "spec_id", None)
     spec_ids = [raw_spec_ids] if isinstance(raw_spec_ids, str) else list(raw_spec_ids or [])
     if scheduled:
@@ -1308,6 +1310,8 @@ def spawn(args: argparse.Namespace) -> int:
             "handoff": handoff,
             **resolved_spawn,
         }
+        if getattr(args, "account", None) is not None:
+            payload["account"] = args.account
         # Presence is part of the audit truth: JSON null means the caller omitted
         # that override, while the resolved tuple below records what will launch.
         payload.update(requested_spawn_tuple)
@@ -1381,8 +1385,14 @@ def spawn(args: argparse.Namespace) -> int:
         "visibility": visibility,
         **resolved_spawn,
     }
+    if getattr(args, "lane_id", None):
+        payload["lane_id"] = args.lane_id
+    if getattr(args, "provision_only", False):
+        payload["provision_only"] = True
     if getattr(args, "account", None) is not None:
         payload["account"] = args.account
+    for field in ("pool_override_reason","pool_authority_ref"):
+        if getattr(args,field,None) is not None: payload[field]=getattr(args,field)
     if spec_ids:
         payload["spec_id"] = spec_ids[0]
         if len(spec_ids) > 1:
@@ -3608,6 +3618,15 @@ def close(args: argparse.Namespace) -> int:
     """
     if not _require_stream_id("close", args.stream_id):
         return 2
+    request_id = getattr(args, "request_id", None)
+    if request_id is not None and not str(getattr(args, "expected_generation", None) or "").strip():
+        print("agent-orch close: --request-id requires --expected-generation", file=sys.stderr)
+        return 2
+    if request_id is not None and (not isinstance(request_id, str) or not request_id.strip()):
+        print("agent-orch close: --request-id must be nonempty", file=sys.stderr)
+        return 2
+    request_id = request_id if request_id is not None else f"close-{uuid.uuid4()}"
+    print(f"close request ID: {request_id}", file=sys.stderr, flush=True)
     config = load_config()
     caller_stream_id = (
         getattr(args, "caller_stream_id", None)
@@ -3635,6 +3654,7 @@ def close(args: argparse.Namespace) -> int:
                 progeny_stream_id=getattr(args, "progeny", None),
                 disposition_waived_reason=getattr(args, "disposition_waived_reason", None),
                 expected_generation=getattr(args, "expected_generation", None),
+                request_id=request_id,
             )
         )
     except ValueError as exc:
@@ -3775,10 +3795,11 @@ def consent_command(args: argparse.Namespace) -> int:
 
 
 def lifecycle(args: argparse.Namespace) -> int:
-    """Inspect, or (as the designated manager) transfer, fleet lifecycle authority.
+    """Inspect fleet lifecycle authority, or emergency-revoke it on loopback.
 
-    Designation and revocation require the authenticated operator (web UI);
-    a seat token can only transfer a grant it currently holds.
+    With a primary direct binding the current front desk holds it automatically;
+    otherwise the operator-designated grant does. Designation and ordinary
+    revocation go through phone consent; transfer is disabled.
     """
     config = load_config()
     caller = getattr(args, "from_stream_id", None) or discover_leader_stream_id_short(config)
@@ -5345,7 +5366,9 @@ def build_parser() -> argparse.ArgumentParser:
             timer_parser.add_argument("--repeat", action="store_true")
 
     spawn_parser = subparsers.add_parser("spawn")
-    spawn_parser.add_argument("--account", help="Named account for this launch (front desk only); omitted uses host/provider default.")
+    spawn_parser.add_argument("--account", help="Named account within existing launch authority; retained for delayed/recurring work. Omitted fresh launches use the target default.")
+    spawn_parser.add_argument("--pool-override-reason",help="Current primary/operator: override one spawn's pool control")
+    spawn_parser.add_argument("--pool-authority-ref",help="Authority receipt for that one spawn")
     spawn_parser.add_argument("--no-watch", action="store_true", help="Skip the default parent watch")
     spawn_parser.add_argument("--provider", help="Required except for --handoff, which inherits the retiring stream provider.")
     spawn_parser.add_argument(
@@ -5363,6 +5386,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start the seat in this absolute project directory (immediate spawns only).",
     )
     spawn_parser.add_argument("--role")
+    spawn_parser.add_argument("--lane-id", help="Select the lane for an ambiguous spec membership.")
+    spawn_parser.add_argument("--provision-only", action="store_true", help="FD: provision a promptless lead; bind and explicitly activate its lane before sending work.")
     spawn_parser.add_argument("--phase")
     spawn_parser.add_argument(
         "--spec-id",
@@ -5561,6 +5586,7 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument("--tz", help="IANA zone (default America/Chicago)")
         parser.add_argument("--days", help="weekly only: comma list, e.g. mon,wed")
         parser.add_argument("--provider", required=creating)
+        parser.add_argument("--account", help="named provider account retained until fire")
         parser.add_argument("--model")
         parser.add_argument("--effort")
         parser.add_argument("--host")
@@ -6246,6 +6272,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     close_parser = subparsers.add_parser("close")
     close_parser.add_argument("--reason", default="manual")
+    close_parser.add_argument("--request-id", help="Replay the original complete close invocation; requires --expected-generation.")
     close_parser.add_argument(
         "--expected-generation",
         help="Refuse if the target's current session generation differs from this value.",
@@ -6331,12 +6358,12 @@ def build_parser() -> argparse.ArgumentParser:
                 command.add_argument("fingerprint")
     lifecycle_parser = subparsers.add_parser(
         "lifecycle",
-        description="inspect or transfer operator-designated fleet lifecycle authority",
+        description="inspect fleet lifecycle authority (the current front-desk binding, or the designated grant)",
     )
     lifecycle_sub = lifecycle_parser.add_subparsers(dest="lifecycle_command", required=True)
-    lifecycle_inspect = lifecycle_sub.add_parser("inspect", help="current grant, recent audit, optional target readback")
+    lifecycle_inspect = lifecycle_sub.add_parser("inspect", help="effective holder and policy, raw grant, recent audit, optional target readback")
     lifecycle_inspect.add_argument("--target", help="stream id to read back generation and eligibility")
-    lifecycle_transfer = lifecycle_sub.add_parser("transfer", help="holder-only: move the grant to an existing eligible seat")
+    lifecycle_transfer = lifecycle_sub.add_parser("transfer", help="disabled (authority_transfer_disabled): authority follows the front-desk binding; use operator designate or revoke")
     lifecycle_transfer.add_argument("target", help="recipient stream id (existing open lead or protected assistant)")
     lifecycle_transfer.add_argument("--reason", required=True)
     lifecycle_transfer.add_argument("--target-generation", help="exact recipient generation (default: fresh readback)")

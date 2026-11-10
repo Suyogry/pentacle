@@ -1,4 +1,4 @@
-"""Item (1): a new managed commission names one assigned spec in an open product lane.
+"""Acceptance owners require work links; parented supporting roles inherit optional attribution.
 
 Lane tracking minimal A1-A5 with QA corrections R1, R4, R5, R6.
 """
@@ -13,7 +13,7 @@ from store import UNASSIGNED, Store, effective_assignment
 from store_work_lanes import _assigned_seats_conn
 from test_spawn_wip_cap import HOST, setup
 
-SUMMARY = "---\nid: work_{stem}\n---\n**Status** — Underway.\n\n**Next action** — Continue.\n"
+SUMMARY = "---\nid: work_{stem}\n---\n**Progress** — Created the acceptance fixture.\n\n**Status** — Underway.\n\n**Next action** — Continue.\n"
 SPEC = ("---\nid: spec_{stem}\ntitle: Fixture {stem}\n---\n## Acceptance Criteria\n- [ ] Done.\n\n"
         "## Estimate\n- remaining_work_h: 1–2 (median 1.5) as_of 2026-10-09\n")
 
@@ -28,17 +28,16 @@ def item(root, stem, *, summary=SUMMARY):
 
 async def lane(store, lane_id, *members, state="active"):
     def op(conn):
+        from work_lane_link import link_specs_conn
+        link_specs_conn(conn, *members, lane_id=lane_id)
         conn.execute(
-            "INSERT INTO v2_assistant_composite_lanes (lane_id,stream_id,phase,summary,version,created_at,updated_at,"
-            "work_state,work_state_reason,owner_kind,title,members_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (lane_id, "fixture:assistant", "execution", "", 4, "2026-10-09T00:00:00Z", "2026-10-09T00:00:00Z",
-             state, "fd", "fd", "Lane " + lane_id, json.dumps(list(members))))
+            "UPDATE v2_assistant_composite_lanes SET work_state=?,version=4 WHERE lane_id=?", (state,lane_id))
         conn.commit()
     await store.submit(op)
 
 
-async def seat(store, name, *spec_ids, assigned=None, role="lead"):
-    row = await store.open_session(HOST, name, provider="claude", role=role, spec_ids=list(spec_ids),
+async def seat(store, name, *spec_ids, assigned=None, role="lead", visibility="hidden"):
+    row = await store.open_session(HOST, name, provider="claude", role=role, visibility=visibility, spec_ids=list(spec_ids),
                                    spec_binding_provenance=[{"spec_id": s, "provenance": "spawn_explicit",
                                                              "granting_principal": "operator",
                                                              "granted_at": "2026-10-09T00:00:00Z"}
@@ -85,7 +84,7 @@ async def test_unlinked_explicit_commission_is_refused_before_any_pane(env):
     ctl, _sessions, tmux = await setup(env.root, env.store, env.monkeypatch)
     await lane(env.store, "wl-home", home)
     caller = await seat(env.store, "caller", home, assigned=home)
-    err = await refused(ctl, agent(caller, spec=target))
+    err = await refused(ctl, agent(caller, spec=target, role="lead"))
     assert err.code == "work_lane_assignment_unlinked"
     # The repair names the caller's home lane and only the new member.
     assert f"agent-orch work-lane add-member wl-home {target}" in str(err)
@@ -104,7 +103,7 @@ async def test_linked_commission_persists_assignment_and_warns_on_checkpoint(env
     assert row["assigned_spec_id"] == target
     # A malformed display record is a warning, never an extra refusal (FD GO).
     assert reply["work_checkpoint"]["state"] == "invalid"
-    assert [d["code"] for d in reply["work_checkpoint"]["deficiencies"]] == ["status_missing", "next_action_missing"]
+    assert [d["code"] for d in reply["work_checkpoint"]["deficiencies"]] == ["progress_missing", "status_missing", "next_action_missing"]
 
 
 @pytest.mark.asyncio
@@ -113,7 +112,7 @@ async def test_portfolio_parent_without_assignment_requires_spec_id(env):
     ctl, _sessions, tmux = await setup(env.root, env.store, env.monkeypatch)
     await lane(env.store, "wl-p", *specs)
     caller = await seat(env.store, "fd", *specs)  # multi-tag, unassigned (legacy portfolio)
-    err = await refused(ctl, agent(caller))
+    err = await refused(ctl, agent(caller, role="lead"))
     assert err.code == "work_assignment_required"
     assert "--spec-id" in str(err) and "3 specs" in str(err)
     assert tmux.created == 0
@@ -168,7 +167,7 @@ async def test_exempt_callers_are_never_refused(env, auth):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("role, exempt", [("assistant", True), ("lead", False)])
+@pytest.mark.parametrize("role, exempt", [("assistant", False), ("lead", False)])
 async def test_protected_assistant_caller_is_exempt_and_other_roles_are_not(env, role, exempt):
     # A2/R5: a protected assistant seat is exempt; a seat's ordinary role never is.
     env.monkeypatch.setenv("PENTACLE_ASSISTANT_ROLE", "assistant")
@@ -189,7 +188,7 @@ async def test_operator_elevated_seat_token_is_still_managed(env):
     target = item(env.root, "demo__target")
     ctl, _sessions, _tmux = await setup(env.root, env.store, env.monkeypatch)
     caller = await seat(env.store, "caller", target, assigned=target)
-    msg = agent(caller, spec=target)
+    msg = agent(caller, spec=target, role="lead")
     msg["_auth_context"].update(operator_authenticated=True, operator_authority_source="stream_token")
     assert (await refused(ctl, msg)).code == "work_lane_assignment_unlinked"
 
@@ -216,7 +215,7 @@ async def test_done_lane_membership_is_not_a_link(env):
     ctl, _sessions, _tmux = await setup(env.root, env.store, env.monkeypatch)
     await lane(env.store, "wl-old", target, state="done")
     caller = await seat(env.store, "caller", target, assigned=target)
-    assert (await refused(ctl, agent(caller, spec=target))).code == "work_lane_assignment_unlinked"
+    assert (await refused(ctl, agent(caller, spec=target, role="lead"))).code == "work_lane_assignment_unlinked"
 
 
 @pytest.mark.asyncio
@@ -277,11 +276,62 @@ async def test_operator_assign_is_recorded_without_refusal_and_detach_clears(env
     target = item(env.root, "demo__target")
     ctl, sessions, _tmux = await setup(env.root, env.store, env.monkeypatch)
     chat = await seat(env.store, "chat", role=None)
+    await lane(env.store, "wl-operator", target)
     operator = {"operator_authenticated": True, "operator_principal": "operator:fixture"}
     reply = await spec_update(env, ctl, sessions, "assign", chat[0], target, operator)
     assert reply["session"]["assigned_spec_id"] == target and reply["session"]["spec_ids"] == [target]
     reply = await spec_update(env, ctl, sessions, "detach", chat[0], target, operator)
     assert reply["session"]["assigned_spec_id"] == UNASSIGNED and effective_assignment(reply["session"]) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["attach", "detach"])
+@pytest.mark.parametrize("state", ["paused", "orphan", "fd", "active"])
+async def test_legacy_spec_tag_change_guards_proposed_effective_assignment(env, action, state):
+    target, other = item(env.root, "demo__target"), item(env.root, "demo__other")
+    ctl, sessions, _tmux = await setup(env.root, env.store, env.monkeypatch)
+    await lane(env.store, "wl-tags", target, state="paused" if state == "paused" else "active")
+    chat = await seat(env.store, "tag-chat", *([target, other] if action == "detach" else []), role="worker")
+    if state == "orphan":
+        await env.store.submit(lambda conn: (
+            conn.execute("UPDATE v2_assistant_composite_lanes SET bound_generation='lost' WHERE lane_id='wl-tags'"),
+            conn.commit()))
+    if state == "fd":
+        # The actual authenticated binding, not a role, title or caller flag.
+        await env.store.submit(lambda conn: (
+            conn.execute("INSERT INTO v2_assistant_direct_binding(name,stream_id,generation,revision,updated_at) "
+                         "VALUES ('assistant',?,?,1,'2026-11-09T00:00:00Z')", chat), conn.commit()))
+    before = await env.store.fetch_session(HOST, "tag-chat")
+    assert before["assigned_spec_id"] is None and effective_assignment(before) is None
+    operator = {"operator_authenticated": True, "operator_principal": "operator:fixture"}
+    changed_spec = other if action == "detach" else target
+    if state == "active":
+        reply = await spec_update(env, ctl, sessions, action, chat[0], changed_spec, operator)
+        assert reply["session"]["assigned_spec_id"] is None
+        assert effective_assignment(reply["session"]) == target
+    else:
+        with pytest.raises(VerbError) as exc:
+            await spec_update(env, ctl, sessions, action, chat[0], changed_spec, operator)
+        assert exc.value.code == {"paused": "work_lane_not_active", "orphan": "work_lane_visible_lead_required",
+                                  "fd": "work_lane_fd_execution_forbidden"}[state]
+        after = await env.store.fetch_session(HOST, "tag-chat")
+        assert after["spec_ids"] == before["spec_ids"] and effective_assignment(after) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["attach", "detach"])
+async def test_coordination_tags_stay_usable_after_explicit_unassignment(env, action):
+    target, other = item(env.root, "demo__target"), item(env.root, "demo__other")
+    ctl, sessions, _tmux = await setup(env.root, env.store, env.monkeypatch)
+    await lane(env.store, "wl-tags", target, state="paused")
+    chat = await seat(env.store, "coord-chat", *([target, other] if action == "detach" else []), role="worker")
+    operator = {"operator_authenticated": True, "operator_principal": "operator:fixture"}
+    unassigned = await spec_update(env, ctl, sessions, "unassign", chat[0], auth=operator)
+    assert effective_assignment(unassigned["session"]) is None
+    reply = await spec_update(env, ctl, sessions, action, chat[0], other if action == "detach" else target, operator)
+    assert reply["session"]["spec_ids"] == [target]
+    assert reply["session"]["assigned_spec_id"] == UNASSIGNED
+    assert effective_assignment(reply["session"]) is None
 
 
 @pytest.mark.asyncio
@@ -295,8 +345,8 @@ async def test_unassign_of_a_single_spec_seat_sticks_through_handoff(env):
     reply = await spec_update(env, ctl, sessions, "unassign", lead[0], auth=operator)
     assert reply["session"]["spec_ids"] == [keep] and effective_assignment(reply["session"]) is None
     assert await env.store.submit(lambda c: _assigned_seats_conn(c, [keep])) == []  # no longer "in use"
-    # A new commission from it must name its spec; the tag is not an implicit assignment.
-    assert (await refused(ctl, agent(lead, name="kid"))).code == "work_assignment_required"
+    # A new lead commission must name its spec; the tag is not an implicit assignment.
+    assert (await refused(ctl, agent(lead, name="kid", role="lead"))).code == "work_assignment_required"
     # A handoff successor inherits the unassignment, even when it names specs.
     for name, extra in (("succ-a", {}), ("succ-b", {"spec_id": other})):
         msg = agent(lead, parent=False, name=name, handoff=True, handoff_from_stream_id=lead[0], **extra)
@@ -332,3 +382,43 @@ def test_removing_a_live_assignment_needs_a_recorded_reason():
         await env.op("set_members", {"members": [], "no_spec_reason": "Paused intake."},
                      lane=lid, version=done["lane"]["version"])
     run(body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["worker", "evaluator", "planner", "reviewer-advisory", None])
+@pytest.mark.parametrize("attribution", ["none", "portfolio", "unlinked"])
+async def test_parented_supporting_spawn_needs_no_manual_work_link(env, role, attribution):
+    specs = [] if attribution == "none" else [item(env.root, f"demo__support_{i}") for i in range(2)]
+    ctl, _sessions, tmux = await setup(env.root, env.store, env.monkeypatch)
+    caller = await seat(env.store, "operator-chat", *specs, role=None, visibility="visible")
+    if attribution == "portfolio":
+        await lane(env.store, "wl-support", *specs)
+    msg = agent(caller, role=role, key="support-key")
+    if role is None:
+        msg.pop("role")
+    if attribution == "unlinked":
+        msg["spec_id"] = specs[0]
+    reply = await ctl.spawn(msg, HOST)
+    row = await env.store.fetch_session(HOST, "child")
+    assert reply["type"] == "spawn.ok"
+    assert row["parent_stream_id"] == caller[0]
+    assert row["objective"] == msg["objective"]
+    assert row["spec_ids"] == (specs[:1] if attribution == "unlinked" else specs)
+    if attribution == "portfolio":
+        assert row["assigned_spec_id"] is None
+        assert all(b["provenance"] == "parent_inherited" for b in row["spec_binding_provenance"])
+        assert [l["lane_id"] for l in await env.store.open_lanes_for_spec(row["spec_ids"][0])] == ["wl-support"]
+    again = await ctl.spawn(msg, HOST)
+    assert again["stream_id"] == reply["stream_id"] and tmux.created == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role,extra,resolved_role", [
+    ("lead", {}, None), ("qa", {}, None), ("worker", {"phase": "qa"}, None),
+    (None, {"qa_spec_id": "spec_demo__review"}, None), ("worker", {}, "lead"),
+])
+async def test_acceptance_spawns_still_require_work_binding(env, role, extra, resolved_role):
+    ctl, _sessions, tmux = await setup(env.root, env.store, env.monkeypatch, resolved_role=resolved_role)
+    caller = await seat(env.store, "operator-chat", role=None)
+    assert (await refused(ctl, agent(caller, role=role, **extra))).code == "work_assignment_required"
+    assert tmux.created == 0

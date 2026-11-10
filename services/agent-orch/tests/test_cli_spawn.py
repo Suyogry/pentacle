@@ -73,6 +73,18 @@ def _config(tmp_path: Path, memory_repo_path: Path | None = None) -> Config:
     )
 
 
+def test_spawn_prints_authoritative_preflight_corrections(monkeypatch, tmp_path, capsys):
+    errors = [{"code": "origin_malformed", "field": "work_item.origin", "correction": "Repair the existing Tracking line."},
+              {"code": "spec_unavailable", "field": "spec_id", "correction": "Restore readable source."}]
+    response = {"type": "spawn.error", "error_code": "spawn_preflight_failed", "errors": errors}
+    monkeypatch.setattr(cli, "load_config", lambda: _config(tmp_path))
+    async def spawn(*args, **kwargs):
+        return response
+    monkeypatch.setattr(cli, "spawn_once", spawn)
+    assert cli.spawn(_spawn_args(tmp_path)) == 1
+    assert json.loads(capsys.readouterr().out)["errors"] == errors
+
+
 def _install_spawn_fakes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -604,7 +616,7 @@ def test_spawn_direct_defaults_parent_to_caller_without_wrapper_workspace(monkey
     ("parent", "role", "top_level", "requested_visibility", "expected_visibility"),
     [
         (None, "nexus", True, None, "default"),
-        ("hostc:codex-parent", "nexus", False, None, "default"),
+        ("hostc:codex-parent", "nexus", False, None, None),
         (None, "lead", True, None, "default"),
         ("hostc:codex-parent", "lead", False, None, None),
         (None, "lead", True, "nested", "nested"),
@@ -675,6 +687,7 @@ def test_spawn_role_baseline_is_prepended_to_initial_prompt(monkeypatch, tmp_pat
     printed = _printed_json(capsys)
 
     assert captured["payload"]["initial_prompt"] == "BASELINE\n\nTASK"
+    assert captured["payload"]["initial_prompt_baseline_end"] == len("BASELINE\n\n")
     assert printed["role_baseline"]["content"] == "BASELINE\n"
 
 
@@ -767,6 +780,7 @@ def test_spawn_role_baseline_uploads_composed_prompt_bytes(monkeypatch, tmp_path
 
     assert captured["uploaded"] == expected
     assert captured["payload"]["initial_prompt_blob_sha"] == hashlib.sha256(expected).hexdigest()
+    assert captured["payload"]["initial_prompt_baseline_end"] == len("BASELINE\n\n")
     assert "initial_prompt" not in captured["payload"]
 
 
@@ -827,6 +841,24 @@ def test_spawn_role_baseline_is_initial_prompt_when_no_prompt_is_given(monkeypat
     _printed_json(capsys)
 
     assert captured["payload"]["initial_prompt"] == "BASELINE\n"
+    assert captured["payload"]["initial_prompt_baseline_end"] == len("BASELINE\n")
+
+
+def test_provision_only_public_cli_sends_no_task_or_baseline(monkeypatch, tmp_path, capsys):
+    agents = tmp_path / "memory" / "agents"
+    agents.mkdir(parents=True)
+    (agents / "lead_baseline.md").write_text("BASELINE\n")
+    monkeypatch.setattr(cli, "load_config", lambda: _config(tmp_path, agents.parent))
+    captured = []
+    async def call(config, payload, timeout):
+        captured.append(payload)
+        return {"type": "spawn.ok", "stream_id": "hostc:lead"}
+    monkeypatch.setattr(cli, "spawn_once", call)
+    args = _spawn_args(tmp_path, role="lead")
+    args.provision_only, args.lane_id, args.spec_id = True, "wl-paused", ["spec_demo__owned"]
+    assert cli.spawn(args) == 0
+    assert captured[0]["provision_only"] is True and captured[0]["lane_id"] == "wl-paused"
+    assert not any(key in captured[0] for key in ("initial_prompt", "initial_prompt_blob_sha", "initial_prompt_baseline_end"))
 
 
 def test_spawn_indeterminate_role_baseline_ack_is_explicit(monkeypatch, tmp_path: Path, capsys) -> None:

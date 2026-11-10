@@ -1,3 +1,4 @@
+from _shared.spawn_profiles import resolve_test_profile
 """Admission/refusal through the real deploy transaction, with isolated launchd."""
 from pathlib import Path
 import hashlib
@@ -37,7 +38,7 @@ def test_supplied_merge_receipt_is_reused_once_and_seams_admitted(isolated_relea
         assert evidence["sha"] == target and evidence["passed"] is True
         evidence["seam_results"] = {"identity": {"candidate": target}, "results": []}
         admitted.append(True)
-        return {"identity": {"candidate": target}}
+        return {"identity": {"candidate": target, "test_profile": resolve_test_profile()}}
     monkeypatch.setattr(module.release_selection, "admit", admit)
     monkeypatch.setattr(module.release_selection, "revalidate", lambda *_: None)
     monkeypatch.setattr(module, "_validate_selected_activation", lambda *_: None)
@@ -153,6 +154,12 @@ def admitted_transaction(isolated_release, tmp_path, monkeypatch):
     monkeypatch.setattr(module, 'run_gate_and_write_evidence', lambda *_a, **_k: pytest.fail('duplicate merge gate'))
     monkeypatch.setattr(module, '_install_fleet_smoke_schedule', lambda *_: pytest.fail('canary cannot install full-matrix schedule'))
     cell = {'host': 'primary', 'provider': 'codex', 'prompt_mode': 'promptless', 'outcome': 'passed'}
+    from _shared.spawn_profiles import resolve_test_profile, test_prompt_tuple
+    profile = resolve_test_profile()
+    model, effort = test_prompt_tuple('codex', profile)
+    cell.update(model=model, effort=effort, test_profile=profile,
+        tuple_evidence={'requested_model': model, 'requested_effort': effort,
+                        'effective_model': model, 'effective_effort': effort})
     payload = {'returncode': 0, 'result': {'ok': True, 'status': 'PASS', 'cells': [cell]}}
     result_path = tmp_path / 'synthetic-provider-result.json'
     _write(result_path, payload)
@@ -175,7 +182,9 @@ def test_real_admission_reuses_merge_and_dispatches_exact_affected_child(admitte
     assert stamp['release_selection']['identity'] == t['section']['identity']
     assert {b['id'] for b in stamp['release_selection']['boundaries']} == {'client_wire_render', 'deploy_invocation'}
     child = json.loads(t['child'].read_text())
-    assert child['argv'][1:] == ['ws://127.0.0.1:7791', 'primary']
+    assert child['argv'][1:3] == ['ws://127.0.0.1:7791', 'primary']
+    assert child['argv'][3] == '--test-profile-snapshot'
+    assert json.loads(Path(child['argv'][4]).read_text()) == stamp['test_profile']
     assert child['machines_file'] == str(t['machines'])
     assert child['ambient_hosts'] is None and child['ambient_json'] is None
     verdict = stamp['fleet_smoke']
@@ -287,10 +296,21 @@ def test_actual_child_non_green_cannot_certify_or_rollback_healthy_source(admitt
 
 
 @pytest.mark.parametrize('isolated_release', ['selection'], indirect=True)
-def test_rollback_needs_fresh_receipts_and_uses_actual_recorded_preimage(admitted_transaction, request):
+def test_rollback_needs_fresh_receipts_and_uses_actual_recorded_preimage(admitted_transaction, request, monkeypatch):
     from .test_release_selection import _write
+    from deploy.restoration import qualified_prior
     t = admitted_transaction
+    module, repo, service = t['module'], t['repo'], t['service']
+    # This rollback journey needs a qualified actual prior. Other journeys keep
+    # isolated_release's deliberately stale stamp and all their refusal controls.
+    prior_stamp = module._read_stamp(repo, service)
+    prior_stamp.update(sha=t['prior'], daemon_runtime_readback={'sha':t['prior']},
+        daemon_boot_readback={'outcome':'observed'}, fleet_smoke={'outcome':'passed','cells':[]})
+    module._write_stamp(repo, service, prior_stamp)
+    t['before'] = module._stamp_path(repo, service).read_bytes()
     first = t['activate']()
+    # The real forward writer persists qualification usable by later rollback.
+    assert qualified_prior(module._read_stamp(repo, service), t['target'], [])['sha'] == t['target']
     assert first['prior_sha'] == t['prior'] and first['sha'] == t['target']
     # A target receipt cannot qualify the actual recorded rollback source.
     with pytest.raises(t['module'].DeployError, match='stale seam identity|candidate mismatch'):
@@ -306,10 +326,26 @@ def test_rollback_needs_fresh_receipts_and_uses_actual_recorded_preimage(admitte
             row['receipt'] = _write(Path(row['receipt']['path']), observed)
     t['freeze']()
     t['module']._checked(('git', 'checkout', '--detach', t['target']), t['repo'], t['module']._run)
+    # Fresh source/seam receipts cannot qualify an unproven production prior.
+    unqualified = json.loads(json.dumps(first))
+    unqualified['prior_qualification']['stamp'].pop('daemon_boot_readback')
+    module._write_stamp(repo, service, unqualified)
+    refused_preimage = module._stamp_path(repo, service).read_bytes()
+    with pytest.raises(module.DeployError, match='prior lacks accepted production forward qualification'):
+        t['activate'](rollback=True)
+    assert module._stamp_path(repo, service).read_bytes() == refused_preimage
+    assert module._git(repo, 'rev-parse', 'HEAD', runner=module._run) == t['target']
+    assert len([c for c in t['calls'] if 'kickstart' in c]) == 1
+    module._write_stamp(repo, service, first)
+    # Synthetic provider/OS peers establish transaction mechanics, not readiness.
+    monkeypatch.setattr(module, '_verify_direct_restoration', lambda *_a, **_k:
+        {'outcome':'passed', 'mode':'zero_input', 'synthetic':True})
     rolled = t['activate'](rollback=True)
     assert rolled['sha'] == t['prior'] and rolled['prior_sha'] == t['target']
     assert 'post_activation_error' not in rolled
-    assert rolled['fleet_smoke']['outcome'] == 'passed'
+    assert rolled['restoration'] == {'outcome':'passed', 'mode':'zero_input', 'synthetic':True}
+    assert rolled['model_canary']['outcome'] == 'not_run_by_design'
+    assert rolled['full_fleet_acceptance'] is False and 'fleet_smoke' not in rolled
     assert t['module']._git(t['repo'], 'rev-parse', 'HEAD', runner=t['module']._run) == t['prior']
     assert len([c for c in t['calls'] if 'kickstart' in c]) == 2
     _record_transaction(request, t, rolled)

@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -398,7 +399,7 @@ def _fleet_smoke_hosts(machines_file: str) -> tuple[tuple[str, ...], tuple[str, 
 def _fleet_smoke_verdict(
     result: subprocess.CompletedProcess[str], machines_file: str,
     required_cells: list[dict[str, str]] | None = None,
-    *, declared_exclusions: list[dict[str, str]] | None = None,
+    *, declared_exclusions: list[dict[str, str]] | None = None, accounts: Sequence[str] = (), test_profile=None,
 ) -> dict[str, object]:
     """Combine every smoke evidence channel; missing cells can never turn green.
 
@@ -441,6 +442,19 @@ def _fleet_smoke_verdict(
             expected = set(keys)
         except (TypeError, KeyError, ValueError) as exc:
             issues.append("invalid_required_cells: " + str(exc))
+    choices = {}
+    if accounts:
+        from tools.spawn_fleet_smoke import account_map
+        try:
+            choices = account_map(list(accounts), tuple(sorted(expected)))
+        except ValueError as exc:
+            issues.append('invalid_smoke_accounts: ' + str(exc))
+    if test_profile is not None:
+        from _shared.spawn_profiles import validate_test_profile
+        try:
+            test_profile = validate_test_profile(test_profile)
+        except ValueError as exc:
+            issues.append("invalid_test_profile: " + str(exc))
     cells: dict[tuple[str, str, str], dict[str, object]] = {}
     severity = {"passed": 0, "unreachable": 1, "untested": 2, "failed": 3}
     seen_pass_rows = set()
@@ -460,6 +474,26 @@ def _fleet_smoke_verdict(
                 seen_pass_rows.add(key)
             if key not in expected:
                 issues.append(f"unconfigured_or_invalid_cell:{'/'.join(key)}")
+            if choices and key in expected:
+                actual = row.get('account_binding') or {}
+                alias = choices[(key[0], key[1])]
+                if (row.get('account') != alias or actual.get('alias') != alias
+                        or actual.get('host') != key[0] or actual.get('provider') != key[1]
+                        or not actual.get('generation')):
+                    row = {**row, 'outcome': 'failed', 'reason': 'account_binding_mismatch'}
+            if test_profile is not None and str(row.get("outcome", "")).lower() == "passed":
+                from _shared.spawn_profiles import test_prompt_tuple
+                try:
+                    model, effort = test_prompt_tuple(key[1], test_profile)
+                    proof = row.get("tuple_evidence") or {}
+                    if (row.get("test_profile") != test_profile
+                            or (row.get("model"), row.get("effort")) != (model, effort)
+                            or any(proof.get(k) != v for k, v in
+                                (("requested_model", model), ("requested_effort", effort),
+                                 ("effective_model", model), ("effective_effort", effort)))):
+                        raise ValueError("requested/effective tuple or settings mismatch")
+                except ValueError:
+                    row = {**row, "outcome": "failed", "reason": "test_profile_mismatch"}
             outcome = str(row.get("outcome") or "").lower()
             classification = str(row.get("class") or "").lower()
             reason = str(row.get("reason") or row.get("stage") or "")
@@ -793,8 +827,10 @@ def _render_v2_usage_collector_plist(repo: Path) -> bytes:
     return _render_release_checkout_plist(repo, USAGE_COLLECTOR_TEMPLATE, "usage collector")
 
 
-def _render_v2_spawn_fleet_smoke_plist(repo: Path) -> bytes:
-    return _render_release_checkout_plist(repo, SPAWN_FLEET_SMOKE_TEMPLATE, "fleet smoke")
+def _render_v2_spawn_fleet_smoke_plist(repo: Path, *, accounts: Sequence[str] = ()) -> bytes:
+    value = plistlib.loads(_render_release_checkout_plist(repo, SPAWN_FLEET_SMOKE_TEMPLATE, "fleet smoke"))
+    value.setdefault('EnvironmentVariables', {})['PENTACLE_SMOKE_ACCOUNTS'] = ','.join(accounts)
+    return plistlib.dumps(value)
 
 
 def _validate_v2_launchd_program(repo: Path, arguments: Sequence[str]) -> Path:
@@ -1138,7 +1174,45 @@ def classify_slow_consumer_log(
 
 
 def classify_slow_consumer_lines(lines, *, boot_marker_seen=True, max_examples=None):
-    """The existing classifier over a stream; count all failures, cap examples."""
+    """Count failures, excluding only connection-proven handshake-only auth failures."""
+    def handshake_only(record):
+        count = record.get("non_handshake_tx")
+        if record.get("auth_state") != "failed" or type(count) is not int or count != 0:
+            return False
+        for field in ("tx_messages", "tx_bytes", "auth_suppressed_total"):
+            if field in record and (type(record[field]) is not int or record[field] < 0):
+                return False
+        if record.get("auth_suppressed_total", 0) != 0:
+            return False
+
+        def coherent(messages, size):
+            # Successful handshake frames are nonempty. Missing optional totals
+            # are not substitutes for the explicit whole-connection zero above.
+            return (messages is None or size is None
+                    or (bool(messages) == bool(size) and size >= messages))
+
+        if not coherent(record.get("tx_messages"), record.get("tx_bytes")):
+            return False
+        if "traffic" not in record:
+            return True
+        traffic = record["traffic"]
+        if not isinstance(traffic, dict):
+            return False
+        messages = sent_bytes = 0
+        for bucket, metrics in traffic.items():
+            if not isinstance(metrics, dict):
+                return False
+            for prefix in ("direct", "broadcast"):
+                sent, size = metrics.get(prefix + "_sent"), metrics.get(prefix + "_sent_bytes")
+                if type(sent) is not int or type(size) is not int or sent < 0 or size < 0:
+                    return False
+                if not coherent(sent, size) or (bucket != "other" and (sent or size)):
+                    return False
+                messages += sent
+                sent_bytes += size
+        return (("tx_messages" not in record or record["tx_messages"] == messages)
+                and ("tx_bytes" not in record or record["tx_bytes"] == sent_bytes))
+
     queue_depth_warnings = 0
     unparsed_conn_diag = 0
     failures: list[dict[str, str]] = []
@@ -1146,9 +1220,14 @@ def classify_slow_consumer_lines(lines, *, boot_marker_seen=True, max_examples=N
     peer_4000_connections: list[str] = []
     priority = {"1011_close": 1, "keepalive_timeout": 2, "peer_liveness": 3, "overflow": 4}
     keepalive_connections: set[str] = set()
+    auth_failed: set[str] = set()
+    auth_accepted: set[str] = set()
+    handshake_only_closes: dict[str, bool] = {}
     for raw_line in lines:
         raw_line = raw_line.rstrip("\r\n")
-        if len(connection_failures) + len(peer_4000_connections) + len(failures) + len(keepalive_connections) > 100000:
+        if (len(connection_failures) + len(peer_4000_connections) + len(failures)
+                + len(keepalive_connections) + len(auth_failed) + len(auth_accepted)
+                + len(handshake_only_closes)) > 100000:
             raise ValueError("diagnostic identity resource limit")
         line = raw_line.strip()
         if "conn_diag " in raw_line:
@@ -1171,6 +1250,15 @@ def classify_slow_consumer_lines(lines, *, boot_marker_seen=True, max_examples=N
                 unparsed_conn_diag += 1
                 continue
             event = record["event"]
+            if event == "auth_fail":
+                auth_failed.add(conn_id)
+            elif event == "auth_ok":
+                auth_accepted.add(conn_id)
+            elif event == "close":
+                # Missing legacy counts, suppressed auth evidence, and contradictory
+                # copies of a close cannot become proof through a later zero row.
+                proven = bool(conn_id) and handshake_only(record)
+                handshake_only_closes[conn_id] = handshake_only_closes.get(conn_id, True) and proven
             if event == "slow_consumer" and record.get("phase") == "enter":
                 queue_depth_warnings += 1
             kind: str | None = None
@@ -1246,6 +1334,21 @@ def classify_slow_consumer_lines(lines, *, boot_marker_seen=True, max_examples=N
         if failures[index]["kind"] in ("overflow", "peer_liveness")
     }
     peer_4000_other = sum(conn_id not in forced_connections for conn_id in peer_4000_connections)
+    # Decide only after the whole window: auth_ok or conflicting close evidence
+    # may occur later or in a different selected log sink. Sticky rejection is
+    # deliberately not evidence; pre-rejection frames still count as access.
+    excluded = []
+    retained = []
+    for index, row in enumerate(failures):
+        conn_id = row["client"]
+        if (row["kind"] in {"1011_close", "keepalive_timeout"}
+                and connection_failures.get(conn_id) == index
+                and conn_id in auth_failed and conn_id not in auth_accepted
+                and handshake_only_closes.get(conn_id, False)):
+            excluded.append(row)
+        else:
+            retained.append(row)
+    failures = retained
     overflow_drops = sum(row["kind"] == "overflow" for row in failures)
     kinds = {kind: sum(row["kind"] == kind for row in failures)
              for kind in sorted({row["kind"] for row in failures})}
@@ -1260,6 +1363,9 @@ def classify_slow_consumer_lines(lines, *, boot_marker_seen=True, max_examples=N
         "unparsed_conn_diag": unparsed_conn_diag,
         "failure_count": len(failures),
         "failures": failures if max_examples is None else failures[:max_examples],
+        "excluded_auth_failure_count": len(excluded),
+        "excluded_auth_failure_conn_ids": [row["client"] for row in excluded],
+        "excluded_auth_failures": excluded if max_examples is None else excluded[:max_examples],
     }
 
 
@@ -1627,13 +1733,40 @@ def _verify_runtime_sha(
         sleep(min(RUNTIME_READBACK_INTERVAL_SECONDS, remaining))
 
 
-def _install_fleet_smoke_schedule(repo: Path, runner: Runner) -> None:
+def _install_fleet_smoke_schedule(repo: Path, runner: Runner, accounts: Sequence[str] = ()) -> None:
     schedule = Path.home() / "Library/LaunchAgents/com.pentacle.spawn-fleet-smoke.plist"
     schedule.parent.mkdir(parents=True, exist_ok=True)
-    _write_bytes(schedule, _render_v2_spawn_fleet_smoke_plist(repo))
+    _write_bytes(schedule, _render_v2_spawn_fleet_smoke_plist(repo, accounts=accounts))
     domain = f"gui/{os.getuid()}"
     runner(("launchctl", "bootout", f"{domain}/com.pentacle.spawn-fleet-smoke"), repo)
     _checked(("launchctl", "bootstrap", domain, str(schedule)), repo, runner)
+
+
+def _verify_direct_restoration(service, repo, stamp, boot, runner, runtime=None):
+    """Use the coordinated controller's exact no-input/dispatch proof policy."""
+    from deploy.coordinated_runtime import Runtime, code_identity_at
+    from deploy.restoration import qualified_prior
+    # This module can be loaded by a test/module entry point under another name.
+    if runtime is None:
+        runtime = Runtime(sys.modules[__name__], service, repo, runner,
+                          stream=str(stamp.get("deployer_stream_id") or ""), boot_wait_seconds=0)
+    plist = _launchd_plist(service.launchd_label)
+    env = plist.get("EnvironmentVariables", {})
+    machines = env.get("PENTACLE_MACHINES_FILE", "")
+    policy = coordinated.read_json(env.get("PENTACLE_PROVIDER_ACCOUNT_POLICY", ""))
+    scope = coordinated.host_scope(machines, [])
+    accounts = runtime.account_snapshot(policy, runtime.database(plist),
+        accounts=stamp.get("smoke_accounts"), scope=scope)
+    bindings = [b for b in accounts["selected_bindings"] if b["host"] in scope["included_hosts"]]
+    reference = stamp["restored_qualification"]
+    qualified_prior(reference["stamp"], stamp["sha"], bindings)
+    runtime.verification_started = time.time()
+    source = {"sha":stamp["sha"], "code_identity":code_identity_at(repo, stamp["sha"], runner)}
+    receipt = {"accounts":accounts, "scope":scope, "transaction_directory":str(_stamp_path(repo, service).parent)}
+    result = runtime.restoration_proof(receipt, source, boot)
+    if runtime.account_snapshot(policy, runtime.database(plist), accounts=stamp.get("smoke_accounts"), scope=scope) != accounts:
+        raise DeployError("account/pin/binding drift during restoration")
+    return result
 
 
 def _apply_post_activation(
@@ -1650,6 +1783,7 @@ def _apply_post_activation(
     verify_boot: Callable[..., BootReadback] = verify_fresh_daemon_log_line,
     verify_runtime: Callable[..., tuple[bool, dict[str, object]]] = _verify_runtime_sha,
     activated_plist_digest: str | None = None,
+    restoration_runtime=None,
 ) -> None:
     """Restart the daemon and classify the result onto `stamp`. NEVER raises.
 
@@ -1699,26 +1833,40 @@ def _apply_post_activation(
                     if not machines_path.is_absolute():
                         machines_path = repo / machines_path
                     machines_file = str(machines_path.resolve())
-                selection = stamp.get("release_selection")
-                required_cells = None
-                smoke_args = ()
-                if selection is not None:
-                    identity = selection["identity"]
-                    activation = identity["activation"]
-                    required_cells = identity["required_cells"]
-                    smoke_args = (activation["url"], activation["host"])
-                smoke = runner(
-                    (
-                        "/usr/bin/env",
-                        "-u", "PENTACLE_MACHINES_JSON",
-                        "-u", "PENTACLE_SMOKE_HOSTS",
-                        f"PENTACLE_MACHINES_FILE={machines_file}",
-                        str(_venv_python(repo, service)),
-                        str(repo / "services/chat-stream-v2/tools/spawn_fleet_smoke.py"),
-                        *smoke_args,
-                    ),
-                    repo,
-                )
+                if stamp.get("verification_kind") == "restoration":
+                    stamp["restoration"] = _verify_direct_restoration(service, repo, stamp, readback, runner, restoration_runtime)
+                    stamp["model_canary"] = {"outcome":"not_run_by_design"}
+                    stamp["full_fleet_acceptance"] = False
+                else:
+                    selection = stamp.get("release_selection")
+                    required_cells = None
+                    smoke_args = ()
+                    if selection is not None:
+                        identity = selection["identity"]
+                        activation = identity["activation"]
+                        required_cells = identity["required_cells"]
+                        smoke_args = (activation["url"], activation["host"])
+                    smoke_accounts = (selection['identity']['activation'].get('accounts', [])
+                                      if selection is not None else stamp.get('smoke_accounts', []))
+                    smoke_args += tuple(arg for entry in smoke_accounts for arg in ('--account', entry))
+                    if "test_profile" in stamp:
+                        frozen_profile = _write_test_profile(repo, service, stamp["test_profile"])
+                        if _release_test_profile(repo, service, runner) != stamp["test_profile"]:
+                            raise DeployError("test profile/settings drift before canary")
+                        smoke_args += ("--test-profile-snapshot", str(frozen_profile))
+                    smoke = runner(
+                        (
+                            "/usr/bin/env",
+                            "-u", "PENTACLE_MACHINES_JSON",
+                            "-u", "PENTACLE_SMOKE_HOSTS",
+                            "-u", "PENTACLE_SMOKE_ACCOUNTS",
+                            f"PENTACLE_MACHINES_FILE={machines_file}",
+                            str(_venv_python(repo, service)),
+                            str(repo / "services/chat-stream-v2/tools/spawn_fleet_smoke.py"),
+                            *smoke_args,
+                        ),
+                        repo,
+                    )
                 guard = stamp.get("restart_guard") or {}
                 activation = stamp.get("restart_activation") or {}
                 no_outgoing_writer = (
@@ -1736,9 +1884,19 @@ def _apply_post_activation(
                     expected_start=active_start, prior_pid=prior_pid,
                     prior_start=prior_start, no_outgoing_writer=no_outgoing_writer, runner=runner,
                 )
-                stamp["fleet_smoke"] = _fleet_smoke_verdict(smoke, machines_file, required_cells)
-                if stamp["fleet_smoke"]["outcome"] == FLEET_SMOKE_PASSED and required_cells is None:
-                    _install_fleet_smoke_schedule(repo, runner)
+                if stamp.get("verification_kind") != "restoration":
+                    verdict_options = {}
+                    if smoke_accounts:
+                        verdict_options["accounts"] = smoke_accounts
+                    if "test_profile" in stamp:
+                        verdict_options["test_profile"] = stamp["test_profile"]
+                    stamp["fleet_smoke"] = _fleet_smoke_verdict(
+                        smoke, machines_file, required_cells, **verdict_options)
+                    if stamp["fleet_smoke"]["outcome"] == FLEET_SMOKE_PASSED and required_cells is None:
+                        if smoke_accounts:
+                            _install_fleet_smoke_schedule(repo, runner, smoke_accounts)
+                        else:
+                            _install_fleet_smoke_schedule(repo, runner)
         # Persist the classified record inside the same never-raising boundary. A stamp-write
         # failure after activation must not escape as a refusal either — record it and make one
         # best-effort retry so the error itself is captured; main() still prints the returned
@@ -1936,8 +2094,16 @@ def deploy(service: ServiceConfig, *, release_checkout: Path, ref: str,
            skip_kickstart: bool = False, log_guard_dir: str | Path | None = None,
            boot_wait_seconds: float = DEFAULT_BOOT_WAIT_SECONDS,
            coordinated_plan: Path | None = None, coordinated_receipt: Path | None = None,
-           prepare_only: bool = False, runner: Runner) -> dict[str, object]:
+           prepare_only: bool = False, smoke_accounts: Sequence[str] | None = None,
+           recovery_authorization: Path | None = None, recovery_go_tell_id: str | None = None,
+           runner: Runner) -> dict[str, object]:
+    if (recovery_authorization is not None or recovery_go_tell_id is not None) and (
+            not rollback or coordinated_receipt is None or coordinated_plan is not None or prepare_only
+            or recovery_authorization is None or not recovery_go_tell_id):
+        raise DeployError("recovery controller authorization requires --rollback --coordinated-receipt and --recovery-go-tell-id")
     coordinated_mode = coordinated_plan is not None or coordinated_receipt is not None or prepare_only
+    if smoke_accounts is not None and (coordinated_mode or release_inputs is not None):
+        raise DeployError('account mapping belongs in coordinated intent or release-input activation')
     if coordinated_mode and (service.name != "chat-streamd-v2" or release_inputs is not None or skip_kickstart):
         raise DeployError("coordinated deployment cannot combine with release-inputs/skip-kickstart or another service")
     if coordinated_mode and (coordinated_receipt is None or (not rollback and coordinated_plan is None)
@@ -1953,7 +2119,8 @@ def deploy(service: ServiceConfig, *, release_checkout: Path, ref: str,
                     boot_wait_seconds=boot_wait_seconds, log_guard_dir=log_guard_dir)
                 transaction = coordinated.Transaction(adapter, root)
                 if rollback:
-                    return transaction.rollback(coordinated_receipt)
+                    return transaction.rollback(coordinated_receipt, authorization=recovery_authorization,
+                                                go_tell_id=recovery_go_tell_id)
                 if prepare_only:
                     return transaction.prepare(coordinated_plan, coordinated_receipt)
                 return transaction.apply(coordinated_plan, coordinated_receipt)
@@ -1961,9 +2128,38 @@ def deploy(service: ServiceConfig, *, release_checkout: Path, ref: str,
             return _deploy_legacy(service, release_checkout=repo, ref=ref, rollback=rollback,
                 gate_evidence=gate_evidence, release_inputs=release_inputs, deployer_stream_id=deployer_stream_id,
                 skip_kickstart=skip_kickstart, log_guard_dir=log_guard_dir,
-                boot_wait_seconds=boot_wait_seconds, runner=runner)
+                boot_wait_seconds=boot_wait_seconds, smoke_accounts=smoke_accounts, runner=runner)
     except (coordinated.Invalid, OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError) as exc:
         raise DeployError(str(exc)) from exc
+
+
+def _release_test_profile(repo, service, runner, *, snapshot=None):
+    """Ask the actual release runner to validate its settings, without a prompt."""
+    command = (str(_venv_python(repo, service)),
+        str(repo / "services/chat-stream-v2/tools/spawn_fleet_smoke.py"),
+        "--dry-run", "ws://127.0.0.1:0", "profile-check",
+        *(("--test-profile-snapshot", str(snapshot)) if snapshot else ()))
+    result = _checked(command, repo, runner)
+    from _shared.spawn_profiles import validate_test_profile
+    try:
+        profile = validate_test_profile(json.loads(result.stdout)["test_profile"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise DeployError("release runner lacks compatible test_prompt settings") from exc
+    if snapshot is None:
+        with tempfile.TemporaryDirectory(prefix="pentacle-release-test-profile-") as directory:
+            frozen = Path(directory) / "test-profile.json"
+            coordinated.atomic_json(frozen, profile)
+            if _release_test_profile(repo, service, runner, snapshot=frozen) != profile:
+                raise DeployError("release runner cannot honor sealed test profile")
+    return profile
+
+
+def _write_test_profile(repo, service, profile):
+    from _shared.spawn_profiles import validate_test_profile
+    path = _stamp_path(repo, service).with_name(service.name + ".test-profile.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    coordinated.atomic_json(path, validate_test_profile(profile))
+    return path
 
 
 def _deploy_legacy(
@@ -1978,6 +2174,7 @@ def _deploy_legacy(
     skip_kickstart: bool = False,
     log_guard_dir: str | Path | None = None,
     boot_wait_seconds: float = DEFAULT_BOOT_WAIT_SECONDS,
+    smoke_accounts: Sequence[str] | None = None,
     runner: Runner,
 ) -> dict[str, object]:
     repo = release_checkout.expanduser().resolve()
@@ -2000,6 +2197,15 @@ def _deploy_legacy(
     if not rollback and _code_identity_at(repo, prior_sha, runner) != _code_identity_at(repo, sha, runner):
         raise DeployError("code identity changes require an admitted coordinated plan before checkout mutation")
 
+    restoration_runtime = None
+    if service.name == "chat-streamd-v2":
+        from deploy.restoration import qualified_prior, qualification_stamp
+    if rollback and service.name == "chat-streamd-v2":
+        # Bind the controller and all no-input proof imports before checkout;
+        # the restored prior may predate these modules and APIs.
+        from deploy.coordinated_runtime import Runtime
+        restoration_runtime = Runtime(sys.modules[__name__], service, repo, runner,
+            stream=deployer_stream_id or "", boot_wait_seconds=boot_wait_seconds)
     with _PreActivationTransaction(repo, prior_sha, stamp_path, prior_stamp_bytes, runner) as transaction:
         _checked(("git", "checkout", "--detach", sha), repo, runner)
         verify_log_guard(log_guard_dir if log_guard_dir is not None else service.log_guard_dir)
@@ -2032,6 +2238,11 @@ def _deploy_legacy(
         elif "seam_results" in evidence:
             raise DeployError("release selection: seam evidence requires actual release inputs")
 
+        profile = None
+        if service.name == "chat-streamd-v2" and not rollback:
+            profile = _release_test_profile(repo, service, runner)
+            if selection is not None and profile != selection["identity"]["test_profile"]:
+                raise DeployError("release selection test profile/settings drift")
         log_paths = _daemon_log_paths(service)
         log_path = log_paths[0] if log_paths else None
         if log_path is None and not skip_kickstart:
@@ -2051,12 +2262,41 @@ def _deploy_legacy(
             "gates": gates,
             "selective_qualification": "admitted" if selection is not None else "not_enabled",
         }
+        if profile is not None:
+            stamp.update(test_profile=profile)
+        if rollback and service.name == "chat-streamd-v2":
+            stamp["verification_kind"] = "restoration"
         ancestry = coordinated.legacy_guard(repo, prior_stamp, rollback=rollback)
         if ancestry:
             stamp["coordinated_receipt"] = ancestry
         if selection is not None:
             stamp["release_selection"] = selection
             stamp["gates"]["seam_results"] = evidence["seam_results"]
+        elif service.name == 'chat-streamd-v2':
+            configured = _launchd_environment(service.launchd_label)
+            entries = (list(smoke_accounts) if smoke_accounts is not None else
+                prior_stamp.get('smoke_accounts', []) if rollback else
+                [v for v in configured.get('PENTACLE_SMOKE_ACCOUNTS', '').split(',') if v])
+            if entries:
+                from tools.spawn_fleet_smoke import account_map
+                try:
+                    if not all(isinstance(v, str) for v in entries):
+                        raise ValueError('accounts must be declarations')
+                    hosts, _, _ = _fleet_smoke_hosts(configured.get('PENTACLE_MACHINES_FILE', ''))
+                    account_map(entries, tuple((h, p, m) for h in hosts
+                        for p in ('claude', 'codex') for m in ('prompted', 'promptless')))
+                except (ValueError, OSError) as exc:
+                    raise DeployError('invalid deployment account mapping: ' + str(exc)) from exc
+                stamp['smoke_accounts'] = entries
+        if service.name == "chat-streamd-v2":
+            if rollback:
+                qualification = prior_stamp.get("prior_qualification")
+                if not isinstance(qualification, dict) or qualification.get("sha") != sha:
+                    raise DeployError("rollback lacks prior production qualification")
+                qualified_prior(qualification.get("stamp", {}), sha, [])
+                stamp["restored_qualification"] = qualification
+            else:
+                stamp["prior_qualification"] = {"sha": prior_sha, "stamp": qualification_stamp(prior_stamp)}
         activation_runtime_manifest = runtime_manifest(repo, service, runner)
         stamp["activation_runtime_manifest"] = activation_runtime_manifest
         if not skip_kickstart:
@@ -2141,6 +2381,10 @@ def _deploy_legacy(
                 _validate_selected_activation(selection, repo, service)
             except (release_selection.Invalid, OSError, ValueError, KeyError, TypeError) as exc:
                 raise DeployError(str(exc)) from exc
+        if profile is not None:
+            if _release_test_profile(repo, service, runner) != profile:
+                raise DeployError("test profile/settings drift before activation")
+            _write_test_profile(repo, service, profile)
         _write_stamp(repo, service, stamp)
         transaction.commit()
     if not skip_kickstart:
@@ -2162,6 +2406,7 @@ def _deploy_legacy(
             boot_wait_seconds=boot_wait_seconds,
             runner=runner,
             activated_plist_digest=activated_plist_digest,
+            **({"restoration_runtime":restoration_runtime} if restoration_runtime is not None else {}),
         )
     return stamp
 
@@ -2176,7 +2421,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--coordinated-plan", type=Path, help="Private coordinated deployment intent.")
     parser.add_argument("--coordinated-receipt", type=Path, help="Sealed preparation receipt, also used for whole-transaction rollback.")
     parser.add_argument("--prepare-only", action="store_true", help="Stage inert helpers and seal the coordinated receipt only.")
+    parser.add_argument("--recovery-controller-authorization", type=Path,
+                        help="Private FD authorization for recovering the receipt from a replacement controller (rollback only).")
+    parser.add_argument("--recovery-go-tell-id", help="Ledger id of the FD GO tell quoting the authorization digest.")
     parser.add_argument("--release-inputs", type=Path, help="Observed installed baselines and external tuples for qualified seam admission.")
+    parser.add_argument('--account', action='append', default=None, help='PROVIDER=ALIAS or HOST/PROVIDER=ALIAS for legacy full-matrix smoke')
     parser.add_argument("--deployer-stream-id", default=None)
     parser.add_argument("--log-guard-dir", default=None, help="Override the service log guard directory checked before deploy.")
     parser.add_argument("--skip-kickstart", action="store_true", help="Test/dev only: do not kick launchd after stamping.")
@@ -2230,6 +2479,9 @@ def main(argv: list[str] | None = None) -> int:
             coordinated_plan=args.coordinated_plan,
             coordinated_receipt=args.coordinated_receipt,
             prepare_only=args.prepare_only,
+            smoke_accounts=args.account,
+            recovery_authorization=args.recovery_controller_authorization,
+            recovery_go_tell_id=args.recovery_go_tell_id,
             runner=_run,
         )
     except DeployError as exc:
@@ -2301,6 +2553,12 @@ def main(argv: list[str] | None = None) -> int:
             f"{slow_consumer.get('queue_depth_warnings', 0)} queue-depth warnings.",
             file=sys.stderr,
         )
+    if stamp.get("verification_kind") == "restoration":
+        restoration = stamp.get("restoration") or {}
+        if restoration.get("outcome") != "passed":
+            print("rollback applied; no-input restoration proof failed or missing; model canaries were not run", file=sys.stderr)
+            return EXIT_FLEET_SMOKE_FAILED
+        return EXIT_OK
     smoke = stamp.get("fleet_smoke") or {}
     if smoke.get("outcome") == FLEET_SMOKE_PARTIAL:
         print(

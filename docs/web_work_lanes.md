@@ -1,6 +1,6 @@
 # Work lanes in the web renderer
 
-The web/desktop renderer shows the daemon's first-class work lanes. The daemon owns lane identity, presented state (`active`, `paused`, `blocked`), count, order and tap target; the renderer only presents them. The wire contract and the shared fixture are in [work-lanes.md](../services/chat-stream-v2/docs/work-lanes.md) and `pentacle-chat-core/tests/fixtures/work-lanes-inventory.json`.
+The web renderer shows the daemon's first-class work lanes. The daemon owns lane identity, presented state (`active`, `paused`, `blocked`), count, order and tap target; the renderer only presents them. The wire contract and the shared fixture are in [work-lanes.md](../services/chat-stream-v2/docs/work-lanes.md) and `pentacle-chat-core/tests/fixtures/work-lanes-inventory.json`.
 
 ## Lane organization
 
@@ -15,14 +15,72 @@ The sidebar lanes view (the header lane count and the **Lanes (N)** section) is 
 ## What the operator sees
 
 - **Header.** `#stats` leads with the open-lane count: `4 lanes | 6 sessions | 1 need answer | 2 working`. The lane number is the daemon's `counts.open` (active + paused + blocked), never a session count. Until a lane-aware daemon sends its first inventory, the line is the previous session-only line. `done` lanes are never counted or listed.
-- **Lanes (N) section.** Above the session tiers, in the daemon's order (blocked, active, paused; the renderer never reorders). Each row shows the lane title, an owner glyph (◆ operator-started, ◇ FD-managed), the state badge, a presence dot for the linked lead (working, idle, offline, or dashed when no lead qualifies; working means the lead or a descendant is [busy](seat_busy.md), including background shells and subagents; an FD-managed lane's lead may be a hidden seat, which is never a tap target), the blocker for a blocked lane, the lead's status card, and the ETA. A stale ETA reads `ETA stale`, never `late Xm`.
-  The daemon may present an active lane with reason `lead_lost` or `members_working`; these presented reasons do not change `counts.open`.
+- **Lanes (N) section.** Above the session tiers, in the daemon's order (blocked, active, paused; the renderer never reorders). Each row shows the lane title, an owner glyph (◆ operator-started, ◇ FD-managed), the state badge, a presence dot for the linked lead (working, idle, offline, or dashed when no lead qualifies; working means any effectively assigned lane agent or the bound lead's descendants are [busy](seat_busy.md), before preview caps; an FD-managed lane's lead may be a hidden seat, which is never a tap target), the blocker for a blocked lane, the lead's status card, and the ETA. A stale ETA reads `ETA stale`, never `late Xm`.
+  The daemon may present an active lane with reason `lead_lost`; these presented reasons do not change `counts.open`.
 - **Tap.** The row opens the lane's `visible_chat` according to `available`:
   - `open`: the chat opens in a slot through the same path as a sidebar row (a session, or the composite). A chat that is not in this window's roster shows a toast; nothing else opens.
   - `history`: a read-only slot for the closed chat. The transcript is read with `request_stream_events {stream_id, generation}` using the lane's generation, shown under a "Read-only history" banner, with no composer, no send and no terminal. The slot is named `lane-history:<lane_id>`, so an open session of the same name (a newer generation) is never mistaken for it. A failed or empty read says so ("Messages could not be loaded." / "No retained messages.").
   - `unavailable`: a slot with an explicit "Chat unavailable" card. No chat is read or opened, and the lane stays in the panel.
 - **Ordering.** Lane pushes and the `work_lanes` field of a snapshot go through the same connection state-version gate as the rest of the daemon state, so a stale frame never rolls the panel back. The lane generation is passed only by the lane-history slot's own reads (initial, paging, retry, reconnect refetch); another slot reading the same stream id never sends it.
 - **Lane update cards.** The assistant's chat renders a typed card for every `publish_kind: "lane_update"` publication (`lane_started`, `lane_completed`, `lane_blocked`, `lane_unblocked`, `major_decision`, `milestone`) from `raw.lane_update`. A client that does not branch on the kind shows the summary as ordinary assistant text.
+
+## Structured spec facts
+
+Inventory lanes always carry `icon` (a key or null). Explicit icons are stored
+on the lane through the existing `set_text` operation's optional `icon` key;
+null clears the override. Invalid keys are refused. Without an override, the
+daemon matches the title against the ordered keyword table in
+`pentacle-chat-core/lane_icons.json`. Unknown legacy overrides project null
+and log one warning per unknown value. `LANE_ICON_KEYS` and `LaneIconKey` are
+exported by chat-core for consumers.
+
+The inventory's existing eight inline members carry optional display facts:
+
+- `worked`: elapsed hours, a censoring flag, active hours, seat and QA-round
+  counts, and the observation time. The daemon batches all lane-member specs
+  in one background usage-rollup pass per ten minutes. The batch includes done
+  lanes returned by `show`; its full lane census also runs only when the cache
+  is due. A missing ledger,
+  unattributed usage or a sixty-second timeout yields null. Active hours sum
+  the available Claude and Codex proxies; both missing yields null. These are
+  activity estimates, not billing or a live work timer.
+- `lead_seat`: the first open lead (then nexus) assigned to that member spec,
+  including provider, observed activity, ETA and active status-card step.
+  Steps longer than 120 characters are truncated with an ellipsis.
+  Workers, QA seats and planners never qualify. No qualifying seat yields null.
+- `status_line` and `next_line`: the first passing sentence from the original
+  Status/Next labels. The original `status_text` and `next_action_text` remain
+  available. Rules and examples live only in
+  `pentacle-chat-core/tests/fixtures/summary_prose_cases.json`; the daemon loads
+  those patterns and accepts the first sentence of a longer label.
+
+`work_lanes.show` returns a cursor page of up to 32 lane members and adds
+`criteria` and `transitions`; complete readers accumulate one source revision
+as defined in the [wire contract](../services/chat-stream-v2/docs/work-lanes.md#live-detail-pages).
+These detail arrays are absent from inventory and list frames.
+Criteria include only the spec's Custom acceptance criteria, in source order,
+with `open`, `done`, `waived`, `tracked` or `parked` dispositions. Titles keep
+code spans; at most forty titles of 120 characters are emitted. Consumers may
+sort open criteria first. Transitions translate the source lifecycle's leaving
+date into the next lifecycle's entry date, begin at `created_at`, and retain
+the newest eight entries in chronological order.
+
+Only criteria and transitions extend the observation's material fields.
+Worked time, lead presence and icons never increment `obs_rev` or write
+`item_change` events. The CLI's `agent-orch work-lane show --members` traverses the complete
+member population and prints the icon and all member detail fields; `--json` preserves the wire shapes. Older daemons
+and consumers may omit the additive fields.
+
+Lane pushes use the same compact JSON encoding as snapshots and session
+inventory; whitespace changes, field shapes do not. The byte-budget fixture
+uses a real projection with one lead seat per member, existing title, seat and
+status-card lengths at measured p95, and all new fields populated at their
+caps. It guards an 800-byte per-member new-field delta, a 320 KiB frame for
+16 lanes × 8 members and a 1.25 MiB stress frame for 64 × 8. These are measured
+synthetic bounds, not a promise for arbitrary legacy strings or Unicode text.
+The transport's hard limit is 4 MiB; inventory is a transient broadcast, not a
+persisted exchange event. Detail arrays remain exclusive to `show` regardless
+of size; no size-dependent field dropping occurs.
 
 ## Where it lives
 

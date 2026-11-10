@@ -2,6 +2,134 @@
 
 The public harness is provider-free and uses a disposable local daemon. It validates the shipped websocket and renderer contracts with synthetic sessions; it does not connect to a production service or collect live user content.
 
+## Owned browser gate
+
+Run `npm run build:web` and `node test/e2e/web_gate.js` from the public
+checkout. The gate requires Node dependencies, provisioned Python daemon
+dependencies, Chrome/Chromium, tmux and zsh. `--python` selects an explicitly
+provisioned Python environment. The default gate seeds disposable sessions and
+transcripts, starts an owned loopback daemon and web host, and drives the served
+page over CDP. It reports named assertions and cleans up its own browser,
+daemon, listeners, fixtures and tmux sessions; it needs no phone or native app.
+
+Renderer contract cases use fresh raw frames and fake send/cancel bridges
+through real controls. They prove renderer ordering, duplicate suppression,
+stop retry states and returned draft presentation, not transport delivery, a
+steering ledger, reconnect semantics or silent half-open recovery. Separate
+public replay/paging/reconnect tests cover their named contracts. Reload restores
+browser state and bridges around isolated cases. Inspect the actual failed
+assertion before classifying a product or harness failure; a process or build
+readback alone is not functional proof.
+
+Use the default owned gate for automation. External `--profile` configurations
+are operator-provided live inputs and need separate resource authority. Keep raw
+receipts outside shared memory and retain only location/hash metadata there.
+
+## Finite installed journey
+
+After the release owner grants an installed/native window, run:
+
+```bash
+python3 services/chat-stream-v2/tools/installed_journey.py --manifest PRIVATE.json --evidence-dir FRESH_DIR
+```
+
+The composition reuses `tools.live_window` for authenticated ownership and
+generation-fenced fixture cleanup, and `web_gate` in served-page mode for its
+owned browser. It creates two empty Codex chats (the question producer uses
+the existing visible-seat policy), an unrelated sentinel and,
+when configured, one remote Codex fixture. It checks actual browser text/image
+input, logical-ID retry, durable/native/rendered correspondence, small-page
+history, scoped refusals, a non-authorizing question and a structured report.
+It never starts, stops or restarts an installed service.
+
+The private JSON manifest has schema `pentacle.installed-journey.v1` and these
+required fields: `web_url`, `expected_build_id`, full `source_sha`, `ws_url`,
+`operator_token_path`, `operator_registry_path`, `local_host`, `machine_cwd`,
+`spec_hashes` (absolute spec paths mapped to SHA256), `daemon` (`pid`, UTC
+`ps lstart` string `birth`, boot identity `boot`, `checkout`, `executable`),
+`cli` (`executable`, `sha256`, full release SHA `version`, `manifest_path`,
+`manifest_sha256`, and actual imported `modules` for `cli` and `wsclient`, each
+with `file` and `sha256`), and `provider` (`alias`, `generation`,
+`executable`, `executable_sha256`, `version`, `model`, `effort`). `remote`, when
+present, supplies `host`, `cwd`, `provider` with the same tuple fields and optional
+`tmux_bin`. Local `tmux_bin` is also optional. Credentials are paths to secure
+stores; inline secrets are refused. The caller must provide admitted accounts
+and a current release tuple. Source checkout and running artifact remain
+separate identities.
+
+Releases are component-scoped: `source_sha` binds the daemon; CLI `version`
+binds its own release manifest and installed/imported package bytes. The runner
+checks compatibility independently of release order. `web` supplies its own full `source_sha`, installed `artifact` directory
+and `build_id`. The runner verifies the artifact's `build-sha.txt`, uses the
+existing web build-ID oracle and checks served JS/CSS bytes against the artifact.
+Web-owned paths (renderer, client core, server, assets, configs, libraries,
+main, vendor, package locks, web build script and root config/host loaders)
+may change independently. Changes introduced by a component since its merge-base
+with the daemon must stay within that component's runtime paths (`services/agent-orch`
+for CLI releases); accompanying records under `docs` and `test` are listed separately.
+Older component releases remain valid across daemon-only
+changes. Shared contracts under `services/_shared` must be identical between
+component and daemon source. These source compatibility checks do not waive
+verification of each component's actual installed bytes and build identity.
+
+Exit status is 0 PASS, 1 FAIL, or 2 BLOCKED. `rows.json` retains each check's
+`row`, `result`, `primary_error`, `harness_error`, `fixture_ids` and `cleanup`;
+`run-manifest.json` binds exact owned IDs and artifact identities. Evidence
+directories must be fresh; a dirty directory is refused without replacing its
+earlier receipts. `--expect-build-id deliberately-wrong` tests build refusal
+against the actual served page before fixture or credential mutations.
+
+Historical Claude replay uses `claude_replay` (`path`, `sha256`, original
+`host`, `session_name`, `provenance`) with the actual normalizer. It cannot
+qualify live Claude, which has its own NOT TESTED row and `live_claude_limit`.
+This finite runner does not qualify the strict-full soak, mobile certification,
+offline peers or an observation period. Keep those receipts and limits in the
+parent acceptance matrix. Scheduled admission and quiet/window checks belong
+to the existing nightly wrapper; this command creates no standing window.
+
+## Scheduled strict-full soak
+
+The nightly soak uses `tools/nightly_journey.py admit --job nightly-soak` and
+`report`, with a 2400-second bound and a 600-second window reserve. TERM starts
+30 seconds before the bound for runner-owned cleanup; a birth-verified process
+tree snapshot contains nested sessions before the final cutoff. The FD owns
+`~/.pentacle/nightly-journey/window.json`: `host` must match
+the execution host; `start_utc` is `HH:MM`, `duration_s` is seconds,
+`valid_until` is a `YYYY-MM-DD` date at most 30 days ahead, `held_until` is null
+or an aware ISO timestamp, and `issued_by` names the issuing FD. Missing,
+malformed, expired, held, out-of-window or too-short windows block execution.
+One fire-time process snapshot also blocks active `gate_env.py`, `run_gate.py`
+or Python deployment scripts / `-m deploy.deploy` in the executable's first three
+argv positions; remote commands and agent prompt text do not block. An unavailable
+process table blocks too. FD records certified
+windows, quiet orders, heavy slots and deployments in `held_until`.
+
+Install the tracked `deploy/nightly-soak/run-nightly-soak.sh` and render
+`deploy/com.pentacle.nightly-soak.plist`'s `__PENTACLE_USER_HOME__` placeholder
+under an FD installation window, preserving preimages. Its 01:00 host-local
+fire fits the 05:30–11:30 UTC window in both seasons for America/Chicago.
+Local `~/.pentacle/nightly-soak/config.zsh` sets `CHECKOUT` (the existing pinned
+soak checkout), `TOOLS_ROOT` (accepted tools checkout), `PY` (provisioned service
+Python) and `MEMORY_ROOT` (publisher scripts). No deployment paths live in the
+tracked wrapper. The wrapper preserves its private HOME/TMPDIR/tmux and logs.
+Receipts live beside strict-full evidence at
+`~/.pentacle/soak/<UTC-run>/evidence/receipt.json`; primary/host outcomes remain
+separate from reporting errors. Each occurrence sends one landed
+`REPORT nightly-soak` line to the FD; FAIL/BLOCKED also requires a critical
+outbound notice with non-null `delivered_at`. FAIL files one publisher-deduped
+`pentacle__nightly_soak_<sig8>` item across dates and lifecycle moves. BLOCKED
+creates no defect item. Pause with
+`launchctl bootout gui/$(id -u)/com.pentacle.nightly-soak`; resume with
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pentacle.nightly-soak.plist`.
+The installed journey runner and its 03:00 job remain phase 2.
+
+For an admission-only rehearsal, use a fake file with the current host and
+`{"host":"<execution-host>","start_utc":"05:30","duration_s":21600,"valid_until":"2026-11-30","held_until":null,"issued_by":"test"}`,
+then `python3 tools/nightly_journey.py admit --job nightly-soak --window FILE --now-utc 2026-11-15T09:00:00Z`.
+Tests override `--notify-cmd`, `--publisher-cmd` and `--report-send-cmd`; the
+last command receives one RPC JSON object on stdin and returns JSON on stdout.
+Tests provide isolated `--notifications-db` and `--notices-db` for delivery proof.
+
 ## Supported entry: `scripts/gate_env.py`
 
 The web gate and web-selected npm tests require the optional `node-pty` module and fail as setup when it is absent.
@@ -383,27 +511,6 @@ the same millisecond. The no-profile gate still starts its own daemon on an
 ephemeral port. Its verdict records the owned daemon PID and confirmed exit;
 failure to stop that process fails the gate after a forced termination attempt.
 
-The standalone `test/e2e/grid_split_gate.js` entry is nonfunctional and is
-not a supported acceptance command. The historical invocations below are
-retained only to identify the path awaiting repair or retirement; do not use
-them as evidence of a passing gate:
-
-```bash
-npm run build:web
-node test/e2e/grid_split_gate.js web /tmp/pentacle-split-web
-node test/e2e/grid_split_gate.js desktop /tmp/pentacle-split-desktop
-```
-
-Its intended contract uses the same CDP client and scratch-daemon seeder. It launches the actual
-Electron entry point or served browser bundle with an isolated profile, creates
-four uniquely named local tmux fixtures, and checks their native PTY dimensions
-after drag, maximize/restore and view changes. It also checks narrow widths,
-header-control access and desktop process-restart persistence. It never restarts
-an existing desktop. The `finally` path removes its owned sessions and processes;
-cleanup failures fail the result. JSON, screenshots and logs go to the output
-directory. Set `PENTACLE_PYTHON` or `PENTACLE_CHROME` for a local interpreter or
-browser path; macOS uses the standard Google Chrome application path by default.
-
 ## Evidence contract
 
 Evidence is a small object containing the test name, candidate identifier, timestamps, and pass/fail assertions. Do not paste transcripts, environment dumps, absolute home paths, or tokens into evidence. Synthetic prompts and responses should be short and recognizable, for example `fixture-question` and `fixture-answer`.
@@ -474,7 +581,7 @@ coverage below.
 
 #### Commands and collection
 
-Run from the repository root after [installing the prerequisites](../README.md#local-setup)
+Run from the repository root after [installing the prerequisites](../README.md#quick-start)
 and dependencies with `npm ci`. The complete candidate gates are:
 
 ```sh
@@ -487,7 +594,7 @@ node test/e2e/web_gate.js
 `npm test` invokes the existing collector exactly as follows:
 
 ```sh
-node scripts/run-tests.js "test/*.test.js" "test/*.test.ts" "test/e2e/terminal_interaction_runtime/*.test.js"
+node scripts/run-tests.js "test/*.test.js" "test/*.test.ts"
 ```
 
 The web gate needs Chrome/Chromium, `tmux`, the daemon's provisioned Python

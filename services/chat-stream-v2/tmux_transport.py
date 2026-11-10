@@ -389,6 +389,40 @@ class Tmux:
             "tmux_socket": fields[3], "session_name": fields[4],
         }
 
+    async def close_pane_identity(self, name: str) -> dict[str, str] | None:
+        """Read one live, unambiguous pane for the close ownership bracket.
+
+        These server versions expose STATUSREADY through both exit fields,
+        independently of pane_dead's delayed fd teardown. Unknown formats
+        expand empty, so only a qualified responding-server version can make
+        those empty fields evidence. Keep this separate from persisted proofs.
+        """
+        keys = ("pane_pid", "pane_id", "tty", "tmux_socket", "session_name",
+                "session_id", "server_pid", "server_version", "pane_dead",
+                "pane_pipe", "pane_dead_status", "pane_dead_signal")
+        rc, out = await self.run(
+            "list-panes", "-s", "-t", _target(name), "-F",
+            "#{pane_pid}|#{pane_id}|#{pane_tty}|#{socket_path}|#{session_name}|"
+            "#{session_id}|#{pid}|#{version}|#{pane_dead}|#{pane_pipe}|"
+            "#{pane_dead_status}|#{pane_dead_signal}",
+        )
+        lines = out.splitlines()
+        if rc != 0 or len(lines) != 1:
+            return None
+        fields = lines[0].split("|")
+        if len(fields) != len(keys) or not all(fields[:-2]) or any(fields[-2:]):
+            return None
+        pane = dict(zip(keys, fields))
+        if (pane["session_name"] != name or pane["server_version"] not in {"3.4", "3.7c"}
+                or pane["pane_dead"] != "0" or pane["pane_pipe"] != "0"
+                or not re.fullmatch(r"%[0-9]+", pane["pane_id"])
+                or not re.fullmatch(r"\$[0-9]+", pane["session_id"])):
+            return None
+        for key in ("pane_pid", "server_pid"):
+            if not re.fullmatch(r"[0-9]+", pane[key]) or int(pane[key]) <= 0:
+                return None
+        return pane
+
     async def kill_session(self, name: str) -> None:
         await self.run("kill-session", "-t", _target(name))
 
@@ -530,17 +564,19 @@ class Tmux:
             )
         return "pane_in_mode" if pane_in_mode else None
 
-    async def pretrust_codex_cwd(self, cwd: str) -> None:
+    async def pretrust_codex_cwd(self, cwd: str, *, code_home: str | None = None) -> None:
         """Persist trust on the same host and CODEX_HOME as the provider."""
         from codex_trust import ensure_codex_trust
         if self.ssh_target is None:
             try:
-                await asyncio.to_thread(ensure_codex_trust, cwd)
+                await asyncio.to_thread(ensure_codex_trust, cwd, code_home=code_home)
             except (OSError, ValueError) as exc:
                 raise VerbError("codex_trust_failed", "local host could not persist cwd trust") from exc
             return
         source = await asyncio.to_thread(Path(__file__).with_name("codex_trust.py").read_text)
         command = "python3 - " + shlex.quote(cwd)
+        if code_home is not None:
+            command += " " + shlex.quote(code_home)
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -784,7 +820,7 @@ def open_fields(msg: dict[str, Any]) -> dict[str, Any]:
     fields["objective"] = msg.get("objective")
     fields["objective_source"] = msg.get("objective_source")
     fields["visibility"] = msg.get("visibility") or (
-        "hidden" if msg.get("parent_stream_id") and msg.get("role") != "nexus"
+        "hidden" if msg.get("parent_stream_id")
         and not (msg.get("handoff") or msg.get("handoff_from_stream_id")) else "default"
     )
     fields["no_watch"] = msg.get("no_watch") is True

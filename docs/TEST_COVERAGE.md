@@ -152,7 +152,6 @@ and `test/e2e/web_chat_width_gate.cjs`. Neither changes the reference flow.
 | `services/agent-orch/tests/` | 81 | `cli-pytest --select tests`; separate Public checks contracts partition. |
 | `services/_shared/tests/` | 8 | `shared-pytest --select tests`; separate from daemon tiers. |
 | Root `test/` | 205 | Root npm shallow globs select 203 JS/TS tests. `test/test_specs_parser.py` and `test/test_voice_reply.py` are outside those globs; their focused commands are documented in [public boundary](public_boundary.md) and [room microphone conversation](room_mic_conversation.md), respectively. These explicit entries do not establish required-CI inclusion. |
-| `test/e2e/terminal_interaction_runtime/` | 3 | Its `*.test.js` files join root npm tests; `npm run test:terminal-interactions` separately launches the owned Electron harness. |
 | `test/e2e/`; `test/e2e/lib/`; `test/e2e/scenarios/` | 7; 7; 31 | Outside root npm shallow globs. Explicit npm selections can run nested tests. Default browser invocation uses the registry below, not a recursive scenario-directory glob. |
 | `pentacle-chat-core/tests/` | 44 | Public checks frontend runs `npm --prefix pentacle-chat-core test`: TS tests plus `typecheck:test`. `typeContracts.ts` is typecheck support, not an executed `.test.ts` file. |
 | `mic-server/test/` | 24 | Public checks contracts explicitly runs `PYTHONPATH=mic-server python3 -m pytest mic-server/test`. |
@@ -179,7 +178,7 @@ unfiltered run with its owned profile, it additionally invokes
 three follow-ons. `test/e2e/scenarios/*.js` is a separate legacy population;
 matching names alone do not establish default execution.
 
-Other E2E entries such as `grid_split_gate.js`, `send_refusal_gate.cjs`,
+Other E2E entries such as `send_refusal_gate.cjs`,
 `web_host_recovery_gate.cjs`, `web_assistant_direct_entry_gate.cjs`,
 `web_chat_history_transport_gate.cjs`, `web_popouts_gate.cjs`,
 `web_sidebar_resize_gate.cjs`, `web_chat_width_gate.cjs`,
@@ -199,6 +198,7 @@ assertion completeness, uninspected fake boundaries and runtime cost are UNKNOWN
 | Behavior / purpose | Existing protection and reachability | Boundaries, inspected protection and remaining uncertainty |
 | --- | --- | --- |
 | Advisor new-work admission | [`test_assistant_lane_rulings.py`](../services/chat-stream-v2/tests/test_assistant_lane_rulings.py); daemon unit / focused `v2-pytest` | Covered spawn and send admission, late ruling, authority loss and rebind, identity and normalized payload, stale targets, migration, and interrupted receipt reconciliation. Uses real Store, Sessions and Comms with fake pane transport; live provider and deployed readbacks remain separate. |
+| Ingest identity alert eligibility | [`test_ingest_identity_alerts.py`](../services/chat-stream-v2/tests/test_ingest_identity_alerts.py), [`test_ingest_identity_recovery.py`](../services/chat-stream-v2/tests/test_ingest_identity_recovery.py), [`test_ingest_provider_root_binding.py`](../services/chat-stream-v2/tests/test_ingest_provider_root_binding.py); daemon unit / focused `v2-pytest` | Real Store, error core, outbox and queue; synthetic transcript/process probes and controlled monotonic time. Unavailable-start/equal-PID failures stay fail-closed: dead processes are silent; live seats need three distinct completed attempts spanning ten seconds. Covers entry/late coalescing, late-failure accumulation, reset fences, sink retries, delivery modes/acknowledgement and strict immediate mismatches. Installed birth/exit behavior requires a separate deployed canary. |
 | Send retry → durable receipt | [`test_send_idempotency_dedupe.py`](../services/chat-stream-v2/tests/test_send_idempotency_dedupe.py), [`test_send_semantics.py`](../services/chat-stream-v2/tests/test_send_semantics.py); daemon unit / focused `v2-pytest` | Real Comms, Store, Sessions, SpawnCtl; fake tmux/hosts/blob transport. Inspected: single paste, logical identity, failed retry eligibility, queued and pending replay. Reference below; no real provider/socket/browser proof. |
 | Receipt projection and late proof | [`test_send_receipts.py`](../services/chat-stream-v2/tests/test_send_receipts.py), [`test_send_receipt_late_proof.py`](../services/chat-stream-v2/tests/test_send_receipt_late_proof.py); daemon unit / focused | Real store projection and direct Server dispatch with synthetic records/events. Inspected: metadata correlation, event stamping, proof reconciliation/race/ambiguity and access checks. Distinct from physical-send and client protections. |
 | Disconnect and client reconciliation | [`test_send_survives_disconnect.py`](../services/chat-stream-v2/tests/test_send_survives_disconnect.py); [`test_inbound_admission_bounds.py`](../services/chat-stream-v2/tests/test_inbound_admission_bounds.py) (reference examples below); [`optimisticReconciliation.test.ts`](../pentacle-chat-core/tests/optimisticReconciliation.test.ts) | Server handler/task-lifetime tests use fake sockets and send handlers; no Comms delivery. Client reducers/selectors use synthetic state/events: identity, live/snapshot replay, status ordering and caption lattice. Client suite runs in its own required frontend step. One complete real send/disconnect/consumer journey remains UNKNOWN across the repo, not a proven absent test. |
@@ -426,3 +426,19 @@ Validation for this section is citation and diff review at the stated base.
 No runtime tests, full suites, daemon processes or closing gate were run for
 this docs-only change. Existing full acceptance requirements are unchanged;
 this section neither certifies runtime deployment nor commissions extra work.
+
+### Hosted daemon CI budget
+
+The serial hosted unit tier uses 4320s, with the existing 900s smoke tier,
+for a 5220s merge target and maximum. Successful hosted unit logs measured
+2059.04s and 2071.48s. Another run exhausted its former 2100s unit limit
+after 13010 of 13285 nodes; average-throughput extrapolation gives about
+2144s, an estimate rather than a completed measurement. Twice the larger
+observed or projected cost, rounded up to a minute, gives the new unit
+envelope. Individual test timers and assertions remain unchanged.
+
+The existing runner allowances produce a 5340s deadline and 5370s outer
+gate limit. The daemon job allows 110 minutes, leaving 630s after that
+outer limit and the existing 600s package step for other setup and artifact
+retention. This changes the suite and job envelopes; it does not enable
+parallel hosted workers or alter local gate budgets.

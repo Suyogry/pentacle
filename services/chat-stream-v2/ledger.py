@@ -36,7 +36,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from sessions import TITLE_SOURCE_PLACEHOLDER, VerbError
+from sessions import TITLE_SOURCE_PLACEHOLDER, VerbError, _finish_despite_cancel
 from store import (
     QAAttestationUnverified,
     ReportReplayConflict,
@@ -614,27 +614,22 @@ class Ledger:
 
     async def _owner_checkpoint(self, msg: dict[str, Any], report_id: str, from_stream_id: str,
                                 status: str) -> dict[str, Any] | None:
-        """Item (2): the spec owner's report cannot claim a checkpoint its source fails.
+        """Attach checkpoint diagnostics without blocking durable reports.
 
-        The owner is an open lead seat with a persisted assignment (the FD after
-        `spec assign` is one). Runs after attribution and before persistence; a
-        replay of an already-stored report is never re-gated. error/aborted are
-        never refused, and an unreadable memory root is reported, not refused."""
+        Only an open lead with a persisted assignment gets a checkpoint. A
+        stored report replay remains independent of subsequent source edits.
+        """
         if ":" not in from_stream_id or await self.store.get_report(report_id) is not None:
             return None
         row = await self.store.fetch_session(*from_stream_id.split(":", 1))
-        spec_id = (row or {}).get("assigned_spec_id")
-        if not spec_id or row.get("status") != "open" or str(row.get("role") or "").lower() != "lead":
+        from store_specs import effective_assignment
+        spec_id = effective_assignment(row)
+        if (not spec_id or row.get("status") != "open" or str(row.get("role") or "").lower() != "lead"
+                or row.get("phase") in {"qa", "spec", "planning", "planner"}):
             return None
         from _shared.work_checkpoint import work_checkpoint
         result = await asyncio.to_thread(work_checkpoint, spec_id)
-        if result["state"] == "invalid" and status in {"done", "progress"}:
-            fixes = "; ".join(item["fix"] for item in result["deficiencies"])
-            reason = f"work_checkpoint_invalid: {spec_id}: {fixes}"
-            await self._maybe_record_terminal_report_rejection(msg, reason)
-            raise self._error("work_checkpoint_invalid",
-                              f"{spec_id} does not show this checkpoint; fix and re-report: {fixes}",
-                              report_id, work_checkpoint=result)
+        result["session_generation"] = row.get("session_generation")
         return result
 
     async def _authenticated_caller(self, msg: dict[str, Any]) -> str | None:
@@ -762,6 +757,11 @@ class Ledger:
 
         claim_verified, claim_mismatch = await self.verify_ac_claim(validated.ac_claim)
         checkpoint = await self._owner_checkpoint(msg, report_id, from_stream_id, str(validated.status))
+        if validated.completion_kind == "implementation_ready" and checkpoint and checkpoint["state"] != "valid":
+            code = "work_checkpoint_" + checkpoint["state"]
+            raise self._error(code, "Repair the assigned spec checkpoint before asserting implementation readiness",
+                              report_id, spec_id=checkpoint["spec_id"],
+                              deficiencies=checkpoint["deficiencies"], work_checkpoint=checkpoint)
 
         routing_snapshot = await self._report_routing_snapshot(from_stream_id)
         durable_parent = await self._parent_of(from_stream_id)
@@ -823,7 +823,9 @@ class Ledger:
             ),
             "ingested_at": iso_now(),
         }
-        try:
+        request_owner = asyncio.current_task()
+
+        async def persist_and_project():
             put_kwargs: dict[str, Any] = {}
             if not announce:
                 put_kwargs["announce"] = False
@@ -832,8 +834,23 @@ class Ledger:
             row = await self.store.put_report(
                 report_fields,
                 routing_snapshot=routing_snapshot,
+                _cancel_owner=request_owner,
                 **put_kwargs,
             )
+            inserted = bool(row.pop("_report_inserted", True))
+            if inserted:
+                if apply_state := getattr(self.sessions, "apply_report_state", None):
+                    try:
+                        await apply_state(row)
+                    except Exception:
+                        log.exception("report roster projection failed after durable ingest")
+            return row, inserted
+
+        try:
+            # Disconnect may cancel the report request after the Store commits.
+            # Finish its roster projection before propagating cancellation;
+            # notices, pane delivery and report-triggered close stay outside.
+            row, inserted = await _finish_despite_cancel(persist_and_project())
         except ReportProvenanceUnavailable as exc:
             raise self._routing_refusal(
                 "report_provenance_unavailable",
@@ -863,13 +880,7 @@ class Ledger:
             ) from exc
         # Durable first, announced second: everything below is best-effort and
         # may not fail the ingest the caller was already told to trust.
-        inserted = bool(row.pop("_report_inserted", True))
         if inserted:
-            if apply_state := getattr(self.sessions, "apply_report_state", None):
-                try:
-                    await apply_state(row)
-                except Exception:
-                    log.exception("report roster projection failed after durable ingest")
             await self._alert_claim_result(
                 row.get("claim_verified"), row.get("ac_claim_mismatch"),
                 report_id=str(row.get("report_id") or report_id),
@@ -1216,6 +1227,9 @@ def _tell_audit_record(record: dict[str, Any]) -> dict[str, Any]:
         "ledger_row_id": int(row_id) if isinstance(row_id, int) and not isinstance(row_id, bool) else row_id,
         "tell_id": tell_id,
         "from_stream_id": str(delivery.get("from_stream_id") or ""),
+        "sender_verified": delivery.get("sender_verified") is True,
+        "sender_generation": delivery.get("sender_generation") if delivery.get("sender_verified") is True and delivery.get("sender_kind") == "peer" else None,
+        "sender_kind": delivery.get("sender_kind") if delivery.get("sender_verified") is True and delivery.get("sender_kind") in {"peer", "operator", "service"} else "unknown",
         "to_stream_id": str(delivery.get("to_stream_id") or reply.get("to_stream_id") or ""),
         "original_to_stream_id": str(
             delivery.get("original_to_stream_id")

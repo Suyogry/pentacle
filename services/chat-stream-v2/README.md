@@ -1,6 +1,44 @@
 # Chat stream daemon
 
-The daemon launches configured Claude/Codex CLI sessions in tmux, ingests their native JSONL transcripts, persists session and coordination state, and serves WebSocket clients. It includes the `agent-orch` coordination RPCs, assets, schedules, notifications and authenticated desktop/mobile transport.
+The daemon launches configured Claude/Codex CLI sessions in tmux, ingests their native JSONL transcripts, persists session and coordination state, and serves WebSocket clients. It includes the `agent-orch` coordination RPCs, assets, schedules, notifications and authenticated web/mobile transport.
+
+Covered assistant commissions run non-mutating admission preflight before
+creating a ruling, enqueueing its notice or launching/reserving a provider.
+`spawn_preflight_failed` carries at most eight redacted `{code, field,
+correction}` entries in `errors`; account authorization remains fail-fast.
+The existing spec resolver, work binding and model tuple predicates are reused;
+no routing policy or advisor authority changes. Missing operator origin remains
+honest substantive input; malformed existing Tracking origin syntax is a
+mechanical error. New decision packets retain the exact resolved
+`spec_content_sha256` and display-only `excerpt_rule`, with complete immutable
+intent in the existing ruling row. Existing pending requests retain their
+original evidence, and release still rechecks authority and safety.
+See [CLI admission and exact close retries](../agent-orch/README.md#supporting-spawn-admission).
+
+## Accepted report evidence
+
+`work.report.get` reads an immutable ingested report by `report_id`. Existing
+authenticated metadata callers receive `report_id`, `status`, `from_stream_id`,
+`provenance_qualified_spec_ids` and `created_at`. Missing reports remain
+`not_found`; unavailable storage remains `unavailable`.
+
+Only the existing `work-report-reader` service identity additionally receives
+well-formed typed evidence for a finished QA report: `qa_verdict`, `target_sha`,
+the report's `session_generation`, and `qa_review` containing only
+`reviewed_scope`, `candidate_identity`, `gate_evidence_digest` and
+`commission_msg_id`. Candidate identity must equal the full target SHA; scope
+and generation must be nonempty, the evidence digest must be SHA256, and a
+commission ID must be a nonnegative integer matching an existing independent
+commission for that reviewer generation and provenance-qualified spec; a
+spec-phase review does not authorize final release. Missing or malformed
+evidence leaves the original metadata response intact. No opaque extras,
+report body, request hash or credentials are exposed. The service's existing
+authentication and single-verb restriction are unchanged.
+
+A consumer admitting a protected release must require ACCEPT and bind the
+reviewer's immutable evidence to its exact candidate bytes, affected paths and
+base revisions, while retaining spec provenance, reviewer independence and
+commission checks. A completed report or free-form scope alone is insufficient.
 
 [Named provider accounts](../../docs/provider_accounts.md) are optional and
 default OFF. Their launch, transcript, usage and recovery consumers must be
@@ -18,10 +56,41 @@ Close/reap process identity uses numeric kernel session IDs. On hosts whose
 with `os.getsid`; peer reaping requires `python3` on the peer's command path.
 An unavailable probe leaves cleanup unverified. Birth, boot, user, process group,
 session and tmux ownership checks still apply before survivor signals.
+Forced local close first brackets capture with the same live, single-pane tmux
+binding across the whole session. The pane root must be a direct child of the
+responding server. Both snapshots require server version `3.4` or `3.7c`,
+`pane_dead=0`, `pane_pipe=0`, and exactly empty `pane_dead_status` and
+`pane_dead_signal`; even exit status `0` refuses authority. Other server versions
+defer until their format/reap/respawn contract is independently qualified.
+Capture retains a fixed process cohort and a kernel witness per process before
+the second binding check and graceful teardown. Fresh process records and boot
+identity fence each target; Linux sends through the retained pidfd. Darwin uses
+NOTE_EXIT and a synchronous final event check immediately before kill. Darwin's
+check and kill are not atomic: exit plus PID reuse in that final interval, and
+initial ambiguity in one-second printed birth values, remain platform limits.
+Unproved initial binding returns `logical_ownership_unproven` for forced close;
+later instance drift returns `instance_authority_unproven`. An unanchored attempt
+creates no ownership proofs and retains unknown cleanup even if its guessed PIDs
+disappear. Existing authorized graceful tmux teardown remains available without
+an initial anchor; its success is separate from that unresolved cleanup.
+An instance refusal may follow delivery to other proved members of the cohort;
+the session stays open with its cleanup obligation.
+After a valid initial binding, a changed or unavailable second binding defers
+the entire attempt without graceful teardown, so it cannot retarget a replacement.
+Late descendants are reported but never signalled by this escalation. A tmux
+server that wedges after a successful anchor still permits witnessed escalation;
+a server already wedged before anchoring does not.
+Legacy cancelled-spawn rows without a nonce also require a nonempty matching
+birth value; otherwise their retained cleanup remains deferred.
+
 `close` requests carrying `progeny_stream_id` are refused before teardown with
 `close_progeny_unsupported`; use `spawn --handoff` for succession.
 
-Use the complete [local startup recipe](../../README.md#local-setup) first. It aligns the desktop and daemon host identity (`local`), native transcript directory, loopback endpoint and desktop credential. Python 3.11+ and tmux are required; provider CLIs require their own accounts and authentication.
+Cancelled remote spawns retain exact cleanup ownership until creation commands
+are terminal and the pane is absent. See [remote creation cleanup](docs/remote-creation-cleanup.md)
+for status, persistent uncertainty and rollback requirements.
+
+Use the complete [local startup recipe](../../README.md#quick-start) first. It aligns the web host and daemon host identity (`local`), native transcript directory, loopback endpoint and web host credential. Python 3.11+ and tmux are required; provider CLIs require their own accounts and authentication.
 
 ## Work index polling
 
@@ -38,7 +107,7 @@ duration is logged as `work index phase=worktree_sweep duration_s=...`.
 
 Without peer configuration, the daemon runs locally. To keep specs and QA records outside the checkout, configure the documented memory root for the orchestration CLI and daemon. Do not put transcripts, credentials, runtime databases or real work receipts in the public source tree.
 
-`python services/chat-stream-v2/main.py --help` lists runtime options. `--port 0 --db :memory:` is useful for a temporary probe; ephemeral sessions alone do not isolate every optional service database. The desktop smoke explicitly sets separate session, notification, asset and blob paths and uses its own tmux socket.
+`python services/chat-stream-v2/main.py --help` lists runtime options. `--port 0 --db :memory:` is useful for a temporary probe; ephemeral sessions alone do not isolate every optional service database. The web gate explicitly sets separate session, notification, asset and blob paths and uses its own tmux socket.
 
 ## Waiting for notification answers
 
@@ -60,7 +129,7 @@ includes the adopted inventory. Authentication challenges are created after this
 wait; disconnecting during startup releases the pending handler.
 
 SHA resolution keeps its existing checkout, deploy-stamp and VERSION fallbacks.
-If none provides an identity, the daemon logs that limitation. The desktop's
+If none provides an identity, the daemon logs that limitation. The web host's
 five-second welcome timeout can still require a reconnect during an unusually
 slow startup; the existing git lookup timeout is ten seconds.
 
@@ -83,14 +152,14 @@ Before downgrading to an older daemon, retain or explicitly disposition queued
 recovery inputs and unresolved spawn handles without replay: older binaries do
 not enforce the new route-origin fence.
 
-## Desktop and mobile credentials
+## Web and mobile credentials
 
 All clients, including native localhost tools, require credentials for commands,
 reads, snapshots and broadcasts. See [daemon authentication and migration](../../docs/daemon_authentication.md)
 for CLI launch environments, automatic worker credentials and recovery. The
 authenticated operator retains full existing command authority.
 
-`tools/operator_auth_cli.py issue --client-kind pentacle` issues a desktop credential; `--client-kind pentacle-mobile` issues a separate mobile credential. The JSON output's `code` field is secret. Store desktop credentials in a mode-0600 file under a mode-0700 directory and point `chatStream.tokenPath` at its canonical path. Do not place a v2 credential inline in the desktop config. The CLI's `list`, `revoke` and `rotate` commands manage credentials in the daemon's registry.
+`tools/operator_auth_cli.py issue --client-kind pentacle` issues a web host credential; `--client-kind pentacle-mobile` issues a separate mobile credential. The JSON output's `code` field is secret. Store web host credentials in a mode-0600 file under a mode-0700 directory and point `chatStream.tokenPath` at its canonical path. Do not place a v2 credential inline in the web host config. The CLI's `list`, `revoke` and `rotate` commands manage credentials in the daemon's registry.
 
 For the mobile app, create a **single-use enrollment link** on the daemon host,
 as the same OS user running the daemon. This is separate from the raw credential
@@ -136,7 +205,7 @@ still do whatever an operator credential can, and only `send` text is labelled.
 ## Remote session interrupt
 
 `send.interrupt` targets a session by `host` and `session_name`. For a configured
-remote host, updated web and desktop clients also send the selected open row's
+remote host, updated web clients also send the selected open row's
 `expected_session_generation`. They capture that value before handing the
 request to an asynchronous bridge and retain it for a retry. A remote request
 without the selected generation returns `generation_required`; the daemon does
@@ -181,10 +250,11 @@ does not resume a task, switch models, or produce a completion report.
 
 `agent-orch work owed --json` clears assignment debt on the normal accepted
 observation scan when source is fresh, has a revision, and is `completed`,
-`deprecated` or `backlog`, including work already settled before assignment.
-Backlog is deferred work. Other dispositions still require the existing
-witnessed transition or changed valid blocked declaration. Unusable source
-cannot clear debt from cached status; a later healthy scan can repair it.
+`deprecated`, `backlog`, `ready_for_dev`, `blocked` or `needs_qa`, including
+work already settled before assignment. `analysis` and `in_progress` remain
+active. Unusable source cannot clear debt from cached status; a later healthy
+scan can repair it. Lead, nexus and planner close checks also retain unresolved
+assignment history; see [Lead disposition and close](docs/lead-dispositions.md).
 
 `agent-orch work unattended --json` lists fresh `in_progress` work without a
 qualifying live lead or Nexus. Missing records do not degrade this list when
@@ -203,28 +273,35 @@ That terminal negative retains the original tell without acknowledging or
 resubmitting it; current owed facts can use the next ordinary digest deadline.
 Incomplete, unavailable or changed evidence stays pending with a typed
 `absence_readback_unknown:<reason>` in the existing error/action fields.
+Tell ledger audit records expose `sender_verified`, `sender_kind` (`peer`,
+`operator`, `service`, `unknown`) and nullable `sender_generation`. These fields
+capture server-authenticated context at delivery; they are not reconstructed from
+current sessions. `from_stream_id` remains a display claim unless verification
+is true. Legacy rows default to false/unknown/null. Composite queued peers retain
+only their verified stream and generation in additive nullable queue columns;
+legacy queue rows receive no inferred identity or backfill.
+
 `agent-orch ledger get <tell_id>` remains read-only. Do not resend or manually
 terminalize a pending notice to obtain fresh debt delivery.
 
 ## Front desk close authority
 
-The verified current direct-primary front desk may use
+The verified current direct-primary front desk is the lifecycle principal:
 `agent-orch close <stream> --expected-generation <generation> --reason "Operator <directive-id>: close absorbed kickoff; custody with FD"`
-after inspecting the target and confirming that the cited instruction covers it.
-The reason and request identity are required and audited; a citation alone
-does not authorize other seats. This exception covers top-level visible seats
-without a handoff source. Protected assistants and leads or visible chats of
+closes any ownership shape (non-child, another parent's hidden child, a
+top-level handoff successor) after the FD inspects the target and confirms the
+cited instruction covers it. Authority follows the binding; rebind, handoff,
+restore and host transfer need no designation. The reason and request identity
+are required and audited. Protected assistants and leads or visible chats of
 open operator-owned lanes are refused, including with force or confirmation
-flags. Existing idle, child/spawn, report, disposition, external close-ruling
-and process-death checks still apply. Binding, generation and current lane
-ownership are rechecked under the close fence before termination.
-
-This is close-only authority. It does not designate a lifecycle manager,
-waive reports, grant reparent or descendant cleanup, or complete a lane/spec.
-Self, direct-parent, authenticated operator and designated-manager paths
-retain their existing behavior. Admission and outcome use `fd_close` audit
-rows with the verified actor/target generations, reason and request identity;
-close attribution records `actor_kind=front_desk`.
+flags. Idle, child/spawn, external close-ruling and process-death checks still
+apply; a missing terminal report uses the audited exact-generation waiver, and
+an ordinary accountable-owner close requires a fresh disposition or live
+same-spec successor. Explicit `--force` recovery of the FD's own proven busy
+child retains owed debt with FD custody; a reason and request id are required. Binding,
+generation and lane ownership are rechecked under the close fence before
+termination. Audit rows are `manager_close*` with `actor_kind=front_desk`. See
+[Fleet lifecycle authority](../../docs/assistant.md#fleet-lifecycle-authority).
 
 ## Tests and supported integrations
 
@@ -251,7 +328,7 @@ The retained source checkpoint resumes missing primary messages without clearing
 history. Restart recovery can drain that checkpoint independently of discovery;
 verify that the source returns to live capture after recovery completes.
 
-Run the final merge gate from a clean checkout; it produces a source-bound evidence file outside the repository. The macOS preflight requires the [127.0.0.2 loopback alias](deploy/loopback-alias/README.md). See [public runtime boundaries](../../docs/public_release.md) for unsupported private integrations and the real desktop smoke. Fixtures must use invented content and valid public wire identifiers.
+Run the final merge gate from a clean checkout; it produces a source-bound evidence file outside the repository. The macOS preflight requires the [127.0.0.2 loopback alias](deploy/loopback-alias/README.md). See [public runtime boundaries](../../docs/public_release.md) for unsupported private integrations and the web gate. Fixtures must use invented content and valid public wire identifiers.
 
 Public CI sets the existing unit-only budget `V2_UNIT_TIMEOUT_S=1200`; smoke and
 soak limits keep their defaults. Pytest scratch is separate from
@@ -505,19 +582,16 @@ not idle-timeout claims. This detector belongs to local `Ingest`; satellite
 `event.push` ownership must be inspected separately when investigating a remote
 session.
 
-The start-field consumer audit covers process-record/table capture and reap
-proof capture (`prockill`), remote spawn capture and cancelled-spawn cleanup
-(`spawnctl`), strict/recovery ingest checks, reconciler remote table capture and
-reap proof comparison, Store rebind no-op detection, and assistant-restore ps
-classification. Exact JSON binding CAS snapshots and unrelated timestamps are
-unchanged. Gate ownership uses Linux start ticks or its existing platform
-fallback; orphan-reaper date parsing is an elapsed-age input, not observer
-presentation equality. Private cache/delivery validators are maintained by
-their owner outside this public source tree.
+The [process ownership contract and consumer dispositions](../../docs/PROCESS_OWNERSHIP.md)
+cover restore/replay, capture, reap, ingest, occupancy and input/capacity probes,
+including each retained availability refusal and the alternate-rendering clock
+fences. Persisted producer renderings and exact binding CAS snapshots remain
+unchanged.
 
 ### Native Codex cwd trust and late delivery
 
-Before a configured Codex launch, the target host seeds the realpath cwd in
+After account launch admission, the target host seeds the realpath cwd in the
+selected binding's `home/config.toml`. Unbound legacy launches use
 `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`). A file lock protects
 idempotent writes; unrelated configuration bytes are preserved. The existing
 command-line trust override remains. Invalid or unsupported project-table
@@ -535,6 +609,23 @@ is fenced to the parent generation. Late proof retains `failure_code` and
 `delivery_failed_at`, adds `delivered_late_at`, and records
 `late_first_user_event`; `adopted_after_restart` requires evidence of a different
 daemon instance. Reuse the existing spawn handle for recovery.
+
+
+### Interrupted spawn adoption
+
+A restart reconciles each saved request against its pane nonce and session
+generation. An owned pane created before admission can be registered normally
+when no conflicting row exists. If a retained closed row has another generation
+and no intentional close marker, recovery preserves that row and cleans up only
+the interrupted request's nonce-bound pane. Confirmed cleanup produces a failed
+spawn outcome; uncertain cleanup keeps an indeterminate outcome and its durable
+reservation. Foreign panes, open successor generations and intentional closes
+retain their existing refusal behavior.
+
+For promptless provider spawns still starting, adoption runs the existing
+bounded readiness observer. A ready pane advances bootstrap to ready; an
+unproven live pane keeps the original handle and reports starting. Initial
+prompt delivery remains `not_requested`, and recovery sends no synthetic input.
 
 ## Screen leases
 

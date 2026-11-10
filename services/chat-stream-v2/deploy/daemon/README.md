@@ -176,10 +176,20 @@ python services/chat-stream-v2/deploy/deploy.py chat-streamd-v2 \
 
 Preparation stages full immutable helper source, tests the existing configured
 interpreters and read-only native artifacts, validates target/prior gate evidence
-and both target smoke plans, and saves private preimages. It changes no active
+and the sealed forward smoke plan, binds the prior's production forward
+qualification, and saves private preimages. No prior runner/profile API is required. It changes no active
 policy, source, launchd state, CLI launcher, pin or account generation. It needs
 the owner's explicit host-staging/probe authority. Keep its directories through
 handoff; there is no automatic garbage collection.
+
+Account admission follows the existing recovery predicates, including sealed
+resolution of parked repins, and checks live maintenance input slots and
+unexpired spawn holds. Historical maintenance receipts do not represent live
+slots. Unresolved recovery or generation intents, including attempts awaiting
+enrollment, still refuse preparation and revalidation; deployment never rewrites
+the account journal to clear them.
+
+Helper child failures report argv0, exit status or timeout, and redacted stdout/stderr tails (at most 1000 characters each). Remaining argv and environment are omitted. Pre-stop apply refusals retain this diagnostic in `helper_proof_failure` in the prepared journal; post-stop failures retain it in the existing recovery failure record. A journal write error preserves the original refusal. Only an artifact-proof child exiting 1 with the exact JSON outcome `account_busy` waits. One shared 15-second deadline starts at the first busy outcome in a controller invocation, with 250 ms backoff; later proofs cannot reset it. The deadline exceeds three times the measured observation hold maximum and is below the 60-second cap. Retry child execution is bounded by the remaining deadline. Each wait records attempt count, elapsed seconds and last outcome in the journal (preparation records them when its journal is created), and exhausted waits retain that detail in the refusal. Every other exit/outcome refuses immediately. Locks, observation cadence and admission guards stay unchanged.
 
 Apply rechecks sealed inputs, sole-deployer/schedule/account quiescence and
 staged proofs. It unloads the old job and proves daemon/local helper exit before
@@ -211,8 +221,9 @@ not bypass any older coordinated ancestry in the live deployment stamp.
 
 Exit **11** means committed scoped success (or successful explicit restoration)
 with declared optional exclusions and `full_fleet_acceptance=false`. It requires
-every included cell to pass and preserves four `SKIPPED_DECLARED` rows per
-excluded host. Only a coordinated consumer that validates receipt digest,
+every included forward model cell or rollback no-input binding cell to pass.
+Forward smoke preserves four `SKIPPED_DECLARED` rows per excluded host;
+rollback records the same excluded scope without inventing model-cell passes. Only a coordinated consumer that validates receipt digest,
 committed phase, admitted exclusions and complete included evidence may accept
 11; generic release gates continue to require 0. Scoped deployment never changes
 the recurring smoke schedule or satellite admission/pins.
@@ -223,7 +234,85 @@ to success. Inspect the journal and returned receipt, and GATE the owner when
 recovery is required. A stale receipt or post-commit source/policy/plist drift
 refuses before stop; prepare a new transaction rather than overwriting later
 work. Explicit rollback restores original source/policy/plist/stamp bytes and
-verifies prior health under the same declared canary scope.
+verifies fresh prior health/PID/birth/served SHA, restored bindings/catalog and
+one zero-input launch/readiness/owned-close for every included selected
+host/provider/account binding. Fresh strict native/helper dispatch proof and
+attributed slow-consumer/cleanup checks remain required. Raw RPC sends no
+prompt, brief, role baseline or subsequent input; the existing `promptless`
+smoke does send a marker and is not used for rollback.
+
+A failed forward health result is journaled as `result` (boot, runtime, fleet
+smoke, slow consumer and helper dispatch kept separate) before
+`candidate health failed` is raised. A verifier that raises journals the
+sub-results completed before it as `partial_result`; a journal write failure
+keeps the original failure and records `journal_failure`.
+
+Recovery never stops a prior that has proved its identity. When the exact prior
+source, policy and plist are restored, a fresh launchd boot with a new PID is
+observed and its loaded runtime SHA equals the receipt's prior SHA, a later
+restoration-proof, helper-dispatch or slow-consumer failure, or a journal write
+failure after a passed proof, leaves that daemon serving. The journal records
+`prior_running` {pid, birth, sha} and a failed `rollback_result` with
+`prior_identity`; the phase stays `recovery_required` (exit 12, not qualified).
+Launchd PID, process start and checkout SHA are re-read at that decision point;
+on any mismatch nothing is signalled and `prior_identity_mismatch` is recorded.
+A failure before that identity is proven still stops only the owned process,
+and a refusal before admission touches nothing.
+
+A sealed receipt pins its controller SHA. To recover it from a repaired
+controller, the FD places an owner-only authorization file in the transaction
+directory and sends a GO tell quoting the file's sha256 and the replacement SHA:
+
+```json
+{"transaction_id": "...", "receipt_sha256": "...",
+ "original_controller_sha": "<receipt intent.controller_sha>",
+ "replacement_controller_sha": "<clean controller HEAD>", "operation": "recovery",
+ "expected_prior_sha": "...", "expected_target_sha": "...",
+ "expected_live": {"sha": "...", "pid": 123, "birth": "<ps lstart>"},
+ "authorized_by": "host:fd-stream", "fd_gate_reference": "..."}
+```
+
+```bash
+.venv/bin/python deploy/deploy.py chat-streamd-v2 \
+  --release-checkout /absolute/runtime --rollback \
+  --coordinated-receipt /private/receipt.json \
+  --recovery-controller-authorization /private/<transaction>/recovery-authorization.json \
+  --recovery-go-tell-id <GO tell id> --deployer-stream-id host:deployer
+```
+
+It is accepted only with `--rollback --coordinated-receipt`. While it is in
+force the original controller no longer qualifies. Before admission, recovery
+requires the controller to be clean at exactly the replacement SHA with the
+receipt's origin, the live launchd PID, process start and checkout SHA to equal
+`expected_live`, and the replacement installer to reproduce every sealed prior
+`original_helpers` proof (`original helper proof drift before stop`). All
+existing receipt, preimage, catalog, account, gate and drift checks still apply,
+and forward apply stays pinned to the receipt controller. The journal records
+the authorization digest, replacement SHA, `authorized_by`, `fd_gate_reference`
+and the GO tell id.
+
+Remote-creation witness rollout requires a qualified compatible reader before
+any writer-enabled release. Seal that exact live reader as the writer release's
+prior and record the actual deploy-controller checkout/SHA separately from the
+smoke-runner hash. After witness production, the release owner must keep every
+selected target/prior compatible, including a new coordinated forward
+preparation; source does not enforce a minimum reader version. Follow the
+[cleanup compatibility contract](../../docs/remote-creation-cleanup.md) for
+receipt staleness, indefinite unknown obligations and further downgrade limits.
+
+The rollback result reports `restoration` acceptance with `model_canary` not run
+by design. Even a full-scope restoration sets `full_fleet_acceptance=false`:
+inference authentication/quota/availability, replies and response-driven pressure
+were not retested. Forward verification retains its cheap sealed full matrix.
+The daemon transaction restores source, private policy/original helper bindings,
+plist/environment, collector/stamp/settings and applicable schedule preimages.
+Installed CLI launcher pointers, native binaries and provider pins remain outside
+this transaction and must stay unchanged; persistent state must remain readable
+by the prior. CLI operations remain separately owned.
+
+New preparations write receipt schema v2. Older sealed receipts are recovered
+using their pinned original controller and policy, without rewriting seals or
+silently interpreting an old receipt under the new verification contract.
 
 The reusable offline rehearsal is `PYTHONPATH=services/chat-stream-v2:services
 python -m deploy.coordinated_harness --root /absolute/empty/owned/scratch`.

@@ -33,7 +33,7 @@ class AssistantPolicy:
             self.extra_roles.add(daff_role)
         # The primary assistant composite, wired by main: its in-memory binding
         # names the front-desk seat without a store read.
-        self.front_desk = None
+        self._front_desk = None
         self.lock = asyncio.Lock()
         # Fleet lifecycle authority: designate/transfer/revoke/handoff-carry and a
         # manager close/reparent from admission through effect all hold this
@@ -41,6 +41,18 @@ class AssistantPolicy:
         # authority (outermost) -> per-target lifecycle lock -> graph lock.
         # Nothing holding a lifecycle or graph lock may acquire it.
         self.authority_lock = asyncio.Lock()
+
+    @property
+    def front_desk(self):
+        return self._front_desk
+
+    @front_desk.setter
+    def front_desk(self, composite):
+        # The Store derives the FD principal from these binding coordinates.
+        import store_lifecycle_authority
+        self._front_desk = composite
+        if self.store is not None:
+            self.store.lifecycle_front_desk = store_lifecycle_authority.front_desk_spec(composite)
 
     @property
     def roles(self) -> set[str]:
@@ -58,7 +70,7 @@ class AssistantPolicy:
         """True for a parentless local seat that is, or is becoming, the bound front desk.
 
         Independent of the role env: a handoff from the bound stream, the bound
-        stream itself (resume/restore), or a seat carrying a configured rebind spec.
+        stream itself (resume/restore), or a deliberately commissioned fresh recovery.
         """
         composite = self.front_desk
         if (composite is None or not composite.enabled or fields.get("parent_stream_id")
@@ -67,9 +79,13 @@ class AssistantPolicy:
         bound = composite.config.direct_primary_stream_id
         if bound and bound in (stream_id, fields.get("handoff_from_stream_id")):
             return True
-        qualified = fields.get("qualified_spec_ids")
-        return bool(isinstance(qualified, (list, tuple))
-                    and composite.env_config.rebind_authorized_spec_ids.intersection(qualified))
+        if fields.get("handoff_from_stream_id"):
+            return False
+        from store_assistant_binding import _configured_spec_authorized
+        return _configured_spec_authorized(
+            {**fields, "visibility": "hidden"},
+            composite.env_config.rebind_authorized_spec_ids, allow_hidden=True,
+        )
 
     @staticmethod
     def _error(code, message):
@@ -137,8 +153,6 @@ class AssistantPolicy:
             raise self._error("assistant_parent_invalid", "assistant must be a top-level session")
         if host != self.local_host:
             raise self._error("assistant_host_invalid", "assistant must run on the configured daemon host")
-        if self.is_daff_backend({"host": host, "role": role}):
-            msg["visibility"] = "hidden"
         async with self.lock:
             # Keep existing idempotent replay ahead of duplicate checks. A new
             # reservation is checked by SpawnCtl immediately before boot.
@@ -148,12 +162,22 @@ class AssistantPolicy:
         if self.protects(row) and close_kind not in {"handed_off", "spawn_rollback"}:
             raise self._error("close_protected", "assistant session is protected; use managed handoff for replacement")
 
-    # -- operator-designated fleet lifecycle authority ----------------------
-    # The durable grant (store_lifecycle_authority) is the only source of this
-    # authority: no role, title, config entry or lineage confers it.
+    # -- fleet lifecycle authority -------------------------------------------
+    # store_lifecycle_authority is the only source of this authority: the
+    # current primary binding (front-desk mode) or the durable grant. No
+    # role, title, old binding, lineage or config entry confers it.
+
+    @property
+    def front_desk_mode(self):
+        """A configured primary direct binding names the lifecycle principal."""
+        return bool(getattr(self.store, "lifecycle_front_desk", None))
+
+    @property
+    def manager_kind(self):
+        return "front_desk" if self.front_desk_mode else "manager"
 
     async def manager_holds(self, auth):
-        """True only for the verified current holder generation."""
+        """True only for the verified current principal generation."""
         auth = auth or {}
         if not auth.get("token_verified"):
             return False

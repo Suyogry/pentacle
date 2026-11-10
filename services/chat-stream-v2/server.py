@@ -109,6 +109,9 @@ _CONN_REASONS = frozenset({"absent", "malformed", "expired", "wrong-seat", "inte
                           "system_producer_auth_required", "revoked", "tls_required"})
 _CONN_LOG_SAFE: ContextVar[bool] = ContextVar("accepted_connection_log_projection", default=False)
 _CONN_AUTH: ContextVar[Any] = ContextVar("connection_auth_diagnostic", default=None)
+# Transport-owned application receive time, inherited only by this request's task.
+# It is never populated from a client field. The challenge uses the same wall clock.
+_HELLO_RECEIVED_AT: ContextVar[Any] = ContextVar("hello_received_at", default=None)
 
 
 def _conn_bucket(value: Any) -> str:
@@ -172,6 +175,7 @@ class _ConnectionDiagnostic:
     rx_messages: int = 0
     rx_bytes: int = 0
     tx_messages: int = 0
+    non_handshake_tx: int = 0
     tx_bytes: int = 0
     last_rx: float | None = None
     last_tx: float | None = None
@@ -488,7 +492,7 @@ class _EncodedFrame:
 
 
 def _encode_frame(payload: Any) -> str:
-    if isinstance(payload, dict) and payload.get("type") in {"snapshot", "session.inventory"}:
+    if isinstance(payload, dict) and payload.get("type") in {"snapshot", "session.inventory", "work_lanes.inventory"}:
         return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     return json.dumps(payload)
 
@@ -824,6 +828,7 @@ class Server:
         self.lifecycle: Any = None
         self._clients: set[Any] = set()
         self._connection_diagnostics: dict[Any, _ConnectionDiagnostic] = {}
+        self._operator_rejected: set[Any] = set()
         #: Broadcasts stay bounded behind one writer per client. RPC replies
         #: write from their request task and use the shared send lock below.
         self._client_send_queues: dict[Any, asyncio.Queue] = {}
@@ -1461,6 +1466,8 @@ class Server:
         state.traffic[bucket][prefix + "_sent"] += 1
         state.traffic[bucket][prefix + "_sent_bytes"] += size
         state.tx_messages += 1
+        if frame_type not in {"welcome", "hello.error"}:
+            state.non_handshake_tx += 1
         state.tx_bytes += size
         state.last_tx = now
         if bucket == "pong":
@@ -1468,14 +1475,18 @@ class Server:
 
     @staticmethod
     def _diag_frame_type(frame: Any) -> str:
+        def kind(value):
+            # Preserve handshake identity for the whole-connection access count;
+            # traffic buckets and emitted diagnostic types remain unchanged.
+            return value if isinstance(value, str) and value in {"welcome", "hello.error"} else _conn_bucket(value)
         if isinstance(frame, _EncodedFrame):
-            return _conn_bucket(frame.frame_type)
+            return kind(frame.frame_type)
         if isinstance(frame, dict):
-            return _conn_bucket(frame.get("type"))
+            return kind(frame.get("type"))
         # Only already-encoded direct frames lack a top-level object here.
         try:
             decoded = json.loads(frame)
-            return _conn_bucket(decoded.get("type")) if isinstance(decoded, dict) else "other"
+            return kind(decoded.get("type")) if isinstance(decoded, dict) else "other"
         except (TypeError, ValueError):
             return "other"
 
@@ -1665,6 +1676,7 @@ class Server:
                 close_sent_reason=sent_reason, close_received_reason=received_reason,
                 auth_state=state.auth_state, rx_messages=state.rx_messages, rx_bytes=state.rx_bytes,
                 tx_messages=state.tx_messages, tx_bytes=state.tx_bytes,
+                non_handshake_tx=state.non_handshake_tx,
                 queue_snapshot_age_ms=0 if queue is not None or state.snapshot_at is None else _conn_ms(state.snapshot_at, now),
                 auth_suppressed_total=state.auth_suppressed_total,
                 pressure_episodes_suppressed_total=state.pressure_suppressed_total,
@@ -1769,6 +1781,7 @@ class Server:
         hello_barrier: asyncio.Task | None = None
         try:
             async for raw in websocket:
+                received_at = time.time()
                 self._diag_rx(websocket, raw)
                 # One task per request: a verb that parks (`await_report`) must
                 # not hold up the requests behind it. Replies correlate by
@@ -1801,7 +1814,11 @@ class Server:
                 if credit is None:
                     self._refuse_request(websocket, request)
                     continue
-                task = asyncio.create_task(self._serve_after_hello(websocket, raw, hello_barrier, credit))
+                received_token = _HELLO_RECEIVED_AT.set((websocket, received_at) if is_hello else None)
+                try:
+                    task = asyncio.create_task(self._serve_after_hello(websocket, raw, hello_barrier, credit))
+                finally:
+                    _HELLO_RECEIVED_AT.reset(received_token)
                 task.add_done_callback(credit.release)
                 if is_hello:
                     hello_barrier = task
@@ -1896,13 +1913,15 @@ class Server:
                         else frame
                         for frame in result
                     ]
-                await self._send_direct(websocket, result)
+                await self._send_direct(websocket, result, request_type="hello", request_id=request.get("request_id"))
             return
         result = await self._dispatch(raw, websocket=websocket)
         await asyncio.sleep(0)
         sent = await self._send_direct(
             websocket, result,
             interleave_history=isinstance(request, dict) and request.get("type") == "request_stream_events",
+            request_type=request.get("type") if isinstance(request, dict) else None,
+            request_id=request.get("request_id") if isinstance(request, dict) else None,
         )
         if isinstance(request, dict) and request.get("type") in {
             "notification.resolve", "notification.resolve_by_dedup", "prompt.answer",
@@ -1967,6 +1986,12 @@ class Server:
             )
             groups.setdefault(key, []).append(websocket)
         for clients in groups.values():
+            # Proof rejection is connection-bound, unlike the shared projection.
+            # Recheck after grouping's awaited auth checks and before choosing a
+            # representative, so neither member order can bypass or poison it.
+            clients = [client for client in clients if client not in self._operator_rejected]
+            if not clients:
+                continue
             projected = self._frame_for_client(clients[0], frame_type, frame)
             if projected is None:
                 continue
@@ -2043,6 +2068,7 @@ class Server:
         self._client_scoped_revoked.discard(websocket)
         self._tls_connections.discard(websocket)
         self._operator_challenges.pop(websocket, None)
+        self._operator_rejected.discard(websocket)
         self._connection_trust.pop(websocket, None)
         self._client_send_queues.pop(websocket, None)
         self._client_send_locks.pop(websocket, None)
@@ -2071,6 +2097,10 @@ class Server:
                     with self._diag_wait(websocket) as measurement:
                         async with lock:
                             self._diag_acquired(websocket, measurement)
+                            # Projection may predate a proof rejection while
+                            # this queued frame waits for the send lock.
+                            if websocket in self._operator_rejected:
+                                continue
                             with self._diag_send(websocket, frame, _frame_type, broadcast=True):
                                 await websocket.send(frame)
                     # Record the DELIVERED digest (not at enqueue): byte-identical
@@ -2222,38 +2252,76 @@ class Server:
             except Exception:  # noqa: BLE001
                 pass
 
-    async def _send_direct(self, websocket: Any, frames: Any, *, interleave_history: bool = False) -> bool:
+    def _rejected_direct_frame(self, frame: Any, request_type: str | None, request_id: Any) -> tuple[Any, bool]:
+        """Keep control/refusal delivery, replacing application payloads at egress."""
+        value = frame.payload if isinstance(frame, _EncodedFrame) else frame
+        if not isinstance(value, dict):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                value = {}
+        if not isinstance(value, dict):
+            value = {}
+        kind = str(value.get("type") or "")
+        # These endpoints intentionally have their own unauthenticated policy.
+        # In particular, screen.lease.status is outside this rejection change.
+        if kind in {
+            "welcome", "pong", "enroll.ok", "enroll.error",
+            "event.push.ok", "event.push.error", "host.stats.ok", "host.stats.error",
+            "screen.lease.status.ok", "screen.lease.status.error",
+        }:
+            return frame, False
+        correlation = value.get("request_id", request_id)
+        if kind.endswith(".error"):
+            code = value.get("error_code")
+            safe_code = code if isinstance(code, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) else "authentication_required"
+            return self._auth_error_frame(kind.removesuffix(".error"), correlation, safe_code), False
+        verb = request_type
+        if not verb:
+            family, _, suffix = kind.rpartition(".")
+            verb = family if suffix in {"ok", "chunk", "result", "ack"} else "protocol"
+        return self._auth_error_frame(verb, correlation, "authentication_required"), True
+
+    async def _send_direct(
+        self, websocket: Any, frames: Any, *, interleave_history: bool = False,
+        request_type: str | None = None, request_id: Any = None,
+    ) -> bool:
         """Write greeting or results without entering broadcast fanout."""
         lock = self._client_send_locks.get(websocket)
         if websocket not in self._clients or lock is None:
             return False
+
+        async def send_frame(frame):
+            # Caller holds the existing send lock. Iterator/storage and earlier
+            # sends may have yielded since admission; recheck for every frame.
+            suppressed = False
+            if websocket in self._operator_rejected:
+                frame, suppressed = self._rejected_direct_frame(frame, request_type, request_id)
+            payload = frame.payload if isinstance(frame, _EncodedFrame) else frame if isinstance(frame, str) else _encode_frame(frame)
+            with self._diag_send(websocket, payload, self._diag_frame_type(frame)):
+                await websocket.send(payload)
+            return not suppressed
+
         try:
             if interleave_history and hasattr(frames, "__aiter__"):
-                try:
-                    # Fetch/encode outside the lock; history retains its fair yields.
-                    async for frame in frames:
-                        payload = frame.payload if isinstance(frame, _EncodedFrame) else _encode_frame(frame)
-                        with self._diag_wait(websocket) as measurement:
-                            async with lock:
-                                self._diag_acquired(websocket, measurement)
-                                if websocket not in self._clients:
-                                    return False
-                                with self._diag_send(websocket, payload, self._diag_frame_type(frame)):
-                                    await websocket.send(payload)
-                        await asyncio.sleep(0)
-                finally:
-                    close = getattr(frames, "aclose", None)
-                    if callable(close):
-                        await close()
+                # Fetch outside the lock; history retains its fair yields.
+                async for frame in frames:
+                    with self._diag_wait(websocket) as measurement:
+                        async with lock:
+                            self._diag_acquired(websocket, measurement)
+                            if websocket not in self._clients:
+                                return False
+                            if not await send_frame(frame):
+                                return False
+                    await asyncio.sleep(0)
                 return True
             with self._diag_wait(websocket) as measurement:
                 async with lock:
                     self._diag_acquired(websocket, measurement)
                     if hasattr(frames, "__aiter__"):
                         async for frame in frames:
-                            payload = frame.payload if isinstance(frame, _EncodedFrame) else _encode_frame(frame)
-                            with self._diag_send(websocket, payload, self._diag_frame_type(frame)):
-                                await websocket.send(payload)
+                            if not await send_frame(frame):
+                                return False
                     else:
                         for frame in ((frames,) if isinstance(frames, str) else frames):
                             # Snapshot assembly can await storage while the finisher
@@ -2268,15 +2336,18 @@ class Server:
                                     **frame.get("capabilities", {}),
                                     "error_alerts_v1": True, "outbound_commit_v1": True,
                                 }, "error_reporting_credential_id": self._connection_trust[websocket].credential_id}
-                            payload = frame if isinstance(frame, str) else _encode_frame(frame)
-                            with self._diag_send(websocket, payload, self._diag_frame_type(frame)):
-                                await websocket.send(payload)
+                            if not await send_frame(frame):
+                                return False
         except ConnectionClosed as exc:
             state = self._connection_diagnostics.get(websocket)
             if state is not None:
                 state.close_exception = exc
             self._unregister_client(websocket)
             return False
+        finally:
+            close = getattr(frames, "aclose", None)
+            if callable(close):
+                await close()
         return True
 
 
@@ -2345,6 +2416,9 @@ class Server:
         }
         if websocket is not None:
             dispatch_msg["_auth_context"] = await self._auth_context(websocket, msg)
+            if self._rejected_rpc(websocket, verb):
+                self._diag_auth_failure(websocket, "authentication_required")
+                return [self._auth_error_frame(verb, request_id, "authentication_required")]
             service_auth = dispatch_msg["_auth_context"]
             if verb in {"upload_blob_init", "upload_blob_chunk"} and msg.get("protocol") == 2:
                 # This opt-in surface always requires a current registered v2
@@ -2520,8 +2594,12 @@ class Server:
             if actor_reset is not None and verb not in {'spawn','await_report','notification.await','request_stream_events'}:
                 async with self.host_transfer.actor_lock(actor):
                     await self.store.require_current_actor(*actor)
+                    if self._rejected_rpc(websocket, verb):
+                        return [self._auth_error_frame(verb, request_id, "authentication_required")]
                     reply = await handler(dispatch_msg)
             else:
+                if self._rejected_rpc(websocket, verb):
+                    return [self._auth_error_frame(verb, request_id, "authentication_required")]
                 reply = await handler(dispatch_msg)
         except (VerbError, StatusCardError, host_transfer.TransferError) as exc:  # expected business failures
             reply = {"type": f"{verb}.error", "error_code": exc.code, "error": str(exc),
@@ -2603,7 +2681,17 @@ class Server:
             return TOKEN_REASON_MALFORMED
         return None
 
+    def _rejected_rpc(self, websocket: Any, verb: str) -> bool:
+        return websocket in self._operator_rejected and verb not in {
+            "ping", "hello", "enroll", "event.push", "host.stats", "screen.lease.status",
+        }
+
     def _diag_auth_result(self, websocket: Any, msg: dict, context: dict, started: float | None) -> dict:
+        # A context may have captured operator trust before a storage/thread
+        # await. It cannot restore that authority after rejection on this socket.
+        if websocket in self._operator_rejected:
+            context.update(operator_authenticated=False, operator_principal="",
+                           operator_trusted=False, credential_id="", scoped_principal=False)
         if started is not None:
             self._diag_auth_observe(websocket, msg, context, _monotonic() - started)
         return context
@@ -3369,6 +3457,8 @@ class Server:
     def _frame_for_client(
         self, websocket: Any, frame_type: str, payload: dict[str, Any],
     ) -> dict[str, Any] | None:
+        if websocket in self._operator_rejected:
+            return None
         if not (self._operator_authenticated(websocket)
                 or self._scoped_authenticated(websocket)
                 or websocket in self._client_authenticated_streams):
@@ -3537,7 +3627,8 @@ class Server:
         """
         trust = self._connection_trust.get(websocket)
         return bool(
-            trust
+            websocket not in self._operator_rejected
+            and trust
             and trust.transport == "v2"
             and trust.operator_trusted
             and not getattr(trust, "scope", None)
@@ -3572,11 +3663,16 @@ class Server:
     def _authenticate_operator_hello(self, websocket: Any, msg: dict[str, Any]) -> str | None:
         """Bind a v2 UI principal to this socket, or fail the claimed proof closed."""
         challenge = self._operator_challenges.pop(websocket, None)
+        if websocket in self._operator_rejected:
+            self._diag_auth_failure(websocket, "operator_auth_invalid", "operator_v2")
+            return "operator_auth_invalid"
         auth_v2 = msg.get("auth_v2")
         if auth_v2 is None:
             return None
         try:
-            if challenge is None or time.time() > challenge[1]:
+            received = _HELLO_RECEIVED_AT.get()
+            received_at = received[1] if received is not None and received[0] is websocket else time.time()
+            if challenge is None or received_at > challenge[1]:
                 raise operator_auth.OperatorAuthError("operator auth challenge unavailable")
             if not isinstance(auth_v2, dict) or set(auth_v2) != {"scheme", "credential_id", "proof"}:
                 raise operator_auth.OperatorAuthError("invalid operator auth frame")
@@ -3591,6 +3687,8 @@ class Server:
                 credential_id, client_kind, challenge[0], operator_auth.encode_b64url(proof),
             )
         except operator_auth.OperatorAuthError:
+            self._operator_rejected.add(websocket)
+            self._connection_trust.pop(websocket, None)
             self._diag_auth_failure(websocket, "operator_auth_invalid", "operator_v2")
             return "operator_auth_invalid"
         self._connection_trust[websocket] = trust
@@ -4069,7 +4167,7 @@ class Server:
         # table (QA #18). Only spawn waits; the gate is open outside the boot
         # window, so this is a no-op for every steady-state spawn.
         await self.spawn_ready.wait()
-        if self.lane_rulings is not None:
+        if self.lane_rulings is not None and not msg.get("provision_only"):
             try:
                 pending = await self.lane_rulings.request_spawn(msg)
             except ValueError as exc:
@@ -4251,6 +4349,13 @@ class Server:
             "tell_id": tell_reply.get("tell_id"),
         }
 
+    def _front_desk_composite(self) -> Any:
+        """The primary composite when its direct binding names the FD."""
+        composite = self.sessions.assistant.front_desk
+        if composite is None or not self.sessions.assistant.front_desk_mode or not composite.enabled:
+            return None
+        return composite
+
     async def _on_tell(self, msg: dict[str, Any]) -> dict[str, Any]:
         if _is_primary_alias(msg.get("to_stream_id")):
             return await self._alias_tell(msg)
@@ -4259,6 +4364,12 @@ class Server:
         composite = self._composite_for(target_stream_id)
         if composite is not None:
             return await self._composite_tell(composite, target_stream_id, msg)
+        front_desk = self._front_desk_composite()
+        if front_desk is not None and target_stream_id in await self.store.front_desk_aliases():
+            # The current or a proved former FD seat id is a logical FD address:
+            # canonicalize before physical routing, even if the old seat is open.
+            return await self._composite_tell(front_desk, front_desk.config.stream_id,
+                                              {**msg, "_fd_requested_to": target_stream_id})
         # Suppression is applied by Comms.tell, after its route/body/Codex guards
         # and under the tell_id idempotency ledger.
         return await self.comms.tell(msg)
@@ -4293,6 +4404,8 @@ class Server:
         delivered = await self._deliver_composite_tell(
             composite, composite_stream_id, from_stream_id, body, tell_id, str(msg.get("request_id") or ""),
             service_ingress_body=msg.get("_wmi_brief_ingress_body"),
+            requested_to=str(msg.get("_fd_requested_to") or msg.get("to_stream_id") or composite_stream_id),
+            auth=auth,
         )
         if delivered is not None:
             return delivered
@@ -4301,6 +4414,8 @@ class Server:
             name=composite.config.name, tell_id=tell_id, from_stream_id=from_stream_id,
             body=body, request_id=str(msg.get("request_id") or ""),
             service_ingress_body=msg.get("_wmi_brief_ingress_body"),
+            verified_from_stream_id=str(auth.get("stream_id") or "") or None if auth.get("token_verified") is True else None,
+            verified_generation=str(auth.get("session_generation") or "") or None if auth.get("token_verified") is True else None,
         )
         return {
             "type": "tell.ok", "to_stream_id": composite_stream_id, "tell_id": tell_id,
@@ -4310,7 +4425,8 @@ class Server:
     async def _deliver_composite_tell(
         self, composite: Any, composite_stream_id: str, from_stream_id: str,
         body: str, tell_id: str, request_id: str,
-        *, service_ingress_body: str | None = None,
+        *, service_ingress_body: str | None = None, requested_to: str | None = None,
+        auth: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Deliver one composite tell to the current bound pane.
 
@@ -4336,10 +4452,23 @@ class Server:
             # The pane was replaced without a rebind: refuse the stale generation.
             raise VerbError("assistant_direct_generation_conflict",
                             "assistant binding generation is stale")
+        logical = None
+        if composite is self._front_desk_composite():
+            # FD tell identity is the logical destination, not this seat, so a
+            # retry after a rebind replays the committed outcome.
+            verified = str((auth or {}).get("stream_id") or "") if (auth or {}).get("token_verified") else ""
+            logical = {"name": composite.config.name, "requested": requested_to or composite_stream_id,
+                       "binding_revision": binding.get("revision"), "sender": verified or from_stream_id,
+                       "aliases": await self.store.front_desk_aliases()}
         reply = await self.comms.tell({
             "type": "tell", "to_stream_id": target, "host": host, "session_name": name,
             "from_stream_id": from_stream_id or composite_stream_id, "message": body,
             "tell_id": tell_id, "request_id": request_id,
+            "_auth_context": {key: (auth or {})[key] for key in (
+                "token_verified", "stream_id", "session_generation",
+                "operator_authenticated", "operator_principal", "service_authenticated", "service_actor",
+            ) if key in (auth or {})},
+            **({"_logical_front_desk": logical} if logical else {}),
             # Only authenticated service dispatch or its durable queue entry
             # supplies the sanitized original. Never infer trust from a header.
             "_wmi_brief_ingress_body": service_ingress_body,
@@ -4357,7 +4486,8 @@ class Server:
             delivered["front_desk_hold_id"] = reply["front_desk_hold_id"]
         # Preserve the committed-but-not-yet-proven acknowledgement for callers
         # which must not resend an already committed brief.
-        for key in ("action_committed", "action_status", "confirmation_status", "confirmation_pending", "do_not_resubmit"):
+        for key in ("action_committed", "action_status", "confirmation_status", "confirmation_pending",
+                    "do_not_resubmit", "duplicate"):
             if key in reply:
                 delivered[key] = reply[key]
         return delivered
@@ -4375,6 +4505,9 @@ class Server:
                     composite, composite.config.stream_id, row["from_stream_id"],
                     row["body"], row["tell_id"], row.get("request_id") or "",
                     service_ingress_body=row.get("service_ingress_body"),
+                    auth={"token_verified": True, "stream_id": row["verified_from_stream_id"],
+                          "session_generation": row["verified_generation"]}
+                    if row.get("verified_from_stream_id") and row.get("verified_generation") else None,
                 )
             except VerbError:
                 break
@@ -4492,7 +4625,10 @@ class Server:
         # A transient physical-target copy: never the caller's object, and no
         # private marker survives (only the server-derived peer context).
         physical = {key: value for key, value in msg.items() if not str(key).startswith("_")}
-        physical.update(to_stream_id=target, host=host, session_name=name, _auth_context=peer)
+        physical.update(to_stream_id=target, host=host, session_name=name, _auth_context=peer,
+                        _assistant_alias_binding={"name": composite.env_config.name,
+                            "env_binding": composite._env_binding(), "stream_id": target,
+                            "generation": generation, "revision": binding.get("revision")})
         if isinstance(msg.get("inbox"), dict):
             physical["inbox"] = {**msg["inbox"], "to": target}
         return await self._on_send(physical)
@@ -4963,7 +5099,8 @@ class Server:
                         and isinstance(msg.get("payload"), dict)):
                     from work_lane_members import validate_members
                     payload = msg["payload"]
-                    members, _ = validate_members(payload.get("members"), payload.get("no_spec_reason"))
+                    members, _ = validate_members(payload.get("members"), payload.get("no_spec_reason"),
+                                                  derived=any(member.get("goal_id") for member in shown["members"]))
                     existing = set(shown["lane"]["members"])
                     specs = self.work_lanes.specs if self.work_lanes is not None else None
                     for identity in members:
@@ -4993,7 +5130,8 @@ class Server:
         if self.store is None:
             raise VerbError("unavailable", "report store is unavailable")
         auth = msg.get("_auth_context") or {}
-        if not (auth.get("service_authenticated") and auth.get("service_actor") == WORK_REPORT_READER):
+        service_reader = auth.get("service_authenticated") and auth.get("service_actor") == WORK_REPORT_READER
+        if not service_reader:
             self._work_lanes_reader(msg, require_inventory=False)
         report_id = msg.get("report_id")
         if any(not key.startswith("_") and key not in {
@@ -5010,9 +5148,39 @@ class Server:
             raise VerbError("unavailable", "report store is unavailable") from exc
         if report is None:
             raise VerbError("not_found", "no ingested report with this report_id")
-        return {"type": "work.report.get.ok", **{key: report.get(key) for key in (
+        response = {"type": "work.report.get.ok", **{key: report.get(key) for key in (
             "report_id", "status", "from_stream_id", "provenance_qualified_spec_ids", "created_at",
         )}}
+        # The dedicated reader may verify protected releases. Other metadata
+        # readers retain their original response, and opaque payload stays private.
+        extras = report.get("extras")
+        review = extras.get("qa_review") if isinstance(extras, dict) else None
+        if (service_reader and report.get("status") == "done"
+                and report.get("qa_verdict") in {"accept", "reject"}
+                and isinstance(report.get("target_sha"), str)
+                and re.fullmatch(r"[a-fA-F0-9]{40}", report["target_sha"])
+                and isinstance(report.get("session_generation"), str) and report["session_generation"].strip()
+                and isinstance(review, dict)
+                and review.get("candidate_identity") == report["target_sha"]
+                and isinstance(review.get("reviewed_scope"), str) and review["reviewed_scope"].strip()
+                and re.fullmatch(r"[a-f0-9]{64}", str(review.get("gate_evidence_digest") or ""))
+                and type(review.get("commission_msg_id")) is int and review["commission_msg_id"] >= 0):
+            # A self-described role or commission number is not a commission.
+            # Match the existing durable identity, including its captured generation.
+            commission = await self.store.submit(lambda conn: conn.execute(
+                "SELECT coordinator, spec_id, phase FROM v2_qa_commissions "
+                "WHERE reviewer=? AND generation=? AND msg_id=?",
+                (report["from_stream_id"], report["session_generation"], review["commission_msg_id"]),
+            ).fetchone())
+            qualified = report.get("provenance_qualified_spec_ids")
+            if (commission is not None and commission["coordinator"] != report["from_stream_id"]
+                    and isinstance(qualified, list) and commission["spec_id"] in qualified
+                    and commission["phase"] != "spec"):
+                response.update({key: report[key] for key in ("qa_verdict", "target_sha", "session_generation")})
+                response["qa_review"] = {key: review[key] for key in (
+                    "reviewed_scope", "candidate_identity", "gate_evidence_digest", "commission_msg_id",
+                )}
+        return response
 
     async def _on_work_owed(self, msg: dict[str, Any]) -> dict[str, Any]:
         self._work_lanes_reader(msg, require_inventory=False)
@@ -5040,22 +5208,22 @@ class Server:
         shown = await self.store.get_work_lane(lane_id) if lane_id else None
         if shown is None:
             raise VerbError("work_lane_not_found", "no first-class lane with that id")
-        from work_lanes_projection import project_lane, presence_index, _iso_now
-        rows = await self.store.work_lane_rows(include_done=True)
-        row = next((row for row in rows if row["lane_id"] == lane_id), None)
-        projected = None
-        if row is not None:
-            row.update(shown["lane"], _members=shown["members"])
-            open_sessions = presence_index(self.sessions.list_open())
-            questions = await self.work_lanes.questions_by_spec() if self.work_lanes is not None else None
-            projected = project_lane(row, open_sessions.get(str(row.get("bound_stream_id") or "")), _iso_now(),
-                                     all_members=True, sessions_by_stream=open_sessions,
-                                     questions_by_spec=questions)
-        return {"type": "work_lanes.show.ok", "lane": shown["lane"], "projection": projected,
-                "events": shown["events"], "updates": shown["updates"],
-                # Same shape as projected members, so the seat/question attribution shows here too.
-                "members": projected["members"] if projected is not None else shown["members"],
-                "work_index": await self.store.work_index_status()}
+        from work_lanes_projection import project_lane, presence_index, _iso_now, page_lane_detail
+        row = shown["_projection_row"]
+        if row is None:
+            raise VerbError("work_lane_not_found", "no first-class lane with that id")
+        open_sessions = presence_index(self.sessions.list_open())
+        questions = await self.work_lanes.questions_by_spec() if self.work_lanes is not None else None
+        projected = project_lane(row, open_sessions.get(str(row.get("bound_stream_id") or "")), _iso_now(),
+                                 all_members=True, sessions_by_stream=open_sessions,
+                                 worked_by_spec=self.work_lanes.worked.values if self.work_lanes is not None else None,
+                                 questions_by_spec=questions)
+        try:
+            return page_lane_detail(shown, projected, members_limit=msg.get("members_limit", 32),
+                                    members_after=msg.get("members_after"), goal_filter=msg.get("goal_id"),
+                                    sessions_by_stream=open_sessions, questions_by_spec=questions)
+        except ValueError as exc:
+            raise VerbError(str(exc), "invalid lane detail request or oversized source projection") from None
 
     async def _on_work_lanes_adopt_preview(self, msg: dict[str, Any]) -> dict[str, Any]:
         self._work_lanes_reader(msg)
@@ -5371,15 +5539,16 @@ class Server:
         sent_chunks = False
         try:
             while remaining > 0 and page_size > 0:
-                query_limit = page_size + (1 if remaining > page_size else 0)
+                quota = min(page_size, remaining)
+                query_limit = quota + (1 if remaining > quota else 0)
                 rows = await self.store.fetch_session_event_page(
                     stream_id,
                     before_daemon_seq=cursor,
                     limit=query_limit,
                     **({"generation": generation} if generation is not None else {}),
                 )
-                has_more = remaining > page_size and len(rows) > page_size
-                page = rows[-page_size:] if has_more else rows[:page_size]
+                has_more = remaining > quota and len(rows) > quota
+                page = rows[-quota:] if has_more else rows[:quota]
                 if not page:
                     break
 
@@ -5531,7 +5700,9 @@ class Server:
         auth = msg.get("_auth_context") if isinstance(msg.get("_auth_context"), dict) else {}
         caller_stream_id = str(auth.get("stream_id") or "").strip()
         claimed_stream_id = str(msg.get("from_stream_id") or msg.get("actor_stream_id") or "").strip()
-        operator_authenticated = bool(auth.get("operator_authenticated"))
+        operator_authenticated = bool(auth.get("operator_authenticated")
+            and not auth.get("token_verified") and not auth.get("scoped_principal")
+            and not auth.get("stream_id") and auth.get("operator_principal"))
         expired_self_close = False
         if auth.get("reason_code") == TOKEN_REASON_EXPIRED and self.store is not None:
             token = msg.get("stream_token")
@@ -5556,7 +5727,6 @@ class Server:
         close_kind = "session_close"
         coordinator_authorized = False
         manager_generation: str | None = None
-        fd_generation: str | None = None
         ruling_manager_close = (
             self.lane_rulings is not None
             and msg.get("_ruling_release") is self.lane_rulings
@@ -5580,19 +5750,12 @@ class Server:
                 if operator_authenticated:
                     close_kind = "operator_close"
                 elif await self.sessions.assistant.manager_holds(auth):
-                    # Fenced to the generation read now; every lifecycle fence
-                    # is re-checked under the lifecycle lock before any kill.
+                    # The current FD binding (or legacy holder), fenced to the
+                    # generation read now; every lifecycle fence and the
+                    # principal are re-checked under the lifecycle and graph
+                    # locks before any kill.
                     manager_generation = expected_generation or self._manager_target_generation(target)
                     close_kind = "manager_close"
-                elif await self._fd_close_caller(auth):
-                    fd_generation = expected_generation or self._manager_target_generation(target)
-                    try:
-                        await self._fd_close_fences(msg, auth, target_stream_id, target, fd_generation)
-                    except Exception as exc:
-                        await self._fd_close_audit(msg, auth, target_stream_id, fd_generation,
-                                                   "refused" if isinstance(exc, VerbError) else "failed",
-                                                   getattr(exc, "code", "fd_close_failed"))
-                        raise
                 else:
                     # A seat token proves only that seat's identity. Visibility
                     # and a caller-supplied confirmation bit do not promote it
@@ -5606,12 +5769,14 @@ class Server:
                         "close_unauthorized",
                         "close requires a verified self, direct-parent, or authenticated operator",
                     )
+            elif (self.sessions.assistant.front_desk_mode and not operator_authenticated
+                  and await self.sessions.assistant.manager_holds(auth)):
+                # The current FD closing its own child takes the one FD close
+                # path; parentage never narrows FD-held authority or its fences.
+                manager_generation = expected_generation or self._manager_target_generation(target)
+                close_kind = "manager_close"
             else:
                 coordinator_authorized = True
-        if coordinator_authorized and msg.get("operator_confirm") is True:
-            # The existing explicit parent-authorized operator route is an
-            # involuntary close. A self-supplied flag never acquires it.
-            close_kind = "operator_close"
         claim_verified: str | None = None
         claim_mismatch: dict[str, Any] | None = None
         if isinstance(msg.get("ac_claim"), dict) and self.ledger is not None:
@@ -5624,12 +5789,7 @@ class Server:
         if self.lane_rulings is not None and msg.get("_ruling_release") is not self.lane_rulings:
             target_row = await self.store.fetch_session(host, name)
             target_generation = str((target_row or {}).get("session_generation") or "")
-            pinned_generation = manager_generation or fd_generation
-            if target_generation and pinned_generation is not None and target_generation != pinned_generation:
-                if fd_generation is not None:
-                    await self._fd_close_audit(msg, auth, target_stream_id, fd_generation,
-                                               "refused", "lifecycle_generation_mismatch")
-                    raise VerbError("lifecycle_generation_mismatch", "FD target generation changed before ruling")
+            if target_generation and manager_generation is not None and target_generation != manager_generation:
                 await self._manager_audit("close", msg, auth, target_stream_id, target_generation,
                                           result="refused", refusal_code="lifecycle_generation_mismatch")
                 raise VerbError("lifecycle_generation_mismatch", "manager target generation changed before ruling")
@@ -5640,14 +5800,8 @@ class Server:
                         target_generation=target_generation, auth=auth,
                     )
                 except ValueError as exc:
-                    if fd_generation is not None:
-                        await self._fd_close_audit(msg, auth, target_stream_id, fd_generation,
-                                                   "refused", str(exc))
                     raise VerbError(str(exc), str(exc)) from exc
                 if ruling_hold is not None:
-                    if fd_generation is not None:
-                        await self._fd_close_audit(msg, auth, target_stream_id, fd_generation,
-                                                   "refused", "close_pending_ruling")
                     return ruling_hold
         defer_if_working = bool(msg.get("defer_if_working"))
         if expired_self_close:
@@ -5655,9 +5809,7 @@ class Server:
         elif close_kind == "operator_close" and not coordinator_authorized:
             actor_kind, auth_kind = "operator", "operator_authenticated"
         elif close_kind == "manager_close":
-            actor_kind, auth_kind = "manager", "token_verified"
-        elif fd_generation is not None:
-            actor_kind, auth_kind = "front_desk", "token_verified"
+            actor_kind, auth_kind = self.sessions.assistant.manager_kind, "token_verified"
         elif coordinator_authorized:
             actor_kind, auth_kind = "parent", "token_verified"
         else:
@@ -5674,12 +5826,17 @@ class Server:
             "request_id": str(msg.get("request_id") or ""),
             "defer_if_working": defer_if_working,
         }
-        if manager_generation is not None or fd_generation is not None:
+        if manager_generation is not None:
             # Live panes require fresh idle proof. Initially offline peers may
             # record a generation-fenced retirement intent, never claimed death.
-            expected_generation = manager_generation or fd_generation
+            expected_generation = manager_generation
             defer_if_working = False
             attribution["defer_if_working"] = False
+        fd_busy_override = bool(
+            manager_generation is not None and self.sessions.assistant.front_desk_mode
+            and msg.get("force") is True
+            and self.sessions.assistant.manager_request_code(msg) is None
+            and isinstance(target, dict) and target.get("parent_stream_id") == caller_stream_id)
         close = functools.partial(
             self.sessions.close,
             host,
@@ -5688,27 +5845,26 @@ class Server:
             expected_generation=expected_generation,
             close_kind=close_kind,
             requires_idle=bool(msg.get("requires_idle") or msg.get("reap"))
-            or manager_generation is not None or fd_generation is not None,
+            or manager_generation is not None,
             operator_override=bool(msg.get("operator_override"))
             and (operator_authenticated or coordinator_authorized)
-            and manager_generation is None and fd_generation is None,
+            and manager_generation is None,
             operator_confirm=msg.get("operator_confirm") is True
-            and manager_generation is None and fd_generation is None,
+            and manager_generation is None,
             defer_if_working=defer_if_working,
             attribution=attribution,
+            # Only an explicit own-busy-child force request may use recovery;
+            # ordinary FD closes use the same disposition guard as parents.
+            busy_override_recovery=fd_busy_override,
             admission_guard=(
-                (lambda row: self._fd_close_admission(msg, auth, target_stream_id, row, fd_generation))
-                if fd_generation is not None else
                 (lambda row: self._seat_close_admission(auth, caller_stream_id, target_stream_id, row))
                 if manager_generation is None and auth.get('token_verified')
                 else None if manager_generation is None
-                else lambda row: self._manager_close_admission(msg, host, name, row, manager_generation, auth)
+                else lambda row: self._manager_close_admission(msg, host, name, row, manager_generation, auth,
+                    busy_override=fd_busy_override)
             ),
         )
-        if fd_generation is not None:
-            result = await _finish_despite_cancel(
-                self._fd_close_locked(close, msg, auth, target_stream_id, fd_generation))
-        elif manager_generation is None:
+        if manager_generation is None:
             result = await close()
         else:
             # The grant cannot change between the manager's admission, the kill
@@ -5751,76 +5907,6 @@ class Server:
             **_claim_wire_fields(claim_verified, claim_mismatch),
         }
 
-    async def _fd_close_caller(self, auth: dict[str, Any]) -> bool:
-        """The effective primary FD binding, at its verified open generation."""
-        composite = self.assistant_composite
-        if (auth.get("token_verified") is not True or composite is None
-                or not composite.enabled or not composite.env_config.direct_primary):
-            return False
-        try:
-            binding = await self.store.get_assistant_binding(
-                env_binding=composite._env_binding(), name=composite.env_config.name)
-            if (auth.get("stream_id"), auth.get("session_generation")) != (
-                    binding.get("stream_id"), binding.get("generation")) or not binding.get("generation"):
-                return False
-            actor = await self.store.fetch_session(*self.sessions.split(binding["stream_id"]))
-            return bool(actor and actor.get("status") == "open"
-                        and actor.get("session_generation") == binding["generation"])
-        except Exception:  # unreadable authority grants nothing
-            return False
-
-    async def _fd_close_fences(self, msg, auth, target, row, generation):
-        if not await self._fd_close_caller(auth):
-            raise VerbError("fd_close_authority_required", "current bound FD generation required")
-        if code := self.sessions.assistant.manager_request_code(msg):
-            raise VerbError(code, "FD close requires an explicit directive reason and request id")
-        if str((row or {}).get("session_generation") or "") != generation:
-            raise VerbError("lifecycle_generation_mismatch", "FD target generation changed")
-        if row.get("status") == "closed":
-            return  # Receipt only; Sessions preserves generation-fenced repeat semantics.
-        self.sessions.assistant.guard_close(row, "session_close")
-        if (row.get("status") != "open" or row.get("parent_stream_id")
-                or row.get("handoff_from_stream_id")
-                or (row.get("visibility") or "default") not in {"default", "visible"}):
-            raise VerbError("close_unauthorized",
-                            "close requires a verified self, direct-parent, or authenticated operator")
-        # All ownership mutations share Sessions' graph fence. An unavailable
-        # authoritative read propagates before admission; it cannot grant close.
-        for lane in await self.store.work_lane_rows():
-            if lane.get("owner_kind") == "operator" and target in {
-                    lane.get("bound_stream_id"), lane.get("visible_chat_stream_id")}:
-                raise VerbError("close_operator_lane_protected", "open operator-owned lane requires its own close confirmation")
-
-    async def _fd_close_admission(self, msg, auth, target, row, generation):
-        # Runs under lifecycle + graph locks, held through the existing kill
-        # ladder. Rebind, transfer and lane mutations cannot cross this fence.
-        await self._fd_close_fences(msg, auth, target, row, generation)
-        if row.get("status") != "closed":
-            await self._fd_close_audit(msg, auth, target, generation, "admitted")
-
-    async def _fd_close_audit(self, msg, auth, target, generation, result, code=None):
-        revision = (await self.store.lifecycle_authority_current())["revision"]
-        await self.store.lifecycle_authority_audit(
-            action="fd_close", actor_kind="front_desk", actor_identity=auth.get("stream_id"),
-            actor_generation=auth.get("session_generation"), target_stream_id=target,
-            target_generation=generation, old_revision=revision, new_revision=revision,
-            reason=msg.get("reason"), request_id=msg.get("request_id"), result=result, refusal_code=code)
-
-    async def _fd_close_locked(self, close, msg, auth, target, generation):
-        try:
-            result = await close()
-        except Exception as exc:
-            await self._fd_close_audit(msg, auth, target, generation,
-                                       "refused" if isinstance(exc, VerbError) else "failed",
-                                       getattr(exc, "code", "fd_close_failed"))
-            raise
-        applied = not (result.get("failed") or result.get("deferred")
-                       or result.get("already_closed") or result.get("stale_generation"))
-        await self._fd_close_audit(msg, auth, target, generation,
-                                   "applied" if applied else "failed" if result.get("failed") else "refused",
-                                   None if applied else str(result.get("reason") or "close_not_applied")[:200])
-        return result
-
     async def _seat_close_admission(self, auth, caller, target, row):
         # Runs after acquiring the target lifecycle and graph locks, directly
         # before termination. Admission-time parentage is only an observation.
@@ -5853,11 +5939,12 @@ class Server:
 
     async def _manager_audit(self, action: str, msg: dict[str, Any], auth: dict[str, Any],
                              target: str, generation: str | None, *, result: str,
-                             refusal_code: str | None = None, actor_kind: str = "manager") -> None:
-        """Audit a lifecycle action under the grant revision current at write time.
+                             refusal_code: str | None = None, actor_kind: str | None = None) -> None:
+        """Audit a lifecycle action under the policy revision current at write time.
 
         Only the server-verified seat identity is recorded, never wire claims.
         """
+        actor_kind = actor_kind or self.sessions.assistant.manager_kind
         revision = (await self.store.lifecycle_authority_current())["revision"]
         await self.store.lifecycle_authority_audit(
             action=f"manager_{action}", actor_kind=actor_kind,
@@ -5892,28 +5979,48 @@ class Server:
             code = "lifecycle_target_unavailable"
         elif generation != expected_generation:
             code = "lifecycle_generation_mismatch"
+        elif action == "close" and target.get("status") == "closed":
+            return False  # Receipt only; Sessions keeps generation-fenced repeat semantics.
         if code is None:
             children = await self.sessions._live_children(sid)
             pending = await self.sessions._pending_child_spawns(sid)
             code = await self.sessions.assistant.manager_fences(
                 target, generation, msg, children=children, pending_spawns=pending,
                 allow_unavailable=action == "close")
+        if code is None and action == "close" and str((target or {}).get("status") or "") == "open":
+            # Closing a seat never closes an operator lane; that keeps its own
+            # confirmation. An unavailable authoritative read propagates.
+            if await self._operator_lane_protects(sid):
+                code = "close_operator_lane_protected"
         if code is not None:
             await self._manager_audit(action, msg, auth, sid, generation, result="refused", refusal_code=code)
             raise VerbError(code, f"manager {action} refused: {code}")
         return await self.store.find_report(
             sid, statuses=INSPECT_TERMINAL_STATUSES, session_generation=generation) is None
 
+    async def _operator_lane_protects(self, sid: str) -> bool:
+        return any(lane.get("owner_kind") == "operator" and sid in {
+            lane.get("bound_stream_id"), lane.get("visible_chat_stream_id")}
+            for lane in await self.store.work_lane_rows())
+
     async def _manager_close_admission(
         self, msg: dict[str, Any], host: str, name: str, row: dict[str, Any] | None,
-        expected_generation: str, auth: dict[str, Any],
+        expected_generation: str, auth: dict[str, Any], *, busy_override: bool = False,
     ) -> None:
         waived = await self._manager_lifecycle_fences("close", msg, host, name, row, auth, expected_generation)
+        if (row or {}).get("status") == "closed":
+            return
+        if busy_override and (row or {}).get("parent_stream_id") != auth.get("stream_id"):
+            await self._manager_audit("close", msg, auth, f"{host}:{name}", expected_generation,
+                                      result="refused", refusal_code="close_unauthorized")
+            raise VerbError("close_unauthorized", "FD busy override requires its own child")
         if waived:
             await self._manager_audit("close_report_waived", msg, auth, f"{host}:{name}",
                                       expected_generation, result="admitted")
         # Durable attribution precedes the effect: an audit failure refuses the close.
         await self._manager_audit("close", msg, auth, f"{host}:{name}", expected_generation, result="admitted")
+        if self.sessions.assistant.front_desk_mode and (row or {}).get("status") == "open":
+            await self.store.front_desk_disposition_custody(f"{host}:{name}", expected_generation)
 
     async def _on_assistant_lifecycle(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Operator designate/revoke and holder transfer of lifecycle authority."""
@@ -5923,6 +6030,7 @@ class Server:
             if not (auth.get("operator_authenticated") or auth.get("token_verified") or (auth.get("peer_loopback") and auth.get("local_admin_verified"))):
                 raise VerbError("authentication_required", "lifecycle inspect requires an authenticated caller")
             reply = {"type": "assistant.lifecycle.ok", "action": "inspect",
+                     "effective": await self.store.lifecycle_authority_effective(),
                      "grant": await self.store.lifecycle_authority_current(),
                      "audit": await self.store.lifecycle_authority_audit_rows(limit=20)}
             target = str(msg.get("target_stream_id") or "").strip()

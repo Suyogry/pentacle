@@ -11,6 +11,15 @@ export type WorkLaneUpdateKind =
   | 'major_decision' | 'lane_started' | 'lane_completed' | 'lane_blocked' | 'lane_unblocked' | 'milestone';
 
 export const WORK_LANE_OPEN_STATES: readonly WorkLaneState[] = ['active', 'paused', 'blocked'];
+/** Keys in lane_icons.json; its ordered keyword table is the resolver authority. */
+export const LANE_ICON_KEYS = [
+  'pentacle', 'flask', 'cube', 'phone', 'bot', 'bug', 'truck', 'wrench', 'columns', 'rocket',
+  'hammer', 'eye', 'camera', 'cursor', 'home', 'book', 'chart', 'shield', 'key', 'leaf',
+] as const;
+export type LaneIconKey = typeof LANE_ICON_KEYS[number];
+/** Ordered keys mirror the canonical lane_hues.json; parity is tested. */
+export const LANE_HUE_KEYS = ['violet', 'cyan', 'yellow', 'pink', 'mint', 'purple', 'sky', 'lime', 'magenta', 'aqua', 'sand', 'orchid', 'teal', 'rose', 'lavender', 'chartreuse'] as const;
+export type LaneHueKey = typeof LANE_HUE_KEYS[number];
 export const WORK_LANE_UPDATE_KINDS: readonly WorkLaneUpdateKind[] = [
   'major_decision', 'lane_started', 'lane_completed', 'lane_blocked', 'lane_unblocked', 'milestone',
 ];
@@ -49,8 +58,16 @@ export type WorkLaneSeat = {
   last_activity: string | null;
 };
 
+export type WorkLaneGoalProgress = { state: 'not_started' | 'in_progress' | 'done'; done: number; total: number };
+export type WorkLaneGoal = WorkLaneGoalProgress & {
+  goal_id: string; title: string; rank: number; target_date?: string; icon?: LaneIconKey | null;
+};
+
 export type WorkLaneMember = {
+  /** Optional released policy fields survive normalization, including retired fields. */
+  [key: string]: unknown;
   spec_id: string;
+  goal_id?: string | null;
   title: string | null;
   status: string | null;
   terminal: 'completed' | 'deprecated' | null;
@@ -60,6 +77,29 @@ export type WorkLaneMember = {
   estimate_exempt: boolean;
   status_text: string | null;
   next_action_text: string | null;
+  progress_text?: string | null;
+  blockers_text?: string | null;
+  checkpoint_state?: 'valid' | 'invalid' | 'unverifiable' | null;
+  checkpoint_deficiencies?: Array<{ field: string; code: string; fix: string }>;
+  checkpoint_revision?: string | null;
+  checkpoint_policy_revision?: string | null;
+  checkpoint_changed_at?: string | null;
+  checkpoint_first_observed_at?: string | null;
+  goal_text?: string | null;
+  goal_text_truncated?: boolean;
+  status_line?: string | null;
+  next_line?: string | null;
+  worked?: {
+    elapsed_h: number | null; censored: boolean; active_h: number | null;
+    seats: number; qa_rounds: number; as_of: string;
+  } | null;
+  lead_seat?: {
+    stream_id: string; host: string; provider: string | null;
+    activity: WorkLaneSeat['activity']; eta_at: string | null; active_step: string | null;
+  } | null;
+  /** Detail-only facts from work_lanes.show, in source order. */
+  criteria?: Array<{ title: string; disposition: 'open' | 'done' | 'waived' | 'tracked' | 'parked' }>;
+  transitions?: Array<{ status: string; at: string }>;
   source_changed_at: string | null;
   observation: { quality: string | null; observed_at: string | null; error: string | null } | null;
   /** Additive attribution; empty/zero from a daemon that predates it. */
@@ -72,6 +112,7 @@ export type WorkLaneMember = {
 export type WorkLaneProgress = {
   members: WorkLaneMember[];
   members_total: number | null;
+  members_next?: string | null;
   no_spec_reason: string | null;
   items_total: number | null;
   items_completed: number | null;
@@ -96,8 +137,16 @@ export type WorkIndexStatus = {
 };
 
 export type WorkLane = {
+  visibility_counts?: Record<string, unknown>;
+  selected_goal?: WorkLaneGoal & Record<string, unknown>;
   lane_id: string;
+  goals?: WorkLaneGoal[];
+  goals_total?: number;
+  default_goal?: WorkLaneGoalProgress | null;
+  detail_revision?: string | null;
   title: string;
+  icon?: LaneIconKey | null;
+  hue?: LaneHueKey | null;
   summary: string;
   state: WorkLaneState;
   state_reason: string | null;
@@ -197,6 +246,25 @@ function normalizeRange(raw: unknown): { p25: number; p75: number; median: numbe
 }
 
 const SEAT_ACTIVITY = new Set(['working', 'idle', 'offline', 'unknown']);
+const CRITERION_DISPOSITIONS = new Set(['open', 'done', 'waived', 'tracked', 'parked']);
+
+function normalizeWorked(raw: unknown): WorkLaneMember['worked'] {
+  if (!isRec(raw) || !nonEmpty(raw.as_of)) return null;
+  return {
+    elapsed_h: finite(raw.elapsed_h), censored: raw.censored === true, active_h: finite(raw.active_h),
+    seats: finite(raw.seats) ?? 0, qa_rounds: finite(raw.qa_rounds) ?? 0, as_of: raw.as_of as string,
+  };
+}
+
+function normalizeLeadSeat(raw: unknown): WorkLaneMember['lead_seat'] {
+  if (!isRec(raw) || !nonEmpty(raw.stream_id) || !nonEmpty(raw.host)) return null;
+  return {
+    stream_id: raw.stream_id as string, host: raw.host as string, provider: str(raw.provider),
+    activity: typeof raw.activity === 'string' && SEAT_ACTIVITY.has(raw.activity)
+      ? raw.activity as WorkLaneSeat['activity'] : 'unknown',
+    eta_at: str(raw.eta_at), active_step: str(raw.active_step),
+  };
+}
 
 function normalizeSeat(raw: unknown): WorkLaneSeat | null {
   if (!isRec(raw)) return null;
@@ -210,6 +278,31 @@ function normalizeSeat(raw: unknown): WorkLaneSeat | null {
   };
 }
 
+const goalId = (value: unknown): string | null =>
+  typeof value === 'string' && /^g_[0-9a-f]{24}$/.test(value) ? value : null;
+const count = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 2147483647 ? value : null;
+
+function normalizeGoalProgress(raw: unknown): WorkLaneGoalProgress | null {
+  if (!isRec(raw) || !['not_started', 'in_progress', 'done'].includes(raw.state as string)) return null;
+  const done = count(raw.done), total = count(raw.total);
+  if (done === null || total === null || done > total) return null;
+  return { state: raw.state as WorkLaneGoalProgress['state'], done, total };
+}
+
+function normalizeGoal(raw: unknown): WorkLaneGoal | null {
+  if (!isRec(raw)) return null;
+  const progress = normalizeGoalProgress(raw), id = goalId(raw.goal_id), rank = count(raw.rank);
+  if (!progress || !id || typeof raw.title !== 'string' || rank === null) return null;
+  const date = typeof raw.target_date === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(raw.target_date)
+    && raw.target_date.slice(0, 4) !== '0000' && Number.isFinite(Date.parse(raw.target_date))
+    && new Date(raw.target_date).toISOString().slice(0, 10) === raw.target_date ? raw.target_date : null;
+  return { ...progress, goal_id: id, title: raw.title, rank,
+    ...(date ? { target_date: date } : {}),
+    ...('icon' in raw ? { icon: typeof raw.icon === 'string' && LANE_ICON_KEYS.includes(raw.icon as LaneIconKey)
+      ? raw.icon as LaneIconKey : null } : {}) };
+}
+
 function normalizeMember(raw: unknown): WorkLaneMember | null {
   if (!isRec(raw)) return null;
   const specId = nonEmpty(raw.spec_id);
@@ -220,7 +313,11 @@ function normalizeMember(raw: unknown): WorkLaneMember | null {
   const seats = (Array.isArray(raw.seats) ? raw.seats : []).map(normalizeSeat).filter((s): s is WorkLaneSeat => s !== null);
   const questions = isRec(raw.open_questions) ? raw.open_questions : {};
   return {
+    // Policy fields are additive and optional; orchestration does not maintain
+    // a second executable field list. Known base fields keep their normalizers.
+    ...raw,
     spec_id: specId,
+    goal_id: goalId(raw.goal_id),
     title: str(raw.title),
     status: str(raw.status),
     terminal: raw.terminal === 'completed' || raw.terminal === 'deprecated' ? raw.terminal : null,
@@ -230,6 +327,15 @@ function normalizeMember(raw: unknown): WorkLaneMember | null {
     estimate_exempt: raw.estimate_exempt === true,
     status_text: str(raw.status_text),
     next_action_text: str(raw.next_action_text),
+    status_line: str(raw.status_line), next_line: str(raw.next_line),
+    worked: normalizeWorked(raw.worked), lead_seat: normalizeLeadSeat(raw.lead_seat),
+    ...(Array.isArray(raw.criteria) ? { criteria: raw.criteria.flatMap((item) =>
+      isRec(item) && typeof item.title === 'string' && typeof item.disposition === 'string'
+        && CRITERION_DISPOSITIONS.has(item.disposition)
+        ? [{ title: item.title, disposition: item.disposition as 'open' | 'done' | 'waived' | 'tracked' | 'parked' }] : []) } : {}),
+    ...(Array.isArray(raw.transitions) ? { transitions: raw.transitions.flatMap((item) =>
+      isRec(item) && typeof item.status === 'string' && typeof item.at === 'string'
+        ? [{ status: item.status, at: item.at }] : []) } : {}),
     source_changed_at: str(raw.source_changed_at),
     observation: obs ? { quality: str(obs.quality), observed_at: str(obs.observed_at), error: str(obs.error) } : null,
     seats: seats,
@@ -246,6 +352,7 @@ function normalizeProgress(raw: Rec): WorkLaneProgress | null {
   return {
     members: (Array.isArray(raw.members) ? raw.members : []).map(normalizeMember).filter((m): m is WorkLaneMember => m !== null),
     members_total: finite(raw.members_total),
+    members_next: str(raw.members_next),
     no_spec_reason: str(raw.no_spec_reason),
     items_total: finite(raw.items_total),
     items_completed: finite(raw.items_completed),
@@ -281,7 +388,17 @@ function normalizeLane(raw: unknown): WorkLane | null {
   const last = raw.last_update;
   return {
     lane_id: laneId,
+    ...(isRec(raw.visibility_counts) ? { visibility_counts: raw.visibility_counts } : {}),
+    ...(isRec(raw.selected_goal) && normalizeGoal(raw.selected_goal)
+      ? { selected_goal: { ...raw.selected_goal, ...normalizeGoal(raw.selected_goal)! } } : {}),
+    goals: (Array.isArray(raw.goals) ? raw.goals : []).map(normalizeGoal).filter((goal): goal is WorkLaneGoal => goal !== null),
+    goals_total: count(raw.goals_total) ?? 0,
+    default_goal: normalizeGoalProgress(raw.default_goal),
+    detail_revision: typeof raw.detail_revision === 'string' && /^[0-9a-f]{64}$/.test(raw.detail_revision)
+      ? raw.detail_revision : null,
     title: str(raw.title) ?? '',
+    icon: typeof raw.icon === 'string' && LANE_ICON_KEYS.includes(raw.icon as LaneIconKey) ? raw.icon as LaneIconKey : null,
+    hue: typeof raw.hue === 'string' && LANE_HUE_KEYS.includes(raw.hue as LaneHueKey) ? raw.hue as LaneHueKey : null,
     summary: str(raw.summary) ?? '',
     state,
     state_reason: str(raw.state_reason),

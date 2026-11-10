@@ -1,167 +1,43 @@
 'use strict';
-
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
 const test = require('node:test');
-const {
-  artifactKey,
-  listLocalArtifacts,
-  normalizeHubIndex,
-  safeBundleEntry,
-  slug,
-} = require('../main/ui_review_artifacts');
-
-function tempRoot() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'pentacle-ui-review-'));
-}
-
-test('slug and artifactKey normalize machine-safe identifiers', () => {
-  assert.equal(slug(' Example Mobile / Chat '), 'example-mobile-chat');
-  assert.equal(artifactKey('Example Mobile', 'Mobile Chat/Options', 'hostc'), 'example-mobile/mobile-chat-options/hostc');
-  assert.equal(artifactKey('', 'x', 'hostc'), null);
+const assert = require('node:assert/strict');
+const { JSDOM } = require('jsdom');
+const library = require('../vendor/dashboard-library/dist/dashboard-library.js');
+const item = { id: 'home', title: 'Home', kind: 'view', entry: 'mobile/Home.html', surface: 'mobile', approval_ref: null, compatibility: { status: 'offline-interactive', reason: 'Verified offline' }, screenshots: [{ name: 'Home', path: 'screenshots/home.png' }], prototype: true };
+const catalog = { schema: 'design-catalog.v1', authority: 'Claude Design', projects: ['example', 'sample', 'demo'].map(id => ({ id, title: id, sync: 'verified', revision_id: 'a'.repeat(64), revisions: [], manifest: { title: id, revision_id: 'a'.repeat(64), source_revision: 'source-v1', complete: true, views: [item], flows: [] } })) };
+test('shared gallery preserves selection on refresh and isolates prototype documents', async () => {
+  const dom = new JSDOM('<main></main>', { url: 'https://app.example.test/designs/' });
+  const refs = library.mountGallery(dom.window.document.querySelector('main'), { fetch: async () => ({ ok: true, json: async () => ({ document: '<h1>Prototype</h1>' }) }) });
+  library.updateGallery(refs, catalog);
+  assert.equal(refs.root.querySelectorAll('[data-project]').length, 3);
+  refs.root.querySelector('[data-project="sample"]').click();
+  assert.equal(refs.state.project, 'sample');
+  [...refs.root.querySelectorAll('.dg-modes button')].find(b => b.textContent === 'Prototype').click();
+  await new Promise(resolve => setImmediate(resolve));
+  const frame = refs.root.querySelector('iframe'); assert.ok(frame); assert.equal(frame.getAttribute('sandbox'), 'allow-scripts'); assert.equal(frame.getAttribute('referrerpolicy'), 'no-referrer'); assert.equal(frame.srcdoc, '<h1>Prototype</h1>');
+  library.updateGallery(refs, structuredClone(catalog)); assert.equal(refs.root.querySelector('iframe'), frame, 'poll refresh must not reload a running prototype');
+  assert.match(refs.root.querySelector('.dg-details').textContent, /Claude Design is the design source of truth/);
+  library.unmountGallery(refs); assert.equal(dom.window.document.querySelector('iframe'), null); dom.window.close();
 });
-
-test('safeBundleEntry rejects path traversal and absolute paths', () => {
-  const root = tempRoot();
-  fs.writeFileSync(path.join(root, 'index.html'), '<html></html>');
-
-  assert.equal(safeBundleEntry(root, 'index.html'), path.join(root, 'index.html'));
-  assert.equal(safeBundleEntry(root, '../secret.html'), null);
-  assert.equal(safeBundleEntry(root, '/tmp/secret.html'), null);
+test('gallery renders empty, search and unavailable mode states without inventing approval', () => {
+  const dom = new JSDOM('<main></main>', { url: 'https://app.example.test/designs/' });
+  const refs = library.mountGallery(dom.window.document.querySelector('main'), { fetch: async () => ({ ok: false }) });
+  library.updateGallery(refs, { schema: 'design-catalog.v1', projects: [] }); assert.match(refs.root.textContent, /library is empty/);
+  library.updateGallery(refs, catalog); assert.match(refs.root.querySelector('.dg-details').textContent, /Mirror \/ candidate/);
+  const input = refs.root.querySelector('input'); input.value = 'absent'; input.dispatchEvent(new dom.window.Event('input')); assert.match(refs.root.querySelector('.dg-items').textContent, /No matching/);
+  [...refs.root.querySelectorAll('.dg-modes button')].find(b => b.textContent === 'Flow video').click(); assert.match(refs.root.querySelector('.dg-stage').textContent, /No flow video/);
+  library.unmountGallery(refs); dom.window.close();
 });
-
-test('listLocalArtifacts reads manifest bundles and legacy HTML fallback', () => {
-  const root = tempRoot();
-  const repo = path.join(root, 'example-mobile');
-  const reviewDir = path.join(repo, '.ui-review', 'mobile-chat-options');
-  const legacyDir = path.join(repo, 'test', 'artifacts');
-  fs.mkdirSync(reviewDir, { recursive: true });
-  fs.mkdirSync(legacyDir, { recursive: true });
-  fs.writeFileSync(path.join(reviewDir, 'index.html'), '<title>Options</title>');
-  fs.writeFileSync(path.join(reviewDir, 'manifest.json'), JSON.stringify({
-    schema: 'pentacle.uiReview.v1',
-    id: 'mobile-chat-options',
-    repo: 'example-mobile',
-    title: 'Mobile Chat Options',
-    entry: 'index.html',
-    createdAt: '2026-04-27T00:00:00Z',
-    tags: ['mobile', 'chat'],
-    extraField: 'preserve me',
-  }));
-  fs.writeFileSync(path.join(legacyDir, 'legacy.html'), '<title>Legacy QA</title>');
-
-  const result = listLocalArtifacts({ repoRoots: [root], artifactDirs: [] }, 'hostc');
-  assert.equal(result.source, 'local-fallback');
-  assert.equal(result.artifacts.length, 2);
-  const manifestArtifact = result.artifacts.find((item) => item.artifactKey === 'example-mobile/mobile-chat-options/hostc');
-  assert.ok(manifestArtifact);
-  assert.equal(manifestArtifact.source.manifest.extraField, 'preserve me');
-  assert.ok(result.artifacts.some((item) => item.title === 'Legacy QA'));
+test('saved History reload fetches the retained manifest before displaying revision content', async () => {
+  const dom = new JSDOM('<main></main>', { url: 'https://app.example.test/designs/' }), old = 'b'.repeat(64);
+  const data = structuredClone(catalog); data.projects[0].revisions = [{ revision_id: old, source_revision: 'old-A', complete: true }];
+  data.projects[0].manifest.views[0].title = 'Current B';
+  dom.window.sessionStorage.setItem('design-gallery.selection', JSON.stringify({ project: 'example', revision: old, item: 'home', kind: 'views', mode: 'screens' }));
+  let resolve, requested; const pending = new Promise(done => { resolve = done; });
+  const refs = library.mountGallery(dom.window.document.querySelector('main'), { fetch: url => { requested = url; return pending; } }); library.updateGallery(refs, data);
+  assert.equal(refs.root.querySelector('h1').textContent.includes('Current B'), false, 'must not show current while the older History choice is pending');
+  const retained = structuredClone(data.projects[0].manifest); retained.revision_id = old; retained.project_id = 'example'; retained.views[0].title = 'Retained A';
+  resolve({ ok: true, json: async () => retained }); await new Promise(done => setImmediate(done));
+  assert.equal(requested, '/api/designs/example/' + old); assert.equal(refs.root.querySelector('h1').textContent, 'Retained A'); assert.ok(refs.root.querySelector('img').src.includes('/' + old + '/')); assert.equal(refs.root.querySelector('[aria-label="History"]').value, old);
+  library.unmountGallery(refs); dom.window.close();
 });
-
-test('listLocalArtifacts skips unsafe manifests without blocking valid artifacts', () => {
-  const root = tempRoot();
-  const repo = path.join(root, 'demo-repo');
-  const valid = path.join(repo, '.ui-review', 'valid');
-  const invalid = path.join(repo, '.ui-review', 'invalid');
-  fs.mkdirSync(valid, { recursive: true });
-  fs.mkdirSync(invalid, { recursive: true });
-  fs.writeFileSync(path.join(valid, 'index.html'), '<html></html>');
-  fs.writeFileSync(path.join(valid, 'manifest.json'), JSON.stringify({
-    schema: 'pentacle.uiReview.v1',
-    id: 'valid',
-    repo: 'demo-repo',
-    title: 'Valid',
-    entry: 'index.html',
-    createdAt: '2026-04-27T00:00:00Z',
-  }));
-  fs.writeFileSync(path.join(invalid, 'manifest.json'), JSON.stringify({
-    schema: 'pentacle.uiReview.v1',
-    id: 'invalid',
-    repo: 'demo-repo',
-    title: 'Invalid',
-    entry: '../escape.html',
-  }));
-
-  const result = listLocalArtifacts({ repoRoots: [root], artifactDirs: [] }, 'hostc');
-  assert.deepEqual(result.artifacts.map((item) => item.id), ['valid']);
-});
-
-test('listLocalArtifacts rejects missing createdAt and symlink entries', () => {
-  const root = tempRoot();
-  const repo = path.join(root, 'demo-repo');
-  const missingCreatedAt = path.join(repo, '.ui-review', 'missing-created-at');
-  const symlinkEntry = path.join(repo, '.ui-review', 'symlink-entry');
-  fs.mkdirSync(missingCreatedAt, { recursive: true });
-  fs.mkdirSync(symlinkEntry, { recursive: true });
-  fs.writeFileSync(path.join(missingCreatedAt, 'index.html'), '<html></html>');
-  fs.writeFileSync(path.join(missingCreatedAt, 'manifest.json'), JSON.stringify({
-    schema: 'pentacle.uiReview.v1',
-    id: 'missing-created-at',
-    repo: 'demo-repo',
-    title: 'Missing createdAt',
-    entry: 'index.html',
-  }));
-  fs.writeFileSync(path.join(symlinkEntry, 'real.html'), '<html></html>');
-  fs.symlinkSync(path.join(symlinkEntry, 'real.html'), path.join(symlinkEntry, 'index.html'));
-  fs.writeFileSync(path.join(symlinkEntry, 'manifest.json'), JSON.stringify({
-    schema: 'pentacle.uiReview.v1',
-    id: 'symlink-entry',
-    repo: 'demo-repo',
-    title: 'Symlink entry',
-    entry: 'index.html',
-    createdAt: '2026-04-27T00:00:00Z',
-  }));
-
-  const result = listLocalArtifacts({ repoRoots: [root], artifactDirs: [] }, 'hostc');
-  assert.deepEqual(result.artifacts, []);
-});
-
-test('normalizeHubIndex sorts artifacts and adds staleness metadata', () => {
-  const now = Date.now();
-  const env = {
-    updated_at: new Date(now - 1000).toISOString(),
-    server_received_at: new Date(now - 600000).toISOString(),
-    freshness_ttl_sec: 60,
-    data: {
-      schema: 'pentacle.uiReviewIndex.v1',
-      artifacts: [
-        { id: 'old', repo: 'demo', machine: 'hostc', title: 'Old', entryUrl: 'https://example.local/old', updatedAt: '2026-01-01T00:00:00Z' },
-        { id: 'new', repo: 'demo', machine: 'hostc', title: 'New', entryUrl: 'https://example.local/new', updatedAt: '2026-01-02T00:00:00Z' },
-      ],
-    },
-  };
-
-  const result = normalizeHubIndex(env, false);
-  assert.equal(result.source, 'hub');
-  assert.equal(result._transport_stale, true);
-  assert.equal(result._data_stale, true);
-  assert.equal(result.artifacts[0].id, 'new');
-  assert.equal(result.artifacts[0].artifactKey, 'demo/new/hostc');
-});
-
-test('normalizeHubIndex reports malformed schema and skips invalid artifacts', () => {
-  const malformed = normalizeHubIndex({
-    updated_at: '2026-04-27T00:00:00Z',
-    server_received_at: '2026-04-27T00:00:00Z',
-    data: { schema: 'wrong', artifacts: [] },
-  }, true);
-  assert.match(malformed.error, /Malformed UI Review index/);
-
-  const invalid = normalizeHubIndex({
-    updated_at: '2026-04-27T00:00:00Z',
-    server_received_at: '2026-04-27T00:00:00Z',
-    data: {
-      schema: 'pentacle.uiReviewIndex.v1',
-      artifacts: [
-        { id: 'bad', repo: 'demo', machine: 'hostc', entryUrl: 'https://example.local/bad' },
-        { id: 'good', repo: 'demo', machine: 'hostc', title: 'Good', entryUrl: 'https://example.local/good', updatedAt: '2026-04-27T00:00:00Z' },
-      ],
-    },
-  }, true);
-  assert.equal(invalid.invalidArtifactCount, 1);
-  assert.deepEqual(invalid.artifacts.map((item) => item.id), ['good']);
-});
-

@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 
 
@@ -21,6 +22,9 @@ SERVICE_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = SERVICE_DIR.parents[1]
 if str(SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(SERVICE_DIR))
+
+sys.path.insert(0, str(SERVICE_DIR.parent))
+from _shared.spawn_profiles import resolve_test_profile, validate_test_profile
 
 from store import Store  # noqa: E402
 from machines import configured_host_names, load_machines  # noqa: E402
@@ -79,6 +83,9 @@ def _preflight_participants(path: Path | None, candidate: str) -> list[dict]:
         payload = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
         raise ValueError('satellite preflight receipt unreadable') from exc
+    profile = validate_test_profile(payload.get('test_profile'))
+    if profile != resolve_test_profile():
+        raise ValueError('satellite preflight test profile/settings drift')
     stamp = payload.get('observed_at_epoch')
     rows = payload.get('participants')
     if (payload.get('candidate') != candidate or type(stamp) not in (int, float)
@@ -158,9 +165,12 @@ async def _observe(store, participants, target, since, deadline, *, useful):
 async def _run(
     db: str, *, stage: str | None, rollback: bool, gate_evidence: Path | None = None,
     satellite_preflight: Path | None = None, url: str = 'ws://127.0.0.1:7791',
+    accounts: list[str] | None = None,
 ) -> dict[str, object]:
     if not rollback and not SATELLITE_HOSTS:
         raise ValueError('no satellite hosts configured; refusing to change the target pin')
+    profile_directory = tempfile.TemporaryDirectory(prefix="pentacle-satellite-test-profile-")
+    profile_path = Path(profile_directory.name) / "test-profile.json"
     store = Store(db)
     store.start()
     try:
@@ -168,6 +178,11 @@ async def _run(
         if target:
             _require_gate_evidence(gate_evidence, target)
             participants = _preflight_participants(satellite_preflight, target)
+            profile = validate_test_profile(json.loads(satellite_preflight.read_text())['test_profile'])
+            profile_path.write_text(json.dumps(profile))
+            profile_path.chmod(0o600)
+            from tools.spawn_fleet_smoke import account_map
+            selected_accounts = account_map(accounts or [], tuple((p['host'], 'codex', 'promptless') for p in participants))
         elif not rollback:
             raise ValueError('a nonempty exact target is required')
         since = time.time()
@@ -196,7 +211,10 @@ async def _run(
                 raise RuntimeError('satellite deadline before affected Codex canary')
             # Existing single-host Codex canary only; never the default fleet matrix.
             smoke = subprocess.run(
-                [sys.executable, str(SERVICE_DIR / 'tools' / 'spawn_fleet_smoke.py'), url, host],
+                [sys.executable, str(SERVICE_DIR / 'tools' / 'spawn_fleet_smoke.py'), url, host,
+                 '--test-profile-snapshot', str(profile_path),
+                 *(['--account', f"{host}/codex={selected_accounts[(host, 'codex')]}" ]
+                   if selected_accounts else [])],
                 cwd=REPO_ROOT, text=True, capture_output=True, check=False,
             )
             notes = _smoke_quota_note(smoke)
@@ -214,10 +232,11 @@ async def _run(
             print('pin staged; partial: Codex quota exhausted; restore quota before validation', file=sys.stderr)
         return {'action': 'rollback' if rollback else 'stage', 'previous': previous,
                 'target_sha': target, 'readback': await store.get('event_push.target_sha'),
-                'status': 'PARTIAL' if partial else 'PASS', 'satellites': observed,
+                'status': 'PARTIAL' if partial else 'PASS', 'satellites': observed, 'test_profile': profile,
                 'pending': pending, 'quota_exhausted': quota, 'smoke': smoke_results}
     finally:
         store.stop()
+        profile_directory.cleanup()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -228,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--satellite-preflight', type=Path,
                         help='fresh exact candidate host/dependency/consumer receipt')
     parser.add_argument('--url', default='ws://127.0.0.1:7791', help='affected Codex canary endpoint')
+    parser.add_argument('--account', action='append', default=[], help='PROVIDER=ALIAS or HOST/PROVIDER=ALIAS')
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--stage", metavar="SHA", help="exact deployed 40-character SHA")
     action.add_argument("--rollback", action="store_true", help="restore the captured preceding pin")
@@ -235,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = asyncio.run(_run(args.db, stage=args.stage, rollback=args.rollback,
                                   gate_evidence=args.gate_evidence,
-                                  satellite_preflight=args.satellite_preflight, url=args.url))
+                                  satellite_preflight=args.satellite_preflight, url=args.url, accounts=args.account))
     except (DeployError, ValueError) as exc:
         parser.error(str(exc))
     print(json.dumps(result, sort_keys=True))

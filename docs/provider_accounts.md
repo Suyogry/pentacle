@@ -1,17 +1,20 @@
 # Named provider accounts
 
 Named accounts are optional and **default OFF**. They let concurrent agents on
-one host use independent subscription logins. The front desk chooses an account
-for a launch or changes the saved host/provider default. A default change affects
+one host use independent subscription logins. Authorized launch callers choose an
+account; the front desk controls saved host/provider defaults. A default change affects
 future launches; each running agent keeps its original home and login generation.
 
 ## Controls
 
-Use the existing authenticated front-desk seat. A role name or claimed stream ID
-alone grants no account-control authority. Its authenticated successor inherits
-control through the existing assistant binding. Workers can spawn through their
-existing grants using the default, and read account status; they cannot choose
-an account override or change a default.
+Authenticated operator clients and current token/generation-verified seats can
+choose an account within their existing spawn authority, including planner SPEC
+QA and evaluator commissions. Ordinary lineage, spec and phase checks still
+apply. A role name, claimed stream ID, watcher or generic service token grants
+no launch authority. Default changes, login, enrollment and repin remain limited
+to the authenticated front-desk binding and its existing successor authority.
+Authenticated operators can also read the inventory used by the pickers. Inventory
+authorization failures remain visible instead of presenting an empty account list.
 
 ```sh
 agent-orch account status --host host-a --provider codex
@@ -24,13 +27,136 @@ agent-orch usage --account primary --json
 An explicit account changes only that launch. Unknown, disabled, unavailable,
 wrong-provider and unprovisioned selections fail clearly, with no alternate
 account, default rewrite, model/provider change or hidden login attempt. Explicit
-account choices currently apply to immediate spawns. Ordinary scheduled spawns
-resolve the saved default when they execute.
+account choices apply to immediate and scheduled spawns. Delayed and recurring
+templates retain the alias and resolve its active generation at fire time, with
+current owner and pin/health checks. A default change cannot redirect an explicit
+schedule. Old rows and omitted selectors retain default-at-fire behavior.
 
-Priorities, exclusions, caps and ratios remain front-desk instructions. For
+The web chat and terminal pickers expose aliases from account status,
+submit the optional scalar `account`, and display the actual bound alias. Voice
+actions can carry the same field. Cursor and Gemini do not support named accounts.
+
+Canonical smoke supports repeatable `--account codex=primary` or
+`--account host-a/codex=spare`. Provider-wide entries cover every included host;
+host-specific entries override them. Duplicate keys, unknown cells and incomplete
+explicit maps refuse before any prompt. `--dry-run` lists the resolved aliases;
+receipts and failure keys include account identity. Scheduled smoke may supply
+the same comma-separated declarations through `PENTACLE_SMOKE_ACCOUNTS`.
+Coordinated deployment intents accept optional `smoke_accounts`, an array of
+those declarations covering every included host/provider. The sealed intent,
+helper proofs, forward/rollback dry plans and actual verdict use the same map.
+Both archived runners must support explicit selection before any activation.
+Full-scope coordinated deployment seals the scheduled job definition and restores
+its prior bytes on rollback; declared-exclusion runs preserve the existing job.
+Qualified release inputs put the canary map in `activation.accounts`; it is part
+of the qualification identity. Legacy full-matrix deployment accepts repeatable
+`--account` and retains its map in the stamp and installed smoke job.
+On a subsequent forward legacy deployment, omitting `--account` resets smoke
+selection to configured legacy defaults (including `PENTACLE_SMOKE_ACCOUNTS`
+from the daemon environment, when set); it does not inherit the previous stamped map.
+The installed scheduled smoke map is replaced accordingly. Repeat the declarations
+to keep an explicit map across forward deployments. Rollback uses its recorded map.
+Startup tuple probes select the tuple's alias explicitly. Wrapper/delivery probes
+and event-push canaries accept the same map. Daily-retro settings accept optional
+`account` and retain it in the original idempotent intent.
+Assistant bootstrap and the busy-seat probe accept scalar `--account`. The
+commissioned recovery manifest accepts `target.account`; omitted selection retains
+the bound predecessor alias. These tools verify the admitted binding, and retained
+retro/recovery admissions are checked again before consuming work on replay.
+
+Bound handoff, recovery and host transfer preserve the source alias when omitted,
+and fail if that target account is unavailable. Same-native-session resume and
+capacity retry retain their immutable original binding. A different account needs
+a fresh context handoff. Provider-native workers have no independent selector;
+their account attribution requires native evidence from the selected parent
+process. A different worker account requires a separate ordinary seat.
+
+Before rolling back to a daemon that cannot interpret account-bearing schedule
+rows, the deployment owner must cancel pending explicit one-shot schedules and
+pause explicit recurring rules through the existing schedule controls. Preserve
+their rows/receipts and defaults; never let old code fire them on a default.
+
+Priorities, exclusions and ratios remain front-desk instructions. For
 example, the front desk can explicitly launch three agents on one permitted
 account and two on another. There is no ratio scheduler, fixed account priority,
 percentage reservation ledger or automatic quota/auth migration.
+
+## Pool ceilings and exact-seat exceptions
+
+`account status` is the source for current pool controls and eligibility.
+`cap` is the revisioned runtime control or null; `legacy_cap` is historical
+private-policy metadata and is never enforced. Deployment does not import old caps.
+
+The current authenticated primary assistant or an operator credential can replace
+a pool control through the existing account RPC. Use the verified pool ID and
+exact observed window key from status; an alias is not a write target.
+
+```sh
+agent-orch account pool-control-set --provider codex --pool-id VERIFIED_POOL \
+  --expected-revision 0 --operation-id ceiling-one --blocked false \
+  --stop-pct 100 --window codex:10080 --reason 'Current operator ceiling' \
+  --authority-ref OPERATOR_RECEIPT
+```
+
+`blocked=true` refuses without a meter. Otherwise a configured ceiling refuses
+at equality, including 100%. A capped pool needs a fresh successful observation
+of its configured window with a future reset and reset identity; UNKNOWN is
+distinct from exhaustion. Uncapped pools gain no meter prerequisite. Controls
+persist across resets; a fresh below-cap observation restores eligibility.
+Selection and the serialized final launch admission both check the control,
+including scheduled and delayed launches. Already-admitted receipts replay
+without another cap decision. Health, identity, pin, cancellation and host holds
+remain independent checks.
+
+Every write includes an expected revision, stable operation ID, reason and
+authority reference. Repeat the identical operation after a lost reply. The
+reply distinguishes the original receipt from the current control; old receipt
+replay cannot restore an old value. A relaxation also needs
+`--supersedes-authority-ref` matching the current control and a distinct new
+authority reference. Clear with `--blocked false --stop-pct none --window none`;
+the clear remains revisioned and audited.
+
+Agent text and attachment input to a restricted seat fails immediately with
+terminal `pool_at_cap`, `pool_blocked` or `pool_usage_unknown`: nothing is pasted,
+queued or scheduled for automatic redelivery. The same refused ID retains its
+known refusal after reset. Inspect status and choose a new request ID for a
+later attempt. Already-pasted input keeps its existing uncertain/Enter-only
+recovery; it is never relabeled as untouched input.
+
+The current primary and configured advisor are exempt as both sender and
+recipient. Operator-credential input passes the cap without a manual flag.
+Role names, elevated stream tokens and former generations confer no exemption.
+Their child spawns still need ordinary eligibility. For one immediate spawn the
+primary/operator can supply `--pool-override-reason` and `--pool-authority-ref`;
+the receipt binds that exception to its payload, pool and control revision.
+It grants no continuing seat exception. A control revision change before final
+admission makes that one-spawn exception stale.
+
+```sh
+agent-orch account seat-override-set --stream host-a:worker \
+  --expected-generation GENERATION --expected-revision 0 --operation-id seat-one \
+  --enabled true --reason 'Continue bounded work' --authority-ref OPERATOR_RECEIPT
+```
+
+An exact-seat override permits input and suppresses cap notices until revoked
+with `--enabled false` and the current revision. It survives pool edits but
+never extends to children, other destinations, a successor or a new generation.
+Status shows active overrides alongside current controls.
+
+Fresh autonomous work at a measured ceiling gets one urgent checkpoint reminder
+and, after 120 seconds from proved submission, one primary BLOCKER wake if a
+fresh later capture still shows working. UNKNOWN, offline and stale captures
+produce no alert. Authenticated operator input suppresses pending reminders and
+flags through the next proved idle boundary after submission, with no same-input
+native queue remaining. Missing or uncertain evidence keeps suppression, visible
+in status. No process is killed, and lag or already-admitted work can overshoot:
+this is admission/input throttling, not a hard spending limit.
+
+Rollback to an older daemon requires the release owner to hold affected new
+admissions and settle pending starts first. Preserve pool/seat controls and
+receipts. Record explicitly that the old daemon no longer refuses cap-restricted
+input; postpone rollback if that behavior is unacceptable. Restore controls only
+through current revisioned mutations, preserving other owners' holds.
 
 ## Revalidate an identity-conflict flag
 
@@ -307,7 +433,8 @@ applicable window. Accounts on different hosts sharing the same verified pool
 produce one pool readback using the latest observation; percentages are not summed.
 The readback includes timestamps, freshness, reset, original identity, conflict
 and configured cap. Missing/stale/incomplete usage is visibly unknown, never zero.
-Freshness is informational; there is no new fixed-age launch admission gate.
+Freshness gates only explicitly capped pools, using the existing account-policy
+`observation_max_age` (default 600 seconds). It is informational for uncapped pools.
 
 Codex may emit an `account/updated` status before or after its first
 `account/read` reply. Only an exact `authMode`/`planType` status for ChatGPT is

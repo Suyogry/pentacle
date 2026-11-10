@@ -4,7 +4,6 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const vm = require('node:vm');
 const chatStreamClient = require('../main/chat_stream_client');
 const { createCcHandlers, createCollector } = require('../main/cc_handlers');
 const { buildCc, createTransport } = require('../renderer/web_cc');

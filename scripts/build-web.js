@@ -24,9 +24,10 @@ const EXTERNAL_CSS = {
 // CommonJS wrapper is exactly what breaks them: a UMD sees `module.exports` and
 // assigns there instead of to `window`, so `window.TriforceDashboards` and
 // `window.PentacleChatCore` would silently never appear. Keeping them external
-// also keeps them byte-identical to what Electron loads.
+// preserves their browser-ready global exports.
 const EXTERNAL_SCRIPTS = {
   'confirm_dialog.js': 'confirm_dialog.js',
+  '../vendor/dashboard-library/dist/dashboard-library.js': 'dashboard-library.js',
   'dashboards/registry.js': 'dashboards-registry.js',
   'dashboards/demo.js': 'dashboards-demo.js',
   'dashboards/catalog_loader.js': 'dashboards-catalog-loader.js',
@@ -40,8 +41,8 @@ const EXTERNAL_SCRIPTS = {
 // runs exactly where app.js ran.
 const BUNDLE_ANCHOR = 'app.js';
 
-// `../config-loader` reads the config off disk in the Electron preload; in a
-// browser the host injects the computed config, so it maps to the shim. esbuild
+// The host injects the computed config, so `../config-loader` maps to the
+// browser shim. esbuild
 // cannot infer that from the filesystem, hence the resolve hook.
 function rendererResolvePlugin() {
   return {
@@ -193,6 +194,12 @@ async function build({ minify = false, desktop = false } = {}) {
   });
 
   const html = readIndexHtml();
+  await esbuild.build({
+    entryPoints: [path.join(RENDERER, 'designs_entry.js')], bundle: true,
+    format: 'iife', target: 'es2020', platform: 'browser',
+    outfile: path.join(out, 'designs.bundle.js'), minify, logLevel: 'warning',
+  });
+  fs.copyFileSync(path.join(RENDERER, 'designs.html'), path.join(out, 'designs.html'));
   const transform = desktop ? desktopHtml : value => value;
   fs.writeFileSync(path.join(out, desktop ? 'desktop.html' : 'web.html'), transform(buildHtml(html)));
   fs.writeFileSync(path.join(out, 'asset-popout.html'), transform(buildAssetPopoutHtml(

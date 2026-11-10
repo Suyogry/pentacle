@@ -38,6 +38,7 @@ RECURRING_OWNER = "recurring"
 RECURRING_OPEN_STATES = frozenset({"pending", "retry_pending", "firing"})
 # Spawn-template fields; changing any of them re-runs spawn admission.
 RECURRING_TEMPLATE_KEYS = frozenset({
+    "account",
     "provider", "model", "effort", "host", "target_host", "role", "phase", "visibility",
     "parent", "spec_id", "spec_ids", "objective", "initial_prompt", "self_close_on_completion",
 })
@@ -63,6 +64,16 @@ def _decode(value: Any, fallback: Any) -> Any:
 
 def _row(value: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(value) if value is not None else None
+
+
+def _recovery_template_digest(row: dict[str, Any]) -> str:
+    """Bind recovery selection to the admitted template, not merged work tags."""
+    keys = ("target_host", "role", "phase", "visibility", "parent_mode", "parent_stream_id",
+            "handoff_from_stream_id", "created_by_stream_id", "owner_stream_id", "owner_service_actor",
+            "owner_spec_ids_json", "owner_spec_provenance_json", "requested_provider", "requested_model",
+            "requested_effort", "resolved_provider", "resolved_model", "resolved_effort", "prompt_sha256",
+            "self_close_on_completion", "objective", "objective_source", "account", "account_owner_json")
+    return hashlib.sha256(_compact({key: row.get(key) for key in keys}).encode()).hexdigest()
 
 
 def _unproven_spawn_delivery_proof(
@@ -141,6 +152,7 @@ def _project_schedule(row: dict[str, Any] | None, *, include_prompt: bool = Fals
     if row is None:
         return None
     value = dict(row)
+    value.pop("account_owner_json", None)
     value["owner_spec_ids"] = _decode(value.pop("owner_spec_ids_json", "[]"), [])
     value["owner_spec_provenance"] = _decode(
         value.pop("owner_spec_provenance_json", "[]"), []
@@ -179,6 +191,7 @@ def _project_recurring(row: dict[str, Any] | None, *, include_prompt: bool = Fal
     if row is None:
         return None
     value = dict(row)
+    value.pop("account_owner_json", None)
     rule = _decode(value.pop("recurrence_json", "{}"), {})
     value["recurrence"] = rule
     value["tz"] = rule.get("tz")
@@ -482,6 +495,82 @@ class WindowSchedule:
     async def schedule_receipt(self, msg: dict[str, Any]) -> dict[str, Any]:
         return await self._receipt_read(msg, "schedule")
 
+    def _explicit_recovery_selection(self, requested, binding) -> list[str]:
+        composite = getattr(getattr(self.sessions, "assistant", None), "front_desk", None)
+        configured = composite.env_config.rebind_authorized_spec_ids if composite else frozenset()
+        if not normalize_spec_ids(requested):
+            return []
+        # Admission resolved exactly this explicit selection from one identity
+        # snapshot. Its binding already contains canonical document IDs, including
+        # proved folder aliases; comparing their original spellings loses proof.
+        # Callers keep owner fallback empty here, and omitted recurring edits reuse
+        # the prior receipt subset rather than treating merged template IDs as explicit.
+        return [sid for sid in binding.get("qualified_spec_ids", []) if sid in configured]
+
+    @staticmethod
+    def _recovery_measurement(row, subset, *, owner_generation=None):
+        return {"configured_recovery_explicit_spec_ids": subset,
+                "configured_recovery_template_sha256": _recovery_template_digest(row),
+                "owner_session_generation": owner_generation}
+
+    @staticmethod
+    def _proved_recovery_subset_tx(conn, receipt, row, *, verbs):
+        """Missing, expired or mismatched proof leaves ordinary scheduling intact."""
+        if (not receipt or receipt.get("surface") != "schedule" or receipt.get("phase") != "row_committed"
+                or receipt.get("verb") not in verbs or str(receipt.get("retain_until") or "") <= _now()
+                or receipt.get("target_id") != row.get("schedule_id", row.get("recurring_id"))
+                or (row.get("schedule_id") and receipt.get("request_id") != row.get("request_id"))):
+            return []
+        measured = _decode(receipt.get("measured_state_json"), {})
+        if not isinstance(measured, dict) or measured.get("configured_recovery_template_sha256") != _recovery_template_digest(row):
+            return []
+        subset = measured.get("configured_recovery_explicit_spec_ids")
+        if (not isinstance(subset, list) or not all(isinstance(s, str) for s in subset)
+                or not set(subset) <= set(_decode(row.get("owner_spec_ids_json"), []))):
+            return []
+        if receipt.get("actor_kind") == "seat":
+            actor = str(receipt.get("actor_id") or "")
+            if actor != (row.get("owner_stream_id") or row.get("created_by_stream_id")) or ":" not in actor:
+                return []
+            generation = conn.execute("SELECT generation FROM v2_session_generations WHERE host=? AND session_name=?",
+                                      actor.split(":", 1)).fetchone()
+            if not generation or not measured.get("owner_session_generation") or generation[0] != measured["owner_session_generation"]:
+                return []
+        elif receipt.get("actor_kind") != "service":
+            return []
+        elif row.get("owner_service_actor") and receipt.get("actor_id") != row["owner_service_actor"]:
+            return []
+        if receipt.get("verb") == "schedule.recurring.materialise":
+            recurring_id = measured.get("recurring_id")
+            try:
+                rule_id = uuid.UUID(str(recurring_id))
+            except (ValueError, TypeError):
+                return []
+            if row.get("request_id") not in {
+                str(uuid.uuid5(rule_id, str(row.get("fires_at_utc")))),
+                str(uuid.uuid5(rule_id, "manual:" + str(row.get("fires_at_utc")))),
+            }:
+                return []
+            owner = measured.get("configured_recovery_owner_stream_id")
+            if owner:
+                if owner != row.get("created_by_stream_id") or ":" not in owner:
+                    return []
+                generation = conn.execute("SELECT generation FROM v2_session_generations WHERE host=? AND session_name=?",
+                                          owner.split(":", 1)).fetchone()
+                if not generation or generation[0] != measured.get("owner_session_generation"):
+                    return []
+        return subset
+
+    @staticmethod
+    def _recurring_recovery_subset_tx(conn, row):
+        receipt = _row(conn.execute(
+            "SELECT * FROM v2_operation_receipts WHERE target_id=? AND phase='row_committed' "
+            "AND verb IN ('schedule.recurring.create','schedule.recurring.update') ORDER BY rowid DESC LIMIT 1",
+            (row["recurring_id"],),
+        ).fetchone())
+        return WindowSchedule._proved_recovery_subset_tx(
+            conn, receipt, row, verbs={"schedule.recurring.create", "schedule.recurring.update"})
+
     async def schedule_insert(self, msg: dict[str, Any]) -> dict[str, Any]:
         # Objective resolution is lineage-aware and needs the parent, computed below.
         request_id = _valid_uuid(msg.get("request_id"))
@@ -639,9 +728,11 @@ class WindowSchedule:
                 "not_authorized",
                 "requested spec selection is outside the owner's qualified binding",
             )
+        recovery_subset = self._explicit_recovery_selection(requested_spec_ids, binding)
         resolved_provider = str(admission.get("resolved_provider") or "").strip()
         resolved_model = str(admission.get("resolved_model") or "").strip()
         resolved_effort = str(admission.get("resolved_effort") or "").strip()
+        account_owner = await self._account_owner(msg) if "account" in admission else None
         if not all((resolved_provider, resolved_model, resolved_effort)):
             raise VerbError("invalid_request", "scheduled spawn resolution is incomplete")
 
@@ -676,6 +767,8 @@ class WindowSchedule:
                     conn.execute("UPDATE v2_schedules SET qa_spec_id=?,qa_surface=?,qa_cycle=?,qa_owner_generation=? WHERE schedule_id=?",
                         (msg.get("qa_spec_id"), msg.get("qa_surface"), msg.get("qa_cycle"),
                          admission.get("qa_owner_generation"), schedule_id))
+                    conn.execute("UPDATE v2_schedules SET account=?,account_owner_json=? WHERE schedule_id=?",
+                                 (admission.get("account"), account_owner, schedule_id))
                     prior = _row(conn.execute("SELECT * FROM v2_schedules WHERE schedule_id=?", (schedule_id,)).fetchone())
                 result = {
                     "type": "schedule.insert.ok", "schedule": _project_schedule(prior),
@@ -685,7 +778,7 @@ class WindowSchedule:
                     conn, request_id=request_id, phase="row_committed", surface="schedule",
                     verb=verb, actor_kind=kind, actor_id=actor, payload_sha=digest,
                     target_id=str(prior["schedule_id"]), measured={"state": prior["state"], "generation": prior["generation"],
-                        "owner_session_generation": owner_generation or None},
+                        **self._recovery_measurement(prior, recovery_subset, owner_generation=owner_generation or None)},
                     result=result, measured_at=timestamp,
                 )
                 conn.commit()
@@ -968,16 +1061,21 @@ class WindowSchedule:
         # Retain the admitting generation rather than resolving today's owner.
         # Protected handoffs without that binding fail before dispatch.
         admission_receipt = await self._get_receipt(schedule["request_id"], "row_committed")
+        recovery_subset = await self.store.submit(lambda conn: self._proved_recovery_subset_tx(
+            conn, admission_receipt, schedule, verbs={"schedule.insert", "schedule.recurring.materialise"}))
         owner_generation = None
         if (admission_receipt and admission_receipt["surface"] == "schedule"
                 and admission_receipt["verb"] == "schedule.insert"
                 and admission_receipt["actor_kind"] == "seat"
                 and admission_receipt["target_id"] == schedule_id):
-            original_generation = _decode(admission_receipt.get("measured_state_json"), {}).get("owner_session_generation")
+            measured = _decode(admission_receipt.get("measured_state_json"), {})
+            original_generation = measured.get("owner_session_generation") if isinstance(measured, dict) else None
             effective_owner, effective_generation = await self.store.transfer_successor(admission_receipt['actor_id'], original_generation)
             if effective_owner == schedule.get('owner_stream_id'):
                 owner_generation = effective_generation
         source_id = str(schedule.get("handoff_from_stream_id") or "")
+        if schedule.get("account") is not None and not await self._account_owner_current(schedule):
+            oracle_error = "stale_owner_generation"
         policy = getattr(self.sessions, "assistant", None)
         source = (await self.store.fetch_session(*source_id.split(":", 1))
                   if policy and ":" in source_id else None)
@@ -995,10 +1093,12 @@ class WindowSchedule:
                 "token_verified": bool(schedule.get("owner_stream_id")),
                 "stream_id": schedule.get("owner_stream_id"),
                 "session_generation": owner_generation,
+                "configured_recovery_explicit_spec_ids": recovery_subset,
             },
             "type": "spawn", "request_id": dispatch["spawn_request_id"],
             "idempotency_key": dispatch["spawn_key"], "host": schedule["target_host"],
             "provider": schedule["resolved_provider"], "model": schedule["resolved_model"],
+            "account": schedule.get("account"),
             "effort": schedule["resolved_effort"], "role": schedule.get("role"),
             "phase": schedule.get("phase"), "visibility": schedule.get("visibility"),
             "objective": schedule.get("objective"),
@@ -1344,6 +1444,41 @@ class WindowSchedule:
             return None
         return stream_id
 
+    async def _account_owner(self, msg):
+        auth = msg.get("_auth_context") or {}
+        if auth.get("token_verified") is True:
+            actor = str(auth.get("stream_id") or "")
+            seat = await self.store.fetch_session(*actor.split(":", 1)) if ":" in actor else None
+            if (seat and seat.get("status") == "open" and auth.get("session_generation")
+                    and seat.get("session_generation") == auth["session_generation"]):
+                return _compact({"kind": "seat", "stream_id": actor,
+                    "generation": auth["session_generation"], "token_hash": seat.get("token_hash")})
+        elif auth.get("operator_authenticated") is True and auth.get("credential_id"):
+            return _compact({"kind": "operator", "credential_id": auth["credential_id"]})
+        raise VerbError("account_control_unauthorized", "explicit schedules need a current launch owner")
+
+    async def _account_owner_current(self, schedule):
+        owner = _decode(schedule.get("account_owner_json"), {})
+        if owner.get("kind") == "seat":
+            stream, generation = await self.store.transfer_successor(owner.get("stream_id"), owner.get("generation"))
+            seat = await self.store.fetch_session(*stream.split(":", 1)) if ":" in str(stream) else None
+            if (not seat or seat.get("status") != "open" or seat.get("session_generation") != generation
+                    or (stream == owner.get("stream_id") and seat.get("token_hash") != owner.get("token_hash"))):
+                return False
+            return set(_decode(schedule.get("owner_spec_ids_json"), [])) <= set(seat.get("qualified_spec_ids") or [])
+        if owner.get("kind") == "operator":
+            runtime = getattr(self.spawnctl, "account_runtime", None)
+            registry = getattr(getattr(runtime, "server", None), "operator_credential_registry", None)
+            if registry is None:
+                return False
+            try:
+                snapshot = await asyncio.to_thread(registry.load)
+                credential = snapshot.credentials.get(owner.get("credential_id"))
+                return bool(credential and not credential.get("revoked_at") and not credential.get("scope"))
+            except Exception:
+                return False
+        return False
+
     async def _recurring_template(
         self, msg: dict[str, Any], fields: dict[str, Any], *, kind: str, actor: str,
         seat: dict[str, Any] | None, admission_name: str,
@@ -1417,6 +1552,8 @@ class WindowSchedule:
             "role": fields.get("role"), "phase": fields.get("phase"),
             "visibility": fields.get("visibility"), "initial_prompt": prompt_text,
         }
+        if fields.get("account") is not None or "account" in msg:
+            admission_msg["account"] = fields.get("account")
         admission_msg.pop("spec_id", None)
         if parent_stream_id is not None:
             admission_msg["parent_stream_id"] = parent_stream_id
@@ -1450,6 +1587,8 @@ class WindowSchedule:
             raise VerbError("invalid_request", "recurring spawn resolution is incomplete")
         raw = prompt_text.encode("utf-8")
         return {
+            "account": admission.get("account"),
+            "account_owner_json": await self._account_owner(msg) if "account" in admission else None,
             "parent_mode": parent_mode,
             "target_host": str(admission.get("host") or self.local_host),
             "requested_provider": requested["provider"], "requested_model": requested["model"],
@@ -1515,6 +1654,10 @@ class WindowSchedule:
             "created_by_stream_id": creator, "generation": 1,
             "created_at": timestamp, "updated_at": timestamp, **template,
         }
+        recovery_subset = self._explicit_recovery_selection(
+            normalize_spec_ids(msg.get("spec_ids"), msg.get("spec_id")),
+            {"qualified_spec_ids": _decode(template["owner_spec_ids_json"], [])})
+        owner_generation = (seat or {}).get("session_generation") if kind == "seat" else None
 
         def op(conn: sqlite3.Connection) -> dict[str, Any]:
             conn.execute("BEGIN IMMEDIATE")
@@ -1535,7 +1678,9 @@ class WindowSchedule:
                     conn, request_id=request_id, phase="row_committed", surface="schedule",
                     verb="schedule.recurring.create", actor_kind=kind, actor_id=actor,
                     payload_sha=digest, target_id=recurring_id,
-                    measured={"state": "active", "generation": 1}, result=result, measured_at=timestamp,
+                    measured={"state": "active", "generation": 1,
+                              **self._recovery_measurement(columns, recovery_subset, owner_generation=owner_generation)},
+                    result=result, measured_at=timestamp,
                 )
                 conn.commit()
                 return result
@@ -1563,6 +1708,7 @@ class WindowSchedule:
     async def _recurring_write(
         self, rule_row: dict[str, Any], assignments: dict[str, Any], *, expected_generation: Any,
         recompute: dict[str, Any] | None = None,
+        recovery_proof: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """One CAS-guarded UPDATE: bumps ``generation`` and, with ``recompute``, re-arms from now."""
         recurring_id = str(rule_row["recurring_id"])
@@ -1577,6 +1723,8 @@ class WindowSchedule:
                     raise VerbError("not_found", "recurring schedule not found")
                 if expected_generation is not None and int(expected_generation) != int(current["generation"]):
                     raise VerbError("generation_conflict", "recurring schedule changed; re-read and retry")
+                if recovery_proof is not None and current["generation"] != rule_row["generation"]:
+                    raise VerbError("generation_conflict", "recurring template changed during admission")
                 now = datetime.now(timezone.utc)
                 values = dict(assignments)
                 if recompute is not None:
@@ -1587,6 +1735,16 @@ class WindowSchedule:
                     + ",".join(f"{key}=?" for key in values) + " WHERE recurring_id=? AND generation=?",
                     (*values.values(), recurring_id, current["generation"]),
                 )
+                if recovery_proof is not None:
+                    updated = {**current, **values}
+                    self._insert_receipt_tx(
+                        conn, request_id=str(uuid.uuid4()), phase="row_committed", surface="schedule",
+                        verb="schedule.recurring.update", actor_kind=recovery_proof["kind"],
+                        actor_id=recovery_proof["actor"], payload_sha=_recovery_template_digest(updated),
+                        target_id=recurring_id, measured=self._recovery_measurement(
+                            updated, recovery_proof["subset"], owner_generation=recovery_proof["generation"]),
+                        result={"type": "schedule.recurring.update.ok", "recurring_id": recurring_id}, measured_at=_iso(now),
+                    )
                 conn.commit()
                 return {}
             except Exception:
@@ -1601,6 +1759,7 @@ class WindowSchedule:
         row = await self._recurring_target(msg, kind, actor)
         expected = msg.get("expected_generation")
         assignments: dict[str, Any] = {}
+        recovery_proof = None
         recompute = None
         if "name" in msg:
             assignments["name"] = self._recurring_name(msg.get("name"))
@@ -1617,6 +1776,7 @@ class WindowSchedule:
             creator = row.get("created_by_stream_id")
             creator_row = seat if kind == "seat" else (await self._session(creator) if creator else None)
             prior = {
+                **({"account": row["account"]} if row.get("account") is not None else {}),
                 "provider": row["requested_provider"], "model": row["requested_model"],
                 "effort": row["requested_effort"], "target_host": row["target_host"],
                 "role": row.get("role"), "phase": row.get("phase"), "visibility": row.get("visibility"),
@@ -1637,9 +1797,18 @@ class WindowSchedule:
                 actor=str(creator or actor), seat=creator_row,
                 admission_name=f"recurring-{str(row['recurring_id'])[-12:]}",
             ))
+            if "spec_id" in msg or "spec_ids" in msg:
+                subset = self._explicit_recovery_selection(
+                    normalize_spec_ids(msg.get("spec_ids"), msg.get("spec_id")),
+                    {"qualified_spec_ids": _decode(assignments["owner_spec_ids_json"], [])})
+            else:
+                subset = await self.store.submit(lambda conn: self._recurring_recovery_subset_tx(conn, row))
+            recovery_proof = {"subset": subset, "kind": "seat" if creator_row else kind,
+                              "actor": str(creator or actor), "generation": (creator_row or {}).get("session_generation")}
         if not assignments:
             raise VerbError("invalid_request", "nothing to update")
-        updated = await self._recurring_write(row, assignments, expected_generation=expected, recompute=recompute)
+        updated = await self._recurring_write(row, assignments, expected_generation=expected, recompute=recompute,
+                                             recovery_proof=recovery_proof)
         await self._broadcast_recurring("recurring_updated", str(row["recurring_id"]))
         return {"type": "schedule.recurring.update.ok", "recurring": _project_recurring(updated)}
 
@@ -1777,6 +1946,11 @@ class WindowSchedule:
                 parent_stream if rule["parent_mode"] == "assistant" else rule["parent_mode"]
             )
             if existing is None:
+                creator = str(rule.get("created_by_stream_id") or "")
+                creator_generation = conn.execute(
+                    "SELECT generation FROM v2_session_generations WHERE host=? AND session_name=?",
+                    creator.split(":", 1),
+                ).fetchone() if ":" in creator else None
                 conn.execute(
                     "INSERT INTO v2_schedules "
                     "(schedule_id,request_id,owner_service_actor,owner_spec_ids_json,owner_spec_provenance_json,"
@@ -1793,13 +1967,20 @@ class WindowSchedule:
                      occurrence, rule["prompt_sha256"], rule["prompt_b64"], timestamp, timestamp,
                      rule["self_close_on_completion"], rule["objective"], rule["objective_source"]),
                 )
+                conn.execute("UPDATE v2_schedules SET account=?,account_owner_json=? WHERE schedule_id=?",
+                             (rule.get("account"), rule.get("account_owner_json"), schedule_id))
                 self._insert_receipt_tx(
                     conn, request_id=request_id, phase="row_committed", surface="schedule",
                     verb="schedule.recurring.materialise", actor_kind="service", actor_id=RECURRING_OWNER,
                     payload_sha=hashlib.sha256(_compact(
                         {"recurring_id": recurring_id, "occurrence": occurrence}).encode()).hexdigest(),
                     target_id=schedule_id,
-                    measured={"state": "pending", "generation": 1, "recurring_id": recurring_id},
+                    measured={"state": "pending", "generation": 1, "recurring_id": recurring_id,
+                              "configured_recovery_owner_stream_id": creator or None,
+                              **self._recovery_measurement(dict(conn.execute(
+                                  "SELECT * FROM v2_schedules WHERE schedule_id=?", (schedule_id,)).fetchone()),
+                                  self._recurring_recovery_subset_tx(conn, rule),
+                                  owner_generation=creator_generation[0] if creator_generation else None)},
                     result={"type": "schedule.recurring.materialise.ok",
                             "schedule_id": schedule_id, "recurring_id": recurring_id},
                     measured_at=timestamp,

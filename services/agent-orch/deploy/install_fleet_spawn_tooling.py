@@ -16,6 +16,7 @@ import fcntl
 import hashlib
 import importlib.metadata
 import ipaddress
+import io
 import json
 import os
 import re
@@ -232,7 +233,7 @@ def _runtime_tar_member(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
     return member
 
 
-def _archive(repo: Path, commit: str, destination: Path, stamp: str | None = None, *, provider_cli_pin=None) -> dict[str, object]:
+def _archive(repo: Path, commit: str, destination: Path, stamp: str | None = None, *, provider_cli_pin=None, spawn_settings=None) -> dict[str, object]:
     canonical = subprocess.check_output(
         ["git", "-C", str(repo), "rev-parse", f"{commit}^{{commit}}"], text=True
     ).strip()
@@ -244,6 +245,17 @@ def _archive(repo: Path, commit: str, destination: Path, stamp: str | None = Non
     with tarfile.open(archive) as bundle:
         if not bundle.getmembers():
             raise ValueError("archive_empty")
+    # Installed copies are derived outputs of the same settings home. Include
+    # the host overlay in the private, hash-bound release, never in public Git.
+    local_settings = Path(repo) / "services/_shared/spawn_defaults.local.json"
+    if spawn_settings is None and local_settings.is_file():
+        spawn_settings = local_settings.read_bytes()
+    if spawn_settings is not None:
+        json.loads(spawn_settings)
+        with tarfile.open(archive, "a") as bundle:
+            member = tarfile.TarInfo("services/_shared/spawn_defaults.local.json")
+            member.size, member.mode = len(spawn_settings), 0o600
+            bundle.addfile(member, io.BytesIO(spawn_settings))
     contract, catalog = _release_contract(repo, commit)
     runtime_package = "services/agent-orch/agent_orch"
     runtime_support_module = "services/_shared/asset_schema.py"
@@ -285,6 +297,15 @@ def _archive(repo: Path, commit: str, destination: Path, stamp: str | None = Non
         # stage() cannot install.
         if str(exc) != "runtime_package_missing":
             raise
+    settings = {}
+    with tarfile.open(archive) as bundle:
+        for name in ("spawn_defaults.json", "spawn_defaults.local.json"):
+            try:
+                data = bundle.extractfile("services/_shared/" + name).read()
+            except KeyError:
+                data = None
+            settings[name] = _sha256_bytes(data) if data is not None else None
+    manifest["test_settings"] = settings
     manifest["archive_sha256"] = _sha256(archive)
     (destination / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
     return manifest
@@ -729,6 +750,10 @@ def _verify_release(target: Target, commit: str, manifest: dict[str, object], *,
         f"test \"$(python3 -c {hash_file} {_remote_quote(release + '/app/services/_shared/spawn_profiles.py')})\" = {_remote_quote(str(dict(manifest['contract'])['sha256']))}",
         f"python3 -c {manifest_catalog} {_remote_quote(release + '/manifest.json')} {_remote_quote(str(manifest['catalog_version']))}",
     ))
+    if "test_settings" in manifest:
+        script = "import hashlib,json,pathlib,sys; root=pathlib.Path(sys.argv[1]); expected=json.loads(sys.argv[2]); actual={n:hashlib.sha256((root/n).read_bytes()).hexdigest() if (root/n).is_file() else None for n in expected}; assert actual==expected, 'installed_test_settings_mismatch'"
+        command += " && " + " ".join(("python3 -c", _remote_quote(script),
+            _remote_quote(release + "/app/services/_shared"), _remote_quote(json.dumps(manifest["test_settings"], sort_keys=True))))
     if manifest.get("runtime_package"):
         runtime_manifest = _remote_quote(json.dumps(manifest["runtime_package"], sort_keys=True))
         command += " && " + " && ".join((
@@ -1104,7 +1129,8 @@ def _private_artifact_metadata(value: str) -> dict[str, object]:
 
 
 def _preflight_binding(args: argparse.Namespace, targets: list[Target], manifest: dict[str, object],
-                       private_artifacts: list[dict[str, object]]) -> dict[str, object]:
+                       private_artifacts: list[dict[str, object]],
+                       provider_snapshot: dict[str, str] | None = None) -> dict[str, object]:
     # Do not resolve the executable symlink: its venv path selects site-packages.
     executable = os.path.abspath(sys.executable)
     config = Path(args.host_config).expanduser().resolve() if args.host_config else None
@@ -1122,6 +1148,8 @@ def _preflight_binding(args: argparse.Namespace, targets: list[Target], manifest
         "python": {"executable": executable, "prefix": sys.prefix,
                    "version": sys.version, "sha256": _sha256(Path(executable))},
         "runtime_package": manifest.get("runtime_package"),
+        "provider_snapshot": provider_snapshot,
+        "provider_packages": manifest.get("provider_packages"),
         "private_artifacts": private_artifacts,
     }
 
@@ -1133,6 +1161,8 @@ def _apply_argv(args: argparse.Namespace, receipt: Path) -> list[str]:
             "--sftp-timeout", str(args.sftp_timeout), "--preflight-receipt", str(receipt)]
     if args.host_config:
         argv += ["--host-config", str(Path(args.host_config).expanduser().resolve())]
+    if args.provider_cli_pin_file:
+        argv += ["--provider-cli-pin-file", str(Path(args.provider_cli_pin_file).expanduser().resolve())]
     for override in args.ssh_target:
         argv += ["--ssh-target", override]
     for artifact in args.private_artifact:
@@ -1249,15 +1279,21 @@ def main() -> int:
             manifest = None
             binding = None
             if not args.rollback:
-                provider_pin=None
+                provider_pin = None
+                provider_snapshot = None
                 if args.provider_cli_pin_file:
-                    services_root=str(Path(__file__).resolve().parents[2])
-                    if services_root not in sys.path: sys.path.insert(0,services_root)
+                    services_root = str(Path(__file__).resolve().parents[2])
+                    if services_root not in sys.path: sys.path.insert(0, services_root)
                     from _shared.provider_cli_release import loads as load_provider_pin
-                    provider_pin=load_provider_pin(Path(args.provider_cli_pin_file).read_text())
+                    snapshot_path = Path(args.provider_cli_pin_file).expanduser().resolve()
+                    snapshot_bytes = snapshot_path.read_bytes()
+                    provider_pin = load_provider_pin(snapshot_bytes)
+                    # Bind exactly the bytes parsed, even if the file changes
+                    # while the archive is built. Replay must revalidate them.
+                    provider_snapshot = {"path": str(snapshot_path), "sha256": _sha256_bytes(snapshot_bytes)}
                 manifest = _archive(repo, args.commit, Path(temp), args.resume,provider_cli_pin=provider_pin)
                 records["manifest"] = manifest
-                binding = _preflight_binding(args, targets, manifest, private_artifacts)
+                binding = _preflight_binding(args, targets, manifest, private_artifacts, provider_snapshot)
                 if args.preflight_receipt:
                     _verify_preflight(args.preflight_receipt, binding)
             lock = nullcontext() if args.dry_run else RolloutLock(_rollout_lock_path(), lock_stamp)

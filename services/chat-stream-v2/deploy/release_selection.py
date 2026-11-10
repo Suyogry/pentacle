@@ -230,10 +230,19 @@ def prepare(repo, sha, input_path, python, runner):
     require(isinstance(candidate_mobile, list) and candidate_mobile and all(full_sha(v) for v in candidate_mobile),
             "missing candidate consumer source")
     activation = inputs.get("activation")
-    require(isinstance(activation, dict) and set(activation) == {"url", "host"}
+    require(isinstance(activation, dict) and set(activation) - {'accounts'} == {"url", "host"}
             and isinstance(activation["host"], str) and activation["host"]
             and isinstance(activation["url"], str) and activation["url"].startswith(("ws://", "wss://")),
             "unsupported activation scope (requires explicit Codex promptless endpoint/host)")
+    if 'accounts' in activation:
+        from tools.spawn_fleet_smoke import account_map
+        try:
+            require(isinstance(activation['accounts'], list)
+                    and all(isinstance(v, str) for v in activation['accounts']),
+                    'activation accounts must be an array of declarations')
+            account_map(activation['accounts'], ((activation['host'], 'codex', 'promptless'),))
+        except (ValueError, TypeError) as exc:
+            raise Invalid('invalid activation account mapping: ' + str(exc)) from exc
     selector_hash = digest((repo / "scripts/select_tests.py").read_bytes())
     map_hash = digest((repo / "scripts/test-selection.json").read_bytes())
     config_hash = digest((repo / "scripts/gate-env.json").read_bytes())
@@ -283,7 +292,11 @@ def prepare(repo, sha, input_path, python, runner):
             # The mandatory merge gate is independently required and reused once.
             if target["target"] != "v2-merge":
                 targets[key(target)] = target
-    required_cells = [{"host": activation["host"], "provider": "codex", "prompt_mode": "promptless"}]
+    from _shared.spawn_profiles import resolve_test_profile, test_prompt_tuple
+    profile = resolve_test_profile()
+    model, effort = test_prompt_tuple("codex", profile)
+    required_cells = [{"host": activation["host"], "provider": "codex", "prompt_mode": "promptless",
+                       "model": model, "effort": effort, "profile_sha256": profile["profile_sha256"]}]
     identity = {"candidate": sha, "inputs_sha256": digest(Path(input_path).read_bytes()),
                 "selector_sha256": selector_hash, "map_sha256": map_hash, "gate_config_sha256": config_hash,
                 "admission_sha256": LOADED_ADMISSION_SHA256,
@@ -294,7 +307,7 @@ def prepare(repo, sha, input_path, python, runner):
                 "target_needs": {t["target"]: read(repo / "scripts/gate-env.json")["profiles"]["pentacle"]["targets"][t["target"]]["needs"]
                                  for t in targets.values()},
                 "installed": installed, "external_inputs": external, "activation": activation,
-                "required_cells": required_cells}
+                "test_profile": profile, "required_cells": required_cells}
     plan = {"identity": identity, "reports": reports, "boundaries": [boundaries[k] for k in sorted(boundaries)],
             "targets": [targets[k] for k in sorted(targets)],
             "classification": "broad_fallback" if any(r["classification"] == "broad_fallback" for r in reports)
@@ -492,6 +505,8 @@ def admit(repo, sha, input_path, gate_evidence, python, runner):
 
 def revalidate(plan, input_path):
     identity = plan["identity"]
+    from _shared.spawn_profiles import resolve_test_profile
+    require(resolve_test_profile() == identity["test_profile"], "changed test profile/settings before activation")
     require(digest(Path(input_path).read_bytes()) == identity["inputs_sha256"], "changed release inputs before activation")
     require(digest(Path(__file__).read_bytes()) == identity["admission_sha256"], "changed admission code before activation")
     require(digest(QUALIFICATION_PATH.read_bytes()) == identity["qualification_sha256"], "changed qualification before activation")

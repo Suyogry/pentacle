@@ -2,6 +2,36 @@
 
 Direct CLI for orchestrating agent sessions through `chat_streamd`. Lets one agent spawn, drive, and observe other agents without the leader's LLM context having to read raw tmux scrollback.
 
+## Supporting spawn admission
+
+An immediate parented worker, evaluator, planner, advisory reviewer (`reviewer-advisory`),
+or helper without a role can spawn with an objective and no manual spec
+assignment or open-lane link. Available parent spec tags and their lane
+attribution are inherited through the existing binding; an unbound parent
+produces an unbound child. Explicit spec tags still resolve normally.
+Lead and QA commissions retain their work binding. Identity, lifecycle,
+objective, provider/account and QA integrity checks remain in force.
+
+New commissions covered by the assistant advisor use the existing admission
+checks before creating a ruling or waking the advisor. A mechanical failure
+returns `spawn.error`, `error_code: "spawn_preflight_failed"`, and `errors` with
+at most eight `{code, field, correction}` entries. The CLI prints the same
+array. Repair the values and submit a new intent. Authentication/account
+authorization still fail first; dependent fields report their unavailable
+prerequisite once. `spec_unavailable` means fresh source could not be read,
+whereas `spec_unresolved` means the supplied identity could not resolve.
+
+The advisor still reviews a valid packet substantively. Its display starts with
+the objective, acceptance and separately attributed work-item origin; missing
+origin stays `origin_missing: true`. An existing Tracking `- Operator request`
+line with malformed quote syntax returns `origin_malformed`, its location and
+the expected shape. This does not require inventing an operator request.
+The packet records `spec_content_sha256` from the exact resolved text and an
+`excerpt_rule`: `composer_boundary` when this CLI composed a role baseline,
+otherwise `last_top_level_heading`, then `first_1600`. The excerpt is bounded,
+redacted display data; full baseline and intent remain stored. A same-key retry
+keeps its original packet and digest. Release rechecks authoritative guards.
+
 ## Outbound credentials
 
 `agent_orch/send_boundary.py` owns credential loading and websocket serialization.
@@ -44,8 +74,9 @@ change updates source only; installing the client is a separate rollout.
 
 → See [../../docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) for system context. Setup guide: see [../../docs/agent_orchestration_setup.md](../../docs/agent_orchestration_setup.md) for installing `chat_streamd`, `agent-orch`, per-machine config, autostart, and smoke tests. That guide installs the CLI into the checkout-local virtual environment; `bash services/agent-orch/install.sh` is an alternative user-level install that needs Python 3.12 or later (3.13 on macOS).
 
-Optional named subscription accounts are default OFF. The front desk can choose
-`spawn --account`, change a host/provider default with `account default set`, or
+Optional named subscription accounts are default OFF. Authorized launch callers can choose
+`spawn --account` for immediate, delayed or recurring work. The front desk can
+change a host/provider default with `account default set`, or
 carry a conversation through `spawn --handoff --handoff-from ... --account ...`.
 See [named provider accounts](../../docs/provider_accounts.md) for authority,
 setup, usage, targeted re-login and rollback.
@@ -80,7 +111,7 @@ the standard `unsupported_in_v2` response.
 | `agent-orch schedule recurring add\|list\|get\|set\|pause\|resume\|run\|rm` | Durable recurring spawn rules (nightly, weekdays, weekly) in an IANA time zone. See [Recurring](#recurring). |
 | `agent-orch send [--retry] <stream_id> <msg_id> <prompt>` | Issue `send` RPC. The target may also be the assistant alias; see [Addressing the assistant by alias](#addressing-the-assistant-by-alias). `msg_id` is unique per target stream. `--retry` is accepted when the latest entry for `(msg_id, stream_id)` is `send.result` with `delivery:"not_landed"`, `send.error`, `transmit_failed`, `transmit_delivered_awaiting_result`, or `send_error`. The CLI builds and validates a minimal Inbox v1 envelope from the prompt, carries it inline to the daemon, and the daemon re-validates it. |
 | `agent-orch tell <peer_stream_id> <text> [--from STREAM_ID] [--ttl SECONDS] [--tell-id UUID] [--urgent]` | Direct one-way peer message. The target may also be the assistant alias; see [Addressing the assistant by alias](#addressing-the-assistant-by-alias). The daemon pastes immediately through the always-submit path and returns a durable completed-delivery receipt; `submission_confirmed` is post-hoc evidence, not a readiness gate. |
-| `agent-orch park <stream_id> --reason TEXT [--from STREAM_ID]` / `agent-orch unpark <stream_id> [--event-id ID --reason TEXT] [--from STREAM_ID]` | Declare or clear a session's parked state. The CLI is authorized for the target stream or its direct parent; the Pentacle desktop operator surface has the separate operator-confirmed path. A routing-integrity park requires its exact event id and a non-empty acknowledgement reason. Parked sessions receive no system nudges. |
+| `agent-orch park <stream_id> --reason TEXT [--from STREAM_ID]` / `agent-orch unpark <stream_id> [--event-id ID --reason TEXT] [--from STREAM_ID]` | Declare or clear a session's parked state. The CLI is authorized for the target stream or its direct parent; the Pentacle Web operator surface has the separate operator-confirmed path. A routing-integrity park requires its exact event id and a non-empty acknowledgement reason. Parked sessions receive no system nudges. |
 | `agent-orch notify (--message TEXT \| --ask TEXT) [--title TEXT] [--producer NAME] [--severity info\|warning\|critical] [--ttl SECONDS] [--button LABEL ... \| --actions JSON] [--await-answer] [--timeout SECONDS] [--from STREAM_ID]` | Publish an operator-facing notification through `chat_streamd`. `--message` creates a message-only Updates card with no buttons. `--ask` creates an actionable question; `--button` builds yes/no-style actions, while `--actions` accepts a JSON list of notification action objects (if both are supplied, `--actions` takes precedence). With `--await-answer`, the CLI records the publishing stream as `answer_to_stream_id`, blocks on `notification.await`, and prints the typed answer payload. `warning`/`critical` also reach the front desk as a typed error alert; a repeated `--dedup-key` does not re-alert. |
 | `agent-orch prompt ask --title TEXT --body TEXT [--question-id ID] [--spec-id ID] [--response-mode single_choice\|multi_choice\|free_text] [--option LABEL[=VALUE] ...] [--from STREAM_ID] [--provider NAME] [--ttl SECONDS] [--await-answer] [--timeout SECONDS]` | Standard operator-question protocol (verified, operator-visible producer only). Creates or refreshes a durable `agent_question.v1` record through `chat_streamd`, publishes one deduped Updates card, and returns immediately by default. Admission caps: title ≤90, body ≤1200 code points in blocks of ≤300 / ≤3 lines, 1–5 options with labels ≤40 and descriptions ≤100; no `ack` mode and no separate `--context` (put context in `--body`). Every question admits free text. If daemon/auth/store failure prevents durable creation, returns `prompt.fallback` plus an `AGENT_QUESTION_V1` inline block. |
 | `agent-orch prompt answer <question_id> [--select VALUE ...] [--text TEXT]` | Answer a durable question with the one canonical payload: selected option value(s) and/or free text. A choice takes selections and/or text; `free_text` takes `--text` only. |
@@ -92,7 +123,7 @@ the standard `unsupported_in_v2` response.
 | `agent-orch asset comments <asset_id> [--session STREAM_ID] [--spec-id ID] [--unresolved] [--timeout N]` / `agent-orch asset comments resolve <asset_id> <comment_id> [--note TEXT]` | Fetch report comments for review iteration, and mark addressed comments resolved with an optional resolution note. |
 | `agent-orch title "<text>" [--timeout N]` | Self-rename the calling chat. The CLI resolves its own stream id, splits `host:session_name` on the first colon, and sends the daemon `rename` RPC with `source:"agent"`. There is no target argument; this verb cannot rename another session. |
 | `agent-orch status [--goal TEXT] [--plan STEP ...] [--step-done N[,N] ...] [--update TEXT] [--eta ISO-8601\|Nm\|Nh\|Nd\|none] [--handoff-planned\|--no-handoff-planned] [--timeout N]` | Set/update the calling session's status card (self-write only; the CLI resolves its own stream id and sends the daemon `status_card` RPC with its stream token). Partial updates: only provided flags change. `--plan` is repeatable (one step per flag) and **replaces** the whole plan, activating step 1; repeat `--step-done` or pass a comma-list to mark several 1-based steps in order. `--eta` records a future timezone-aware timestamp or positive whole duration with its own baseline; `none` clears it. Caps: goal ≤500 chars, update ≤300, step ≤200, plan ≤20 steps. The daemon stamps `updated_at`, persists the card on the sessions row, and rebroadcasts `session.inventory`. At least one field flag is required (exit 2 otherwise). |
-| `agent-orch visibility set <stream_id> <default\|nested\|hidden>` | Issue `set_visibility` RPC. Updates the session's persisted visibility and triggers a `session.inventory` rebroadcast so subscribed clients (Pentacle desktop, Pentacle Mobile, direct agent-orch CLIs) re-filter within one tick. The success frame carries the updated session summary. |
+| `agent-orch visibility set <stream_id> <default\|nested\|hidden>` | Issue `set_visibility` RPC. Updates the session's persisted visibility and triggers a `session.inventory` rebroadcast so subscribed clients (Pentacle Web, Pentacle Mobile, direct agent-orch CLIs) re-filter within one tick. The success frame carries the updated session summary. |
 | `agent-orch await [--include-details] [--include-extras] [--timeout N] --from <stream_id> [--msg-id N]` | Open a direct websocket and block until `chat_streamd` resolves `await_report`. `--msg-id` is optional. **msg_id mode** (`--from <stream> --msg-id N`) waits for the exact `(stream_id, msg_id)`. **Stream mode** (`--from <stream>` with no `--msg-id`) waits for the stream's terminal report for **any** `msg_id` or for the session to close, returning the terminal report else a `closed_without_report` result (see "Stream-mode await"). `progress` reports are observed but do not complete the await. Default `--timeout` is 30s in msg_id mode and 900s in stream mode; an explicit `--timeout` always wins. `--include-details` and `--include-extras` request those fields from the daemon response. |
 | `agent-orch inspect <stream_id> [--msg-id N] [--event-tail N] [--full \| --max-text N] [--json]` | Ask `chat_streamd` for the stream's current session status, recent daemon-held chat events, and the best existing terminal report for `msg_id` if supplied. Pretty output truncates event text at 160 characters by default; `--full` disables truncation. |
 | `agent-orch ledger get <tell_id>` | Read one durable peer-message ledger row through `chat_streamd`, including its exact stored text, route, delivery state, timestamps, and attempt metadata. This works from any configured peer; callers never read the daemon host's SQLite file directly. |
@@ -101,26 +132,44 @@ the standard `unsupported_in_v2` response.
 | `agent-orch close [--reason R] [--operator-confirm] [--force\|--defer-if-working] [--from-stream-id STREAM_ID] [--caller-stream-id STREAM_ID] [--progeny STREAM_ID] [--timeout N] <stream_id>` | Direct `close` RPC. Like `report`, this opens its own websocket directly to chat_streamd (`close_once`), so it works from any context with a valid config. `agent-orch close --operator-confirm $AGENT_ORCH_STREAM_ID` is therefore the **universal self-close** (see "Universal self-close" below). `--reason` default `"manual"`. `--operator-confirm` sets `operator_confirm=true` on the wire so the daemon will accept the close for operator-shape session names; the daemon-side identity check also requires the caller stream to be the close target itself, the target's `parent_stream_id`, or the desktop-UI surface (see chat-stream README "Operator-kill safeguards"). `--defer-if-working` persists a generation-fenced close intent and returns `close.ok` with `deferred:true`; bare close retains the `session_working` refusal. `--force` closes immediately; later process cleanup is reconciler-owned. Exit codes: `0` on `close.ok` or idempotent `close.already_closed`; `1` on `close.error`; `2` on malformed input; `64` unreachable; `66` auth failure; `67` timeout. |
 | `agent-orch drain-sessions --operator-confirm <host>:<session_name> [<host>:<session_name> ...] [--timeout N]` | Issue the compatibility `drain_sessions` RPC with explicit intent. The generic agent-orch transport is not an operator credential and the daemon returns `drain_sessions.error error_code="operator_trust_required"`; the CLI prints that typed refusal without fallback or retry. Operands remain exact `host:session_name` keys and wildcards are rejected locally. A future credentialed admin CLI is separate scope. |
 | `agent-orch reconcile status [--host HOST] [--json] [--timeout N]` | Read-only daemon reconciliation audit. Returns counts and row details for open rows whose session is dead, open rows whose host is unreachable, closed rows with unreaped survivor state, and unmanaged trees. Live sessions with no durable row are folded into `unmanaged_tree`. |
-| `agent-orch reparent <stream_id> --to <new-parent> --expected-generation G [--reason R] [--from-stream-id OWN_ID]` | Move an open seat to an open parent within the same daemon, including across hosts. The verified current parent or its live handoff successor may move its child. The verified lifecycle-grant holder may move any open non-protected seat, including one whose old parent is closed or absent; this manager path uses an explicit ruling waiver and requires a non-default reason. Run it from the holder's own seat with its own stream token and `--from-stream-id` set to that seat, never to the old parent. Read `session_generation` with `agent-orch inspect` and pass it as `--expected-generation` to fence stale moves. Manager admitted/applied/refused audit rows bind holder identity and generation, grant revision, target and destination, reason, and request ID. Cycles, protected workers, closed workers and closed new parents refuse. |
+| `agent-orch reparent <stream_id> --to <new-parent> --expected-generation G [--reason R] [--from-stream-id OWN_ID]` | Move an open seat to an open parent within the same daemon, including across hosts. The verified current parent or its live handoff successor may move its child. The verified lifecycle principal (the current front desk under a primary direct binding, otherwise the designated grant holder) may move any open non-protected seat, including one whose old parent is closed or absent; this manager path uses an explicit ruling waiver and requires a non-default reason. Run it from the principal's own seat with its own stream token and `--from-stream-id` set to that seat, never to the old parent. Read `session_generation` with `agent-orch inspect` and pass it as `--expected-generation` to fence stale moves. Manager admitted/applied/refused audit rows bind holder identity and generation, grant revision, target and destination, reason, and request ID. Cycles, protected workers, closed workers and closed new parents refuse. |
 | `agent-orch list` | Fetch the current daemon snapshot and print visible sessions as JSON. Direct snapshots include subagents. |
 | `agent-orch work-lane list \| show \| adopt \| set-state \| set-lead \| set-chat \| set-text \| set-members \| add-member \| set-owner \| update \| request-confirmation \| estimate-preview` | Read and maintain first-class work lanes; mutations are front-desk-only. `--composite-stream-id` defaults to `PENTACLE_ASSISTANT_COMPOSITE_STREAM_ID` and is required when it is unset. See [work lanes CLI](../chat-stream-v2/docs/work-lanes.md#cli). |
 | `agent-orch spec attach \| detach \| assign \| unassign <stream_id> [spec_id]` | Change a seat's spec tags or its one work assignment. See [work assignment](../chat-stream-v2/docs/work-lanes.md#work-assignment-and-checkpoints). |
 | `agent-orch usage --host <h> [--json] [--max-age-seconds N]` | Read one named host's **current account-period usage** (the Claude/Codex `/usage` weekly-limit percentages, resets, and health) once and exit — a read-only, on-demand snapshot distinct from the per-stream token accounting in `list`/`inspect`. The host name comes from `machines.json` (with no registry, only the local host is known). The local host is agent-orch's own host id (`AGENT_ORCH_HOST_ID`, then `~/.agent-orch/config.json` `local_host_id`, then the hostname; `PENTACLE_HOST_ID` overrides). For the local host it reads the cadence-written `usage_state.json` (`source: cadence-file`). A local host without that file runs the peer probes below locally, without SSH. For a peer it reads once over the existing SSH route: that host's own cadence file plus its `~/.claude.json` `cachedUsageUtilization` (both plucked on-host, allowlisted, so no OAuth token leaves the machine), then selects per provider the freshest account-matched observation (a collector-`ok` cadence row within the cutoff, else a newer cache observation, else the newest matched value as `stale`; a cache is used only when its `accountUuid` matches the logged-in `oauthAccount.accountUuid`). Only when nothing matches does it run the `check_claude_usage.py` probe; Codex falls back to `check_codex_usage.py`. Each row carries `host`, `provider`, `pct`, resets, `outcome` (also `status`), `source`, and the observation tuple: `observed_at`, `age_seconds`, `account_id` and `collector` (`ok`/`no_update`/`failed`). A reading older than the freshness cutoff (`--max-age-seconds`, env `PENTACLE_USAGE_MAX_AGE_SECONDS`, default 900), or whose collector last failed, is reported `stale` with the value still shown, never `ok`; any unavailable outcome (`account_mismatch`/`no_weekly_limits`/`auth_error`/`parser_error`/`provider_error`/`transport_error`/`timeout`) yields `pct: null`, never a fabricated `0`. `--json` prints the compact machine form. |
 | `agent-orch ssh <ssh args...>` | Thin passthrough to `ssh(1)` with `-o SendEnv=PENTACLE_STREAM_ID AGENT_ORCH_STREAM_ID AGENT_ORCH_STREAM_TOKEN_FILE AGENT_ORCH_STREAM_TOKEN` prepended, so the running session's leader stream id and private token-file path propagate across the SSH hop (the legacy token name remains for pre-file sessions). Dispatched via a pre-argparse `sys.argv` intercept so leading ssh flags (`-i`, `-v`, `-h`, `-p`, `-J`, `--`) pass through verbatim, then exec'd via `os.execvp("ssh", ...)`. The sshd side must accept those env names — see `deploy/README.md` for the matching `AcceptEnv` drop-in (redeploy on every host before enabling ownership enforcement). |
 
-The current operator-designated lifecycle manager may close an unrelated seat
+The current lifecycle principal (the bound front desk under a primary direct
+binding, otherwise the operator-designated manager) may close an unrelated seat
 without a terminal report by supplying an explicit `--reason`; the CLI supplies
 a request id. Use `--expected-generation <saved-generation>` when closing a
 previously prepared target; a replacement generation is refused. The daemon
 records `manager_close_report_waived` before admission,
-with the verified holder and target generations, grant revision and reason, then
+with the verified principal and target generations, policy revision and reason, then
 records the close outcome separately. Protected seats, open direct children and
 pending child spawns still refuse; live panes require fresh idle capture.
 A local missing pane requires positive `gone` evidence. An initially unreachable
 peer records retirement intent and a generation-fenced deferred reap, with process
 death unverified. For a seat subject to external lane rulings, only the report
 prerequisite is waived: approval and the existing timeout/release behavior remain,
-and release rechecks the current manager grant. Manager reparent behavior is unchanged.
+and release rechecks the current principal. Manager reparent behavior is unchanged.
+
+For a lost close response, preserve the original complete invocation, including
+`--expected-generation`, reason, caller, flags, progeny and any waiver. The CLI
+prints `close request ID: <id>` to stderr before transport and keeps JSON on
+stdout. Repeat that invocation with `--request-id <original-id>`; an explicit
+ID requires an explicit `--expected-generation`. For example:
+
+```sh
+agent-orch close fixture:worker --expected-generation saved-generation --reason 'Accepted work finished'
+# If the response was lost, use the printed ID with the same complete invocation:
+agent-orch close fixture:worker --expected-generation saved-generation --reason 'Accepted work finished' --request-id close-original-id
+```
+
+An exact retry reconciles the existing decision. Changed immutable inputs or
+generation remain conflicts/refusals. The CLI never retries automatically or
+allocates another ID after timeout. Approval while a seat is working still
+defers closure under the existing safety checks.
 
 `agent-orch list` carries `requested_model`, `requested_effort`, `effective_model`,
 `effective_effort`, and `routing_integrity` on every row. `model` and `effort` are
@@ -245,7 +294,7 @@ System nudges route through the same delivery primitive as tells. `delivery_kind
 
 ## Send an image
 
-Use `agent-orch send-image <path> [--caption "..."]` to attach a local PNG or JPEG to **your own** conversation so the operator sees the real image in Pentacle chat (desktop and mobile) and can open it in the image viewer. The image renders as your (the agent's) own message — the same media bubble and viewer the operator's own image attachments use.
+Use `agent-orch send-image <path> [--caption "..."]` to attach a local PNG or JPEG to **your own** conversation so the operator sees the real image in Pentacle chat (web and mobile) and can open it in the image viewer. The image renders as your (the agent's) own message — the same media bubble and viewer the operator's own image attachments use.
 
 ```bash
 agent-orch send-image ./chart.png --caption "Q3 conversions, up 18%"
@@ -259,7 +308,7 @@ On success the CLI prints a JSON receipt:
 { "ok": true, "stream_id": "home:v2-…", "event_id": 4821, "blob_sha": "…", "content_kind": "image_and_text", "duplicate": false, "source_path": "./chart.png", "source_sha256": "…", "bytes": 20518 }
 ```
 
-`event_id` is the durable transcript row (it survives reconnect/history replay as one row). The send is idempotent by `request_id`: a retry with the same request id returns `"duplicate": true` and adds no second row. Genuine error receipts (non-zero exit, `send_image.error` with an `error_code`) cover an unsupported type or oversize file (rejected client-side before upload, exit `2`), a blob that was never uploaded (`attachment_missing`), an invalid attachment (`attachment_invalid`), and calling from an unverified or foreign stream (`stream_ownership_unverified`, exit `66`). Exit codes: `0` delivered, `1` send error, `2` bad input, `66` not authorized. This is agent → operator only; the operator's own image sends use the existing desktop/mobile attachment composer, not this verb.
+`event_id` is the durable transcript row (it survives reconnect/history replay as one row). The send is idempotent by `request_id`: a retry with the same request id returns `"duplicate": true` and adds no second row. Genuine error receipts (non-zero exit, `send_image.error` with an `error_code`) cover an unsupported type or oversize file (rejected client-side before upload, exit `2`), a blob that was never uploaded (`attachment_missing`), an invalid attachment (`attachment_invalid`), and calling from an unverified or foreign stream (`stream_ownership_unverified`, exit `66`). Exit codes: `0` delivered, `1` send error, `2` bad input, `66` not authorized. This is agent → operator only; the operator's own image sends use the existing web/mobile attachment composer, not this verb.
 
 ### Ad hoc images in the assistant chat
 
@@ -362,7 +411,7 @@ receipt is queued or failed, while leaving the durable question available
 through `prompt status`, so a window request cannot look successfully delivered
 while waiting silently.
 
-Question mutations fail closed with `question_unauthorized`: a connection-authenticated desktop/mobile operator may answer or dismiss any question, while a stream-token-authenticated seat may mutate only a question whose `producer_stream_id` is that seat. The same rule covers `prompt.answer`, `prompt.cancel`, `notification.resolve`, and agent-question `notification.resolve_by_dedup`; caller-supplied actor claims grant no authority.
+Question mutations fail closed with `question_unauthorized`: a connection-authenticated web/mobile operator may answer or dismiss any question, while a stream-token-authenticated seat may mutate only a question whose `producer_stream_id` is that seat. The same rule covers `prompt.answer`, `prompt.cancel`, `notification.resolve`, and agent-question `notification.resolve_by_dedup`; caller-supplied actor claims grant no authority.
 
 If daemon connection, auth, or notification-store availability fails before durable creation, `prompt ask` returns a typed fallback response:
 
@@ -414,7 +463,7 @@ agent-orch asset --title "QA findings" --type report --content-file /tmp/qa-repo
 
 If `--session` is omitted, the CLI uses `discover_leader_stream_id_short()` and publishes to the caller's stream. If `--session` is supplied, the daemon still requires the caller's stream-ownership token for that exact stream; unauthorized or closed sessions fail with typed asset errors. The publisher is provider-agnostic and uses the `asset.publish` RPC exposed by `chat_streamd`.
 
-Republishing with the same `--asset-id` updates the existing asset tab and body in place. Omitting `--asset-id` creates a fresh asset id. The daemon broadcasts metadata only; desktop clients fetch the body lazily when the operator opens the tab. Protocol details live in [report assets](../../docs/report_assets.md).
+Republishing with the same `--asset-id` updates the existing asset tab and body in place. Omitting `--asset-id` creates a fresh asset id. The daemon broadcasts metadata only; web clients fetch the body lazily when the operator opens the tab. Protocol details live in [report assets](../../docs/report_assets.md).
 
 ## Dashboard commands
 
@@ -504,15 +553,15 @@ path. Transfer does not publish a package or reopen the former owner.
 
 ## Self-titling
 
-Agents self-title with `agent-orch title "<succinct durable goal>"` once they understand the session goal. The shared AGENTS.md rule is the primary mechanism; the daemon only backstops desktop-opened interactive chats with a low-frequency naming nudge through the same peer-delivery path when they remain unnamed.
+Agents self-title with `agent-orch title "<succinct durable goal>"` once they understand the session goal. The shared AGENTS.md rule is the primary mechanism; the daemon only backstops web-opened interactive chats with a low-frequency naming nudge through the same peer-delivery path when they remain unnamed.
 
 ## Spawn visibility
 
-When `--visibility` is omitted, `agent-orch spawn` materializes `"default"` for handoffs, `--role nexus`, and parentless spawns (including `--top-level`). A non-Nexus spawn with a parent leaves visibility unset so the daemon resolves it to `"nested"`. Explicit `default`, `nested`, and `hidden` always override this inference.
+Use explicit `--visibility default` for a conversation the operator requested, including when parented to another agent; inspect the effective visibility before reporting it available. Omitted fresh parented work is hidden for every role, including Nexus and QA. Fresh parentless spawns (including `--top-level`) retain `default`. Omitted handoff and native Claude resume inherit the predecessor's stored visibility. Explicit `default`, `nested`, and `hidden` override ordinary inheritance; genuine configured FD and protected Daff seats remain hidden. Visibility changes no lifecycle or rebind authority.
 
 ## Handoff
 
-`agent-orch spawn --handoff` creates a new top-level session for another leader, not a nested child. The CLI sends `handoff:true`, discovers the caller's stream id as `handoff_from_stream_id`, omits `parent_stream_id`, and defaults `visibility` to `"default"` unless the caller explicitly passes `--visibility`. `--handoff` is incompatible with `--parent`.
+`agent-orch spawn --handoff` creates a new top-level successor. The CLI sends `handoff:true`, discovers the caller's stream id as `handoff_from_stream_id`, omits `parent_stream_id`, and preserves omitted visibility so the daemon inherits stored presentation. Immediate and delayed handoffs follow the same rule. Cached legacy requests with a stored explicit `default` retain it; same-key replay retains the admitted successor and receipt. `--handoff` is incompatible with `--parent`.
 
 For Claude spawns, `opus-5.5` and `opus-5` select `claude-opus-5-5`. The full ID `claude-opus-5` still selects Opus 5. The bare `opus` alias and omitted-Claude default remain Opus 4.8.
 
@@ -566,8 +615,12 @@ A successful preflight runs archive/dependency construction and the complete
 stage/activation plan without target commands, target copies, pointer writes or
 the production rollout lock. It writes a receipt binding the installer hash,
 source SHA, repository, host configuration, resolved target names/aliases/roots,
-timeout/resume options, interpreter path/prefix/version/binary hash and runtime
-dependency hashes. The interpreter path preserves the venv symlink: substituting
+timeout/resume options, interpreter path/prefix/version/binary hash, runtime
+dependency hashes and provider packages. When a provider snapshot is supplied,
+the receipt also binds its resolved path and the SHA256 of the exact bytes parsed,
+and `apply_argv` preserves that path as one argument. Changed bytes or a different
+snapshot path require a fresh preflight, even if the provider versions match.
+The interpreter path preserves the venv symlink: substituting
 its resolved base Python changes the environment. Preflight performs **no target
 verification** and grants no deployment authority.
 
@@ -909,7 +962,7 @@ Constraints and safety:
 - **Not in role baselines.** Role baselines (`qa_baseline.md`, `documentation_baseline.md`, etc.) MUST NOT include this flag in their spawn boilerplate. Hidden seats with a real parent already default on; other visibility values default off. A lead who needs to keep a hidden worker open passes `--no-self-close-on-completion`. A test under `services/agent-orch/tests/test_role_baseline_safety.py` scans the live memory-repo baselines for any unconditional reference to the flag and fails if one appears.
 - **Visible via `inspect`.** `agent-orch inspect <stream>` includes `self_close_on_completion: true|false` in its session summary so operators can confirm authorization status without grep'ing the audit log.
 - **Re-upserts require explicit re-authorization.** `session_store.upsert()` defaults `self_close_on_completion=False`; callers re-upserting a session row (e.g. reconciliation, pane_pid_gone recovery) must pass the flag explicitly to preserve it. All current internal callers comply.
-- **Omitted flag follows visibility and lineage.** A hidden worker with a real parent gets `self_close_on_completion=True`; one with `--visibility default` or `--visibility nested` gets no self-close bit. Explicit `--no-self-close-on-completion` persists false for a parented worker or handoff. When a worker has no self-close permission and its leader is alive, `report --terminate` reaches `live_leader_refused` exit 6; the leader closes it after consuming the report.
+- **Omitted flag follows explicit visibility and lineage.** A worker created with explicit `--visibility hidden` and a real parent gets `self_close_on_completion=True`; daemon-inherited hidden visibility does not add that CLI convenience. A worker with `--visibility default` or `--visibility nested` gets no self-close bit. Explicit `--no-self-close-on-completion` persists false for a parented worker or handoff. When a worker has no self-close permission and its leader is alive, `report --terminate` reaches `live_leader_refused` exit 6; the leader closes it after consuming the report.
 
 ### Leader-owned close
 
@@ -933,7 +986,7 @@ close leg of `agent-orch report --terminate` bypass the working guard.
 
 ## Spawn cadence and chat_streamd keepalive
 
-`agent-orch spawn` opens a fresh websocket connection to chat_streamd and runs the spawn RPC. Each spawn drives chat_streamd's asyncio event loop through `handle_client` setup, the initial `snapshot` reply, host inventory, and the tmux session creation. When several spawns fire in rapid succession from one or more CLIs, the daemon's event loop can stay busy for tens of seconds servicing the new connections. Existing long-lived connections (desktop clients, mobile clients, and any blocking direct CLI waits) are still subject to the per-connection keepalive ping/pong from the websockets library; if the event loop is too busy to process pongs within the configured window, those existing connections die with `1011 (internal error) keepalive ping timeout`.
+`agent-orch spawn` opens a fresh websocket connection to chat_streamd and runs the spawn RPC. Each spawn drives chat_streamd's asyncio event loop through `handle_client` setup, the initial `snapshot` reply, host inventory, and the tmux session creation. When several spawns fire in rapid succession from one or more CLIs, the daemon's event loop can stay busy for tens of seconds servicing the new connections. Existing long-lived connections (web clients, mobile clients, and any blocking direct CLI waits) are still subject to the per-connection keepalive ping/pong from the websockets library; if the event loop is too busy to process pongs within the configured window, those existing connections die with `1011 (internal error) keepalive ping timeout`.
 
 To prevent that cascade, chat_streamd's `serve()` invocation now passes `ping_interval=30, ping_timeout=60` (rather than the websockets-library defaults of 20/20). The post-ping pong-wait window is 60 seconds, so an event-loop stall up to ~60 s after a ping is sent will not trip the keepalive on existing connections. Worst-case dead-peer detection under normal scheduling moves from ~40 s to ~90 s — acceptable given this product has no sub-minute liveness requirement.
 
@@ -1020,7 +1073,7 @@ map "terminate yourself" to; it sidesteps the `report --terminate` self-close
 classifier entirely (no `top_level_refused` / `live_leader_refused`) and needs
 no `--msg-id`, `ReportPayloadV1`, or `--self-close-on-completion` spawn flag.
 Session/tmux teardown happens daemon-side in chat_streamd's `_perform_close`,
-the same close core used by the desktop UI's trash button.
+the same close core used by the web UI's trash button.
 
 **Report-expected workers must report first.** Because the universal self-close
 files no report, a worker whose leader may be `await`ing it (parented/handoff
@@ -1700,3 +1753,6 @@ current pin snapshot under a real admission hold. The authenticated host resolve
 the successful chain. Matching artifacts reuse retained turn evidence without
 creating the prospective generation; only a changed provider target needs a new
 native turn. See [provider accounts](../../docs/provider_accounts.md).
+
+Test and proof actors use the [test prompt settings](../../docs/test_prompt_profiles.md),
+exposed by `agent-orch profiles`; they pass explicit model/effort values.

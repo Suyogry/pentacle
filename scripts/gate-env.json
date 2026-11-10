@@ -156,8 +156,7 @@
           },
           "default_patterns": [
             "test/*.test.js",
-            "test/*.test.ts",
-            "test/e2e/terminal_interaction_runtime/*.test.js"
+            "test/*.test.ts"
           ],
           "timeout_s": 900,
           "max_timeout_s": 7200,
@@ -176,11 +175,11 @@
           "capabilities": "v2_host",
           "preflight_script": "services/chat-stream-v2/tools/gate_preflight.sh",
           "tier_timeouts": {
-            "unit": 2100,
+            "unit": 4320,
             "smoke": 900
           },
-          "timeout_s": 3000,
-          "max_timeout_s": 3000
+          "timeout_s": 5220,
+          "max_timeout_s": 5220
         },
         "cli-pytest": {
           "kind": "pytest_files",
@@ -223,7 +222,10 @@
         },
         "web-gate": {
           "kind": "web_gate",
-          "pass_env": ["PENTACLE_WEB_GATE_SCENARIOS", "PENTACLE_WEB_GATE_CONSUMER_ROOT"],
+          "pass_env": [
+            "PENTACLE_WEB_GATE_SCENARIOS",
+            "PENTACLE_WEB_GATE_CONSUMER_ROOT"
+          ],
           "needs": [
             "python",
             "node",

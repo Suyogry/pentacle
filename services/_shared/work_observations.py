@@ -14,7 +14,7 @@ from pathlib import Path
 
 from .specs_parser import WORK_SPEC_ID_RE, load_frontmatter, parse_work_facts
 
-MATERIAL_FIELDS = ("status", "ac_checked", "ac_total", "estimate", "estimate_exempt", "status_text", "next_action_text")
+MATERIAL_FIELDS = ("status", "ac_checked", "ac_total", "estimate", "estimate_exempt", "status_text", "next_action_text", "criteria", "transitions")
 
 
 class WorkFilesUnsettled(ValueError):
@@ -32,7 +32,8 @@ def _signature(path: Path) -> tuple:
     return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
 
 
-def read_work_candidate(folder: Path, status: str, *, now: float, quiet_s: float) -> dict:
+def read_work_candidate(folder: Path, status: str, *, now: float, quiet_s: float,
+                        previous: dict | None = None) -> dict:
     """Read exactly the two source files, checking identities around the read."""
     paths = (folder / "spec.md", folder / "summary.md")
     before = [_signature(p) for p in paths]
@@ -41,6 +42,12 @@ def read_work_candidate(folder: Path, status: str, *, now: float, quiet_s: float
     after = [_signature(p) for p in paths]
     unsettled = (before != after or any(now - p.stat().st_mtime < quiet_s for p in paths)
                  or not all(text.strip() for text in texts))
+    digest = hashlib.sha256(json.dumps([status, *texts], ensure_ascii=False).encode()).hexdigest()
+    from .checkpoint_policy import policy_revision
+    if (not unsettled and previous is not None and previous.get("quality") == "fresh"
+            and previous.get("path") == str(folder) and previous.get("source_hash") == digest):
+        if previous.get("facts", {}).get("checkpoint_policy_revision") == policy_revision():
+            return copy.deepcopy(previous)
     try:
         fm = load_frontmatter(texts[0])
     except (ValueError, yaml.YAMLError):
@@ -56,7 +63,6 @@ def read_work_candidate(folder: Path, status: str, *, now: float, quiet_s: float
         return {"spec_id": identity, "quality": "stale", "error": "work_files_unsettled", "path": str(folder)}
     facts = parse_work_facts(*texts, status)
     facts["title"] = facts["title"] if isinstance(facts["title"], str) else None
-    digest = hashlib.sha256(json.dumps([status, *texts], ensure_ascii=False).encode()).hexdigest()
     return {"spec_id": identity, "quality": "fresh", "facts": facts,
             "source_hash": digest, "path": str(folder), "error": None,
             "document_revisions": {name: hashlib.sha256(content).hexdigest()
@@ -94,15 +100,29 @@ def advance_observation(spec_id: str, previous: dict | None, candidate: dict, *,
         rev = record["member"]["obs_rev"] + int(material)
         source_changed = (timestamp(now) if record.get("source_hash") != candidate["source_hash"]
                           else record["member"]["source_changed_at"])
+        organization = {"_epic", "_epic_error"}
+        organization_only = (old is not None
+            and any(old.get(key) != facts.get(key) for key in organization)
+            and all(old.get(key) == facts.get(key) for key in (old.keys() | facts.keys()) - organization))
+        progress_changed = (record.get("progress_changed_at", record["member"].get("source_changed_at"))
+                            if organization_only or record.get("source_hash") == candidate["source_hash"]
+                            else source_changed)
         member = {"spec_id": spec_id, **facts, "source_changed_at": source_changed,
                   "observation": {"quality": "fresh", "observed_at": timestamp(now), "error": None}, "obs_rev": rev}
+        checkpoint_changed = (old is not None and old.get("checkpoint_revision") is not None
+                              and old.get("checkpoint_revision") != facts.get("checkpoint_revision")
+                              and old.get("checkpoint_policy_revision") == facts.get("checkpoint_policy_revision")
+                              and record.get("source_hash") != candidate["source_hash"])
+        member["checkpoint_changed_at"] = timestamp(now) if checkpoint_changed else record["member"].get("checkpoint_changed_at")
+        member["checkpoint_first_observed_at"] = (record["member"].get("checkpoint_first_observed_at") or timestamp(now))
+        member["goal_source"] = {"spec_id": spec_id, "revision": (candidate.get("document_revisions") or {}).get("spec.md")}
         if material:
             fields = ("status", "ac_checked", "ac_total", "estimate", "estimate_exempt")
             change = {"spec_id": spec_id, "obs_rev": rev,
                       "prior": {k: old.get(k) for k in fields}, "next": {k: facts.get(k) for k in fields},
                       "source_changed_at": source_changed}
         record.update(member=member, last_good=copy.deepcopy(facts), path=candidate["path"],
-                      source_hash=candidate["source_hash"],
+                      source_hash=candidate["source_hash"], progress_changed_at=progress_changed,
                       document_revisions=candidate.get("document_revisions") or {},
                       incident=None, bad_since=None, bad_sweeps=0)
     else:
@@ -118,9 +138,12 @@ def advance_observation(spec_id: str, previous: dict | None, candidate: dict, *,
         member = record["member"]
         if quality in ("missing", "ambiguous"):
             member = {**unresolved_member(spec_id, quality), "obs_rev": member["obs_rev"],
-                      "source_changed_at": member["source_changed_at"], "observation": dict(member["observation"])}
+                      "source_changed_at": member["source_changed_at"], "observation": dict(member["observation"]),
+                      "checkpoint_changed_at": member.get("checkpoint_changed_at"),
+                      "checkpoint_first_observed_at": member.get("checkpoint_first_observed_at")}
         elif old is not None:
             member = {**member, **old}
         member["observation"] = {**member["observation"], "quality": quality, "error": error}
+        member["checkpoint_state"] = "unverifiable"
         record["member"] = member
     return record, change

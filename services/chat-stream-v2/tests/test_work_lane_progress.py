@@ -1,4 +1,6 @@
 """File-derived work survives a paused lane without a running lead."""
+import pytest
+
 from test_work_lanes import run
 
 
@@ -54,6 +56,7 @@ def test_membership_replay_cas_auth_bounds_and_unknown_ids():
 
 
 def test_index_revision_history_and_re_read_membership(tmp_path, monkeypatch):
+    import asyncio
     import time
     from _shared.specs_service import SpecsSubsystem
     folder = tmp_path / "memory" / "work" / "in_progress" / "demo__span"
@@ -75,9 +78,14 @@ def test_index_revision_history_and_re_read_membership(tmp_path, monkeypatch):
         assert not [e for e in shown["events"] if e["operation"] == "item_change"]
         for revision, mark in ((2, "x"), (3, " "), (4, "x")):
             spec.write_text(template.format(mark))
-            await scan()
-            await scan()
-            shown = await env.store.get_work_lane(lid)
+            # File observations may retain stale facts until a fresh scan.
+            deadline = time.monotonic() + 2
+            while True:
+                await scan()
+                shown = await env.store.get_work_lane(lid)
+                if shown["members"][0]["obs_rev"] == revision or time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(0.01)
             assert shown["members"][0]["obs_rev"] == revision
             assert shown["lane"]["version"] == 1
         events = [e for e in shown["events"] if e["operation"] == "item_change"]
@@ -93,6 +101,50 @@ def test_index_revision_history_and_re_read_membership(tmp_path, monkeypatch):
         shown = await env.store.get_work_lane(lid)
         assert [m["spec_id"] for m in shown["members"]] == ["spec_demo__other"]
         assert len([e for e in shown["events"] if e["operation"] == "item_change"]) == 3
+    run(body, str(tmp_path / "fixture.db"))
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("filename", ["spec.md", "summary.md"])
+def test_same_metadata_file_edits_commit_each_material_revision(tmp_path, monkeypatch, explicit, filename):
+    from _shared.specs_service import SpecsSubsystem
+    folder = tmp_path / "memory" / "work" / "in_progress" / "demo__span"
+    folder.mkdir(parents=True)
+    spec_text = "---\nid: spec_demo__span\ntitle: Span\n---\n## Acceptance Criteria\n- [ ] Assemble.\n"
+    (folder / "spec.md").write_text(spec_text)
+    (folder / "summary.md").write_text("**Next action** — Test the span.\n")
+    monkeypatch.setenv("PENTACLE_MEMORY_ROOT", str(tmp_path / "memory"))
+    subsystem = SpecsSubsystem(session_summaries=lambda: [], changed_callback=lambda ids: None,
+                               debounce_s=0, **({"memory_root": tmp_path / "memory"} if explicit else {}))
+    paths = [folder / name for name in ("spec.md", "summary.md")]
+    identity_fingerprint = subsystem._identity_fingerprint
+    fingerprints = {path: identity_fingerprint(path) for path in paths}
+    monkeypatch.setattr(subsystem, "_identity_fingerprint", lambda path, **kwargs:
+                        fingerprints[path] if path in fingerprints else identity_fingerprint(path, **kwargs))
+    now = max(path.stat().st_mtime for path in paths) + 1
+    path = folder / filename
+    original = path.read_text()
+    changed = original.replace("[ ]", "[x]") if filename == "spec.md" else original.replace("Test", "Ship")
+    assert changed != original and len(changed.encode()) == len(original.encode())
+
+    async def body(env):
+        lid = (await env.adopt(state="paused", lead=False, owner="operator", members=["spec_demo__span"]))["lane"]["lane_id"]
+        await env.store.reconcile_work_observations(subsystem.scan_work_observations(now=now), settle_s=0, sweep=True)
+        for revision, text in enumerate((changed, original, changed), 2):
+            path.write_text(text)
+            scan = subsystem.scan_work_observations(now=now + revision)
+            assert scan["candidates"]["spec_demo__span"][0]["quality"] == "fresh"
+            await env.store.reconcile_work_observations(scan, settle_s=0, sweep=True)
+            shown = await env.store.get_work_lane(lid)
+            assert shown["members"][0]["obs_rev"] == revision
+            assert shown["lane"]["version"] == 1
+        events = [event for event in shown["events"] if event["operation"] == "item_change"]
+        assert [event["event_id"] for event in events] == [f"item:{lid}:spec_demo__span:{n}" for n in (2, 3, 4)]
+        assert all(event["actor_stream_id"] == "daemon:index" and event["publication_event_id"] is None for event in events)
+        await env.store.reconcile_work_observations(subsystem.scan_work_observations(now=now + 10), settle_s=0, sweep=True)
+        repeated = await env.store.get_work_lane(lid)
+        assert repeated["members"][0]["obs_rev"] == 4 and repeated["lane"]["version"] == 1
+        assert len([event for event in repeated["events"] if event["operation"] == "item_change"]) == 3
     run(body, str(tmp_path / "fixture.db"))
 
 
@@ -112,8 +164,9 @@ def test_all_members_show_and_inline_inventory_keep_membership_order():
         assert [m["spec_id"] for m in frame["lanes"][0]["members"]] == ids[:8]
         shown = await server._on_work_lanes_show({"lane_id": lane["lane_id"], "members": True,
                                                  "_auth_context": {"operator_authenticated": True}})
-        assert [m["spec_id"] for m in shown["members"]] == ids
-        assert shown["projection"]["members"] == shown["members"]
+        assert [m["spec_id"] for m in shown["members"]] == sorted(ids)
+        from work_lanes_projection import detail_member_keys
+        assert shown["projection"]["members"] == [{k: v for k, v in m.items() if k not in detail_member_keys()} for m in shown["members"]]
     run(body)
 
 
@@ -248,7 +301,7 @@ def test_every_done_to_open_conflicts_without_consuming_confirmation(to):
         history = await a1_close(env, (await env.adopt("stream:history", owner="operator", members=[A]))["lane"])
         holder = await a1_holder(env)
         confirmation = env.confirm("reopen-confirm", history["lane_id"], "set_state:" + to)
-        payload = {"to": to, "reason": "Reopen fixture", "operator_confirmation": confirmation}
+        payload = {"to": to, "reason": "Reopen fixture", "next_action": "Resume after dependency clears", "operator_confirmation": confirmation}
         if to == "blocked":
             payload["blocker"] = "Fixture dependency"
         before = await a1_snapshot(env)
@@ -269,7 +322,7 @@ def test_done_membership_repair_allows_reopen(replacement):
         await env.adopt("stream:current", state="paused", owner="operator", members=[A])
         fixed = (await env.op("set_members", {"members": replacement, "no_spec_reason": None if replacement else "Replanned"},
                             lane=history["lane_id"], version=history["version"]))["lane"]
-        result = await env.op("set_state", {"to": "paused", "reason": "Replanned"}, lane=fixed["lane_id"], version=fixed["version"])
+        result = await env.op("set_state", {"to": "paused", "reason": "Replanned", "next_action": "Resume after the fixture dependency clears"}, lane=fixed["lane_id"], version=fixed["version"])
         assert result["lane"]["work_state"] == "paused"
     run(body)
 
@@ -286,7 +339,7 @@ def test_replay_before_conflict(operation):
             if operation == "reopen":
                 lane = await a1_close(env, lane)
                 lane = (await env.op("set_members", {"members": [A]}, lane=lane["lane_id"], version=lane["version"]))["lane"]
-                payload, verb = {"to": "paused", "reason": "Resume fixture"}, "set_state"
+                payload, verb = {"to": "paused", "reason": "Resume fixture", "next_action": "Resume after the fixture dependency clears"}, "set_state"
             else:
                 payload, verb = {"members": [A]}, "set_members"
             kwargs = {"lane": lane["lane_id"], "version": lane["version"]}
@@ -322,7 +375,7 @@ def test_member_conflict_before_cas(operation):
         if operation == "reopen":
             lane = await a1_close(env, await a1_holder(env))
             holder = (await env.adopt("stream:current", state="paused", owner="operator", members=[A]))["lane"]
-            verb, payload = "set_state", {"to": "paused", "reason": "Resume"}
+            verb, payload = "set_state", {"to": "paused", "reason": "Resume", "next_action": "Resume after the fixture dependency clears"}
         else:
             holder = await a1_holder(env)
             lane = (await env.adopt("stream:target", state="paused", owner="operator"))["lane"]
@@ -394,10 +447,17 @@ def test_additive_estimate_metadata_persists_projection_restart_last_good(tmp_pa
         frame = await server.work_lanes.current()
         listed = await server._on_work_lanes_list({"_auth_context": {"operator_authenticated": True}})
         shown = await server._on_work_lanes_show({"lane_id": lid, "_auth_context": {"operator_authenticated": True}})
+        assert [member["spec_id"] for member in frame["lanes"][0]["members"]] == [A, B]
+        assert [member["spec_id"] for member in listed["lanes"][0]["members"]] == [A, B]
+        assert [member["spec_id"] for member in shown["members"]] == sorted([A, B])
+        from work_lanes_projection import detail_member_keys
+        assert shown["projection"]["members"] == [{k: v for k, v in m.items() if k not in detail_member_keys()} for m in shown["members"]]
         for lane in (frame["lanes"][0], listed["lanes"][0], shown["projection"]):
-            assert lane["members"][0]["estimate_exempt"] is True
-            assert lane["members"][1]["estimate"]["as_of"] == "2026-10-10"
-            assert lane["members"][1]["obs_rev"] == 2
+            by_id = {member["spec_id"]: member for member in lane["members"]}
+            assert set(by_id) == {A, B}
+            assert by_id[A]["estimate_exempt"] is True
+            assert by_id[B]["estimate"]["as_of"] == "2026-10-10"
+            assert by_id[B]["obs_rev"] == 2
             assert lane["estimate_complete"] and lane["open_estimated"] == 1
             assert lane["version"] == 1
         # A malformed summary preserves both independent last-good facts.

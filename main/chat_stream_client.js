@@ -124,9 +124,8 @@ function _backoff(attempt) {
   return (base + jitter) * 1000;
 }
 
-// Resolve this host's build SHA across the three ways Pentacle is run:
-//  1. a packaged Electron app — electron-builder stamps package.json
-//     `pentacleBuildSha` (scripts/build-mac.js);
+// Resolve this host's build SHA from available release metadata:
+//  1. an explicit `pentacleBuildSha` in package.json;
 //  2. a deployed web release — built with `git archive <sha>`, which has no
 //     `.git` and no packaged metadata, so `build-sha.txt` carries the SHA via
 //     the `export-subst` rule in `.gitattributes`;
@@ -236,7 +235,7 @@ class ChatStreamClient {
       ...(this._workLanes ? { work_lanes: this._workLanes } : {}),
       // Version info for the Settings footer (issue #13): this host's own build
       // SHA and the connected daemon's checkout SHA. Both ride the snapshot so
-      // the renderer reads them from one place in Electron and web mode.
+      // the renderer reads them from one place.
       build_sha: this._buildSha,
       runtime_sha: this._runtimeSha,
     };
@@ -713,7 +712,7 @@ try {
     });
   }
 
-  spawnSession({ host, provider, model, effort, spawnProfile, catalogVersion, resolutionSource, openedByHostId, objective, initialPrompt, idempotencyKey } = {}) {
+  spawnSession({ host, provider, account, model, effort, spawnProfile, catalogVersion, resolutionSource, openedByHostId, objective, initialPrompt, idempotencyKey } = {}) {
     const payload = { type: 'spawn', host, provider };
     // A desktop manual spawn is always a complete, daemon-validated tuple.
     // Keep legacy agent-orch callers working by only adding the V2 fields when
@@ -730,11 +729,16 @@ try {
     if (objective !== undefined) payload.objective = objective;
     if (initialPrompt !== undefined) payload.initial_prompt = initialPrompt;
     if (idempotencyKey !== undefined) payload.idempotency_key = idempotencyKey;
+    if (account !== undefined) payload.account = account;
     return this.sendCommand(payload, 'spawn');
   }
 
   getSpawnCatalog() {
     return this.sendCommand({ type: 'spawn_catalog_get' }, 'spawn_catalog_get', { timeoutMs: this._spawnCatalogRpcTimeoutMs });
+  }
+
+  getProviderAccounts() {
+    return this.sendCommand({ type: 'account', action: 'status' }, 'account');
   }
 
   sendMessage({ host, sessionName, streamId, text, requestId, optimisticId, attachments, meta, replyToMessageId, replyToQuestionId, urgent } = {}) {

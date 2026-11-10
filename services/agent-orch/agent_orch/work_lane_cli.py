@@ -64,8 +64,14 @@ def _print_members(members):
         hours = f"{estimate['p25']}–{estimate['p75']}h (median {estimate['median']})" if estimate else "unknown"
         print(f"    {member['spec_id']}  {member.get('status')}  AC {ac}  estimate {hours}  "
               f"[{(member.get('observation') or {}).get('quality', 'unknown')}]")
-        if member.get("next_action_text"):
-            print(f"      next: {member['next_action_text']}")
+        from _shared.checkpoint_policy import FIELDS
+        for field in FIELDS:
+            if member.get(field.wire_key):
+                print(f"      {field.label}: {member[field.wire_key]}")
+        for key in ("worked", "lead_seat", "criteria", "transitions", "checkpoint_state", "checkpoint_deficiencies",
+                    "checkpoint_changed_at", "checkpoint_first_observed_at", "goal_text"):
+            if key in member:
+                print(f"      {key}: {json.dumps(member[key], ensure_ascii=False, default=str)}")
 
 
 def cmd_unattended(args: argparse.Namespace) -> int:
@@ -139,10 +145,61 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _complete_members(args, request, response):
+    """Accumulate one coherent live revision, with at most one automatic restart."""
+    restarted = False
+    while True:
+        first = response
+        if first.get("type") != "work_lanes.show.ok":
+            return first
+        if "members_total" not in first and "members_next" not in first:
+            return first  # Preserve complete legacy response shapes verbatim.
+        revision = first.get("detail_revision")
+        members = list(first.get("members") or [])
+        cursor = first.get("members_next")
+        seen = {member["spec_id"] for member in members}
+        if len(seen) != len(members):
+            raise ValueError("lane detail duplicated a member; retry the complete read")
+        cursors = set()
+        while cursor is not None:
+            if cursor in cursors:
+                raise ValueError("lane detail cursor did not advance")
+            cursors.add(cursor)
+            page = _call(args, {**request, "members_after": cursor})
+            if page.get("type") != "work_lanes.show.ok":
+                return page
+            if page.get("detail_revision") != revision:
+                if restarted:
+                    raise ValueError("lane detail changed twice; retry the complete read")
+                restarted = True
+                response = _call(args, request)
+                break
+            for member in page.get("members") or []:
+                if member["spec_id"] in seen:
+                    raise ValueError("lane detail duplicated a member; retry the complete read")
+                seen.add(member["spec_id"])
+                members.append(member)
+            cursor = page.get("members_next")
+        else:
+            total = first.get("members_total", len(members))
+            if total != len(members):
+                raise ValueError("lane detail incomplete; retry the complete read")
+            result = {**first, "members": members, "members_next": None}
+            if isinstance(first.get("projection"), dict):
+                result["projection"] = {**first["projection"], "members": members, "members_next": None}
+            if isinstance(first.get("lane"), dict):
+                result["lane"] = {**first["lane"], "members": [member["spec_id"] for member in members]}
+            return result
+
+
 def cmd_show(args: argparse.Namespace) -> int:
     try:
-        response = _call(args, {"type": "work_lanes.show", "lane_id": args.lane_id,
-                                **({"members": True} if args.members else {})})
+        request = {"type": "work_lanes.show", "lane_id": args.lane_id,
+                   **({"goal_id": args.goal_id} if getattr(args, "goal_id", None) else {}),
+                   **({"members": True} if args.members else {})}
+        response = _call(args, request)
+        if args.members:
+            response = _complete_members(args, request, response)
     except ServiceCredentialUnavailable:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -155,8 +212,11 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(_lane_line(lane) if lane else stored.get("lane_id"))
     print(f"    stored {stored.get('work_state')} ({stored.get('work_state_reason')})  "
           f"owner_kind={stored.get('owner_kind')}  version={stored.get('version')}")
-    if args.members:
-        _print_members(response.get("members", lane.get("members", [])))
+    print(f"    icon: {lane.get('icon') or '-'}")
+    for key in ("visibility_counts", "selected_goal"):
+        if key in lane:
+            print(f"    {key}: {json.dumps(lane[key], ensure_ascii=False, default=str)}")
+    _print_members(response.get("members", lane.get("members", [])))
     for event in response.get("events") or []:
         update = f"  -> {event.get('update_kind')} {event.get('update_id')}" if event.get("update_kind") else ""
         print(f"    {event.get('created_at')}  {event.get('operation')}  "
@@ -191,8 +251,8 @@ def _confirmation(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str
 
 def cmd_set_state(args: argparse.Namespace) -> int:
     payload: dict[str, Any] = {"to": args.to}
-    for key in ("blocker", "outcome", "resolution", "reason"):
-        if getattr(args, key):
+    for key in ("blocker", "outcome", "resolution", "reason", "next_action"):
+        if getattr(args, key, None):
             payload[key] = getattr(args, key)
     return _operation(args, "set_state", _confirmation(args, payload))
 
@@ -242,6 +302,9 @@ def cmd_add_member(args: argparse.Namespace) -> int:
     try:
         for attempt in range(2):
             shown = _call(args, {"type": "work_lanes.show", "lane_id": args.lane_id})
+            if shown.get("type") != "work_lanes.show.ok":
+                return _finish(shown)
+            shown = _complete_members(args, {"type": "work_lanes.show", "lane_id": args.lane_id}, shown)
             if shown.get("type") != "work_lanes.show.ok":
                 return _finish(shown)
             lane = shown["lane"]
@@ -395,7 +458,7 @@ def cmd_estimate_preview(args: argparse.Namespace) -> int:
             if lane["state"] not in ("active", "paused", "blocked", "done"):
                 raise ValueError("invalid lane state")
             count, members = lane["members_total"], lane["members"]
-            if (type(count) is not int or not 0 <= count <= 32 or not isinstance(members, list)
+            if (type(count) is not int or count < 0 or not isinstance(members, list)
                     or count != len(members) or any(not isinstance(m, str) or not WORK_SPEC_ID_RE.fullmatch(m) for m in members)
                     or len(set(members)) != count):
                 raise ValueError("invalid lane membership/count")
@@ -449,6 +512,7 @@ def add_parser(subparsers: Any) -> None:
     p.add_argument("lane_id")
     p.add_argument("--json", action="store_true")
     p.add_argument("--members", action="store_true", help="include member work facts")
+    p.add_argument("--goal-id", help="filter members to one projected goal")
     common(p)
     p.set_defaults(func=cmd_show)
 
@@ -465,6 +529,7 @@ def add_parser(subparsers: Any) -> None:
     p.add_argument("--outcome")
     p.add_argument("--resolution")
     p.add_argument("--reason", help="required for a bound-FD override of an operator-owned lane")
+    p.add_argument("--next-action", help="required resume condition when pausing or blocking a lane")
     p.add_argument("--confirmation-question-id")
     p.set_defaults(func=cmd_set_state)
 

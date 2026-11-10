@@ -4,8 +4,7 @@
 // ── Pentacle headless web host ───────────────────────────────────────────────
 // Serves the esbuild-bundled renderer over HTTP and exposes the same
 // `window.cc` surface over a websocket, owning the tmux attachments and the
-// single chat-stream connection that the Electron main process owns on the
-// desktop.
+// single chat-stream connection to the daemon.
 //
 //   node server --profile <name> [--port 7795] [--bind 127.0.0.1]
 //
@@ -29,6 +28,7 @@ const { createCcHandlers, createCollector } = require(path.join(ROOT, 'main', 'c
 const { createWsBridge } = require('./ws_bridge');
 const { freezeWebDist } = require('./web_build_id');
 const { createPrivateDashboardRoute } = require('./private_dashboards');
+const { createDesignRoutes } = require('./designs');
 const chatStreamClient = require(path.join(ROOT, 'main', 'chat_stream_client'));
 
 const DEFAULT_PORT = 7795;
@@ -365,7 +365,7 @@ function resolveProfilePath(profile) {
 }
 
 function serveStatic(res, urlPath, configJson, frozen) {
-  const rel = urlPath === '/' ? 'web.html' : urlPath.replace(/^\/+/, '');
+  const rel = urlPath === '/' ? 'web.html' : urlPath === '/designs/' ? 'designs.html' : urlPath.replace(/^\/+/, '');
   // Path traversal guard — a request must not escape the frozen bundle.
   if (path.isAbsolute(rel) || rel.split('/').includes('..')) {
     res.writeHead(403).end('forbidden');
@@ -480,6 +480,7 @@ async function main(argv = process.argv.slice(2)) {
     catalogRoot: CONFIG.dashboards?.catalogRoot || null,
     log: (line) => console.warn(line),
   });
+  const designs = createDesignRoutes({ libraryRoot: CONFIG.dashboards?.designLibraryRoot || process.env.PENTACLE_DESIGN_LIBRARY_ROOT || null });
   const loginLimiter = createLoginLimiter();
   const server = http.createServer((req, res) => {
     if (!auth && !loopbackRequestAllowed(req)) {
@@ -518,6 +519,8 @@ async function main(argv = process.argv.slice(2)) {
         .end(JSON.stringify({ ok: true, connections: bridge.connections.size }));
       return;
     }
+    if (designs.handle(req, res, urlPath)) return;
+    if (urlPath === '/designs') { res.writeHead(302, { location: '/designs/' }).end(); return; }
     if (privateDashboards.handle(req, res, urlPath)) return;
     serveStatic(res, urlPath, configJson, frozen);
   });

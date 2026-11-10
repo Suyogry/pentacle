@@ -461,7 +461,7 @@ def probe_cell(host: str, mode: str, args, output: Path) -> dict:
                 inventory = rpc({"type": "list_sessions"}, "list_sessions")
                 row = next(r for r in inventory["active"] if r["stream_id"] == stream)
                 evidence["provider_binding"] = {key: row.get(key) for key in (
-                    "host", "stream_id", "session_generation", "pane_pid", "observer_binding",
+                    "host", "stream_id", "session_generation", "pane_pid", "observer_binding", "account_binding",
                 )}
                 assert row.get("pane_pid"), "provider live PID missing"
                 wait_event(stream, tell_marker)
@@ -481,6 +481,8 @@ def probe_cell(host: str, mode: str, args, output: Path) -> dict:
 
             evidence["cell"] = smoke.run_cell(
                 host, "claude", mode, rpc=capture_rpc, wait_ready=wait_ready, wait_event=wait_event,
+                test_profile_snapshot=getattr(args, "test_profile", None),
+                **({"account": args.accounts[(host, "claude")]} if getattr(args, 'accounts', None) else {}),
                 verify_teardown=close, register_owned=register, close_owned=close,
                 prepare_owned_spawn=prepare, validate_session=validate,
                 rescue_teardown=lambda stream: smoke._rescue_teardown(
@@ -515,6 +517,7 @@ def probe_cell(host: str, mode: str, args, output: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--hosts", nargs="+", required=True)
+    parser.add_argument("--account", action="append", default=[], help="PROVIDER=ALIAS or HOST/PROVIDER=ALIAS")
     parser.add_argument("--evidence-dir", type=Path, required=True)
     parser.add_argument("--candidate-sha", required=True)
     parser.add_argument("--daemon-pid", type=int, required=True)
@@ -527,6 +530,11 @@ def main() -> int:
     parser.add_argument('--foreground-job', action='append', default=[], metavar='HOST=COMMAND',
                         help='Upfront-declared existing finite scratch pytest job for each queued host')
     args = parser.parse_args()
+    try:
+        args.accounts = smoke.account_map(args.account, tuple((h, 'claude', mode)
+                                         for h in args.hosts for mode in smoke.PROMPT_MODES))
+    except ValueError as exc:
+        parser.error(str(exc))
     args.foreground_jobs = {}
     for declaration in args.foreground_job:
         host, separator, command = declaration.partition('=')
@@ -539,8 +547,9 @@ def main() -> int:
         args.foreground_jobs[host] = command
     if args.journeys and set(args.foreground_jobs) != set(args.hosts):
         parser.error('journeys requires a finite foreground-job declaration for every selected host')
+    args.test_profile = smoke.resolve_test_profile()
     args.evidence_dir.mkdir(parents=True, exist_ok=True)
-    result = {"runtime": runtime_binding(args.runtime_checkout, args.candidate_sha, args.daemon_pid), "cells": []}
+    result = {"runtime": runtime_binding(args.runtime_checkout, args.candidate_sha, args.daemon_pid), "cells": [], "test_profile": args.test_profile}
     for host in args.hosts:
         for mode in smoke.PROMPT_MODES:
             output = args.evidence_dir / f"{host}-{mode}"
