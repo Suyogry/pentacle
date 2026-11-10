@@ -488,24 +488,23 @@ signal during teardown is ignored. SIGKILL cannot be handled. Check it with
 `node --test test/e2e/web_gate_interrupt.test.js` (needs Chrome and the web build;
 it boots the gate three times, so it is not part of `npm test`).
 
-For the external loopback profile, choose a free port for each run and use that
-same value for the daemon and gate. For example, start the daemon in one shell:
+For the external loopback profile, use a disposable authenticated daemon with
+`local` host identity, configured via the [quick start](../README.md#quick-start).
+Supply the daemon's port and its private owner-issued operator credential:
 
 ```bash
 export PENTACLE_SMOKE_PORT=49001
-SCRATCH=$(mktemp -d)
-python3 services/chat-stream-v2/main.py --host 127.0.0.1 --port "$PENTACLE_SMOKE_PORT" \
-  --local-host local --db "$SCRATCH/sessions.db" \
-  --notifications-db "$SCRATCH/notifications.db" \
-  --assets-db "$SCRATCH/assets.db" --blob-root "$SCRATCH/blobs" \
-  --disable-hosts --disable-mirror --disable-nudges \
-  --disable-outbound-notices --disable-remote-presence
+export PENTACLE_SMOKE_TOKEN_PATH=/absolute/private/operator.token
+node test/e2e/web_gate.js --profile test/e2e/configs/web_mode_local_smoke.js
 ```
 
-In a second shell, export the same `PENTACLE_SMOKE_PORT` and run
-`node test/e2e/web_gate.js --profile test/e2e/configs/web_mode_local_smoke.js`.
-Stop the daemon and remove its scratch directory afterward. The profile rejects
-missing ports and values outside decimal `1..65535`. Each gate run stores its
+The daemon must already be running on that port. No-registry and localhost
+connections still require authentication. The profile rejects missing/invalid
+ports and missing/non-absolute credential paths; normal private-file checks
+apply on connection. Keep the credential server-side and stop/remove only the
+disposable resources you own afterward. For an automatically provisioned
+isolated run, omit `--profile`; that gate issues and cleans its own credentials.
+Each gate run stores its
 verdict in a unique directory under `test/e2e/runs/`, including runs started in
 the same millisecond. The no-profile gate still starts its own daemon on an
 ephemeral port. Its verdict records the owned daemon PID and confirmed exit;

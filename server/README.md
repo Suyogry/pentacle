@@ -21,23 +21,13 @@ node server --profile <name>      # serve an already-built bundle
 
 The process prints the URL and stays in the foreground; it does **not** open a
 browser. Open the printed `http://127.0.0.1:7795` yourself. Without a daemon to
-talk to, the page loads and the terminals work, but the sidebar is empty — start
-one first if you want sessions:
-
-```bash
-SCRATCH=$(mktemp -d)
-python3 services/chat-stream-v2/main.py --host 127.0.0.1 --port 7796 \
-  --local-host local --db "$SCRATCH/sessions.db" \
-  --notifications-db "$SCRATCH/notifications.db" \
-  --assets-db "$SCRATCH/assets.db" --blob-root "$SCRATCH/blobs" \
-  --disable-hosts --disable-mirror --disable-nudges \
-  --disable-outbound-notices --disable-remote-presence
-```
-
-then export `PENTACLE_SMOKE_PORT=7796` and point the host at the matching
-`test/e2e/configs/web_mode_local_smoke.js` profile:
-`node server --profile test/e2e/configs/web_mode_local_smoke.js`. Stop the owned
-daemon and remove its scratch directory when finished.
+talk to, the page loads and the terminals work, but the sidebar is empty. Follow
+[root quick start](../README.md#quick-start) to install Python dependencies,
+issue a private operator credential, start the daemon and configure its URL and
+`chatStream.tokenPath`. Authentication is required on localhost too. For an
+isolated test without configuring a personal daemon, run
+`node test/e2e/web_gate.js` after building; it owns its temporary daemon,
+credentials and browser. See [web test setup](../docs/E2E_HARNESS.md).
 
 ## Flags
 
@@ -54,7 +44,8 @@ daemon and remove its scratch directory when finished.
 
 With no `--profile`, the host does **not** look for `configs/<machine>.js`: it
 follows `config-loader`'s ordinary precedence — `PENTACLE_CONFIG` if it is set in
-the environment, then `pentacle.config.js`, then `pentacle.config.example.js`. A
+the environment, then `pentacle.config.js` beside the app, then
+`~/.config/pentacle/pentacle.config.js`, then `pentacle.config.example.js`. A
 `--profile` that resolves to nothing is not fatal: the host logs
 `using fallback configuration` and starts with a minimal built-in config, which
 is why an empty sidebar can mean a mistyped profile rather than a dead daemon.
@@ -66,13 +57,14 @@ reaches a browser.
 
 ### Daemon credential
 
-A web host that talks to a **credentialed** chat-stream daemon must name the
+Every web host that talks to the chat-stream daemon must name its
 credential **explicitly**: the v2 operator auth refuses an implicit default path
 (it fails the connection with `operator_auth_v2_private_path_required`). Provide
 it as `--token-path <path>`, or set `chatStream.tokenPath` in the profile —
-either way it stays server-side (stripped from the browser config above). A
-loopback daemon with no credential registry needs neither. Example against a
-tailnet daemon:
+either way it stays server-side (stripped from the browser config above).
+A missing credential registry grants no anonymous access, including on loopback.
+Issue the credential using the [quick start](../README.md#quick-start) before
+connecting. Example against a tailnet daemon:
 
 ```bash
 # --token-path is the daemon credential; --token-file is the web login (the

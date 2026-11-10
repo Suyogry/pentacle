@@ -20,7 +20,7 @@ Issue credentials on the daemon host as its OS owner using
 `services/chat-stream-v2/tools/operator_auth_cli.py issue --client-kind pentacle`.
 The JSON `code` is a secret v2 credential envelope. Save it without printing it
 to a private regular file with mode 0600 under a private directory with mode
-0700. The [local setup recipe](../README.md#local-setup) shows a pipeline that
+0700. The [quick start](../README.md#quick-start) shows a pipeline that
 writes `~/.config/pentacle/desktop.token`. Do not commit the file.
 
 The web host reads `chatStream.tokenPath` in its private config. For `agent-orch`

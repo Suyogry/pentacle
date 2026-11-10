@@ -1,6 +1,6 @@
 # Pentacle Web configuration
 
-Start with [Local setup](../README.md#local-setup), copy
+Start with [Quick start](../README.md#quick-start), copy
 `pentacle.config.example.js` to `~/.config/pentacle/pentacle.config.js`, or select
 another private file with `PENTACLE_CONFIG=/absolute/path/desktop.config.js`.
 The per-user location also works when opening the packaged app from Finder.
