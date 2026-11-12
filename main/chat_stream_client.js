@@ -712,7 +712,7 @@ try {
     });
   }
 
-  spawnSession({ host, provider, account, model, effort, spawnProfile, catalogVersion, resolutionSource, openedByHostId, objective, initialPrompt, idempotencyKey } = {}) {
+  spawnSession({ host, provider, account, model, effort, spawnProfile, catalogVersion, resolutionSource, openedByHostId, objective, initialPrompt, idempotencyKey, codeContext } = {}) {
     const payload = { type: 'spawn', host, provider };
     // A desktop manual spawn is always a complete, daemon-validated tuple.
     // Keep legacy agent-orch callers working by only adding the V2 fields when
@@ -730,6 +730,7 @@ try {
     if (initialPrompt !== undefined) payload.initial_prompt = initialPrompt;
     if (idempotencyKey !== undefined) payload.idempotency_key = idempotencyKey;
     if (account !== undefined) payload.account = account;
+    if (codeContext !== undefined) payload.code_context = codeContext;
     return this.sendCommand(payload, 'spawn');
   }
 

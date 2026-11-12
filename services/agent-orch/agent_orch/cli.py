@@ -1080,6 +1080,8 @@ def _derive_default_idempotency_key(
         "lane_id": payload.get("lane_id"),
         "provision_only": payload.get("provision_only", False),
     }
+    if payload.get("code_context") is True:
+        canonical["code_context"] = True
     digest = hashlib.sha256(
         json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str).encode()
     ).hexdigest()
@@ -1097,6 +1099,20 @@ def spawn(args: argparse.Namespace) -> int:
     handoff = bool(getattr(args, "handoff", False))
     top_level = bool(getattr(args, "top_level", False))
     scheduled = bool(getattr(args, "at", None) or getattr(args, "delay", None))
+    if getattr(args, "code_context", False):
+        if scheduled or handoff or getattr(args, "resume", None) or args.provider not in {"claude", "codex"}:
+            print("agent-orch spawn: --code-context requires a fresh immediate Claude/Codex launch", file=sys.stderr)
+            return 2
+        try:
+            available = asyncio.run(spawn_catalog_get_once(config, timeout=2))
+            if args.provider not in available.get("features", {}).get("code_context_v1", {}).get("providers", []):
+                print("agent-orch spawn: daemon does not support optional code context; upgrade it or omit --code-context", file=sys.stderr)
+                return 2
+        except ServiceCredentialUnavailable:
+            raise
+        except Exception:
+            print("agent-orch spawn: code-context capability could not be confirmed", file=sys.stderr)
+            return 2
     if scheduled and (getattr(args,"pool_override_reason",None) or getattr(args,"pool_authority_ref",None)):
         print("agent-orch spawn: one-spawn pool overrides require an immediate spawn",file=sys.stderr)
         return 2
@@ -1387,6 +1403,8 @@ def spawn(args: argparse.Namespace) -> int:
     }
     if getattr(args, "lane_id", None):
         payload["lane_id"] = args.lane_id
+    if getattr(args, "code_context", False):
+        payload["code_context"] = True
     if getattr(args, "provision_only", False):
         payload["provision_only"] = True
     if getattr(args, "account", None) is not None:
@@ -5366,6 +5384,7 @@ def build_parser() -> argparse.ArgumentParser:
             timer_parser.add_argument("--repeat", action="store_true")
 
     spawn_parser = subparsers.add_parser("spawn")
+    spawn_parser.add_argument("--code-context", action="store_true", help="Optional local code evidence for this fresh Claude/Codex chat; normal source tools remain available")
     spawn_parser.add_argument("--account", help="Named account within existing launch authority; retained for delayed/recurring work. Omitted fresh launches use the target default.")
     spawn_parser.add_argument("--pool-override-reason",help="Current primary/operator: override one spawn's pool control")
     spawn_parser.add_argument("--pool-authority-ref",help="Authority receipt for that one spawn")

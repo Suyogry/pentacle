@@ -73,6 +73,32 @@ def _config(tmp_path: Path, memory_repo_path: Path | None = None) -> Config:
     )
 
 
+def test_code_context_requires_advertised_capability_and_threads_flag(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(cli, 'load_config', lambda: _config(tmp_path))
+    calls=[]
+    async def catalog(*args, **kwargs):
+        return {'features':{'code_context_v1':{'providers':['codex','claude'],'version':1}}}
+    async def spawn(_config, payload, **kwargs):
+        calls.append(payload)
+        return {'type':'spawn.ok','session':{'stream_id':'fixture:child'}}
+    monkeypatch.setattr(cli,'spawn_catalog_get_once',catalog)
+    monkeypatch.setattr(cli,'spawn_once',spawn)
+    args=_spawn_args(tmp_path);args.code_context=True
+    assert cli.spawn(args)==0
+    assert calls[0]['code_context'] is True
+    async def old_catalog(*args, **kwargs): return {}
+    monkeypatch.setattr(cli,'spawn_catalog_get_once',old_catalog)
+    assert cli.spawn(args)==2 and len(calls)==1
+    assert 'does not support' in capsys.readouterr().err
+
+
+def test_code_context_participates_in_automatic_retry_identity():
+    payload={'provider':'codex','host':'fixture','objective':'Explain code'}
+    normal=cli._derive_default_idempotency_key(payload,{})
+    assert cli._derive_default_idempotency_key({**payload,'code_context':False},{}) == normal
+    assert cli._derive_default_idempotency_key({**payload,'code_context':True},{}) != normal
+
+
 def test_spawn_prints_authoritative_preflight_corrections(monkeypatch, tmp_path, capsys):
     errors = [{"code": "origin_malformed", "field": "work_item.origin", "correction": "Repair the existing Tracking line."},
               {"code": "spec_unavailable", "field": "spec_id", "correction": "Restore readable source."}]

@@ -121,6 +121,8 @@ class UIVerbs:
     async def spawn_catalog_get(self, msg: dict[str, Any]) -> dict[str, Any]:
         rid = str(msg.get("request_id") or "")
         response = {"type": "spawn_catalog_get.ok", "request_id": rid, **spawn_catalog()}
+        from code_context_launch import FEATURE
+        response["features"] = {"code_context_v1": FEATURE}
         context = msg.get("_auth_context")
         if isinstance(context, dict) and context.get("connection_client") == "pentacle-mobile":
             available = response.get("available_models")

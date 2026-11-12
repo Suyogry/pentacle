@@ -1,5 +1,8 @@
 # Pentacle
 
+Optional: new Claude/Codex chats can use [local code context](docs/code_context.md)
+to gather focused source evidence. It is off by default and retains normal tools.
+
 **A control plane for your AI agents.**
 
 This fork retains the isolated Electron desktop client for existing users while

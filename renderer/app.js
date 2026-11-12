@@ -6922,6 +6922,7 @@ const SPAWN_PREFERENCES_WRITER_ID = globalThis.crypto?.randomUUID?.() || `window
 let newSessionCatalog = null;
 let newSessionSelection = null;
 let newSessionSubmitting = false;
+let newSessionCodeContext = false;
 const spawnCatalogLoader = createSpawnCatalogLoader(() => window.cc.chatSpawnCatalog());
 // Bumped whenever a spawn is aborted (operator escaped) or the modal is closed,
 // so a late-resolving in-flight spawn cannot re-drive/reopen a modal the operator
@@ -7188,6 +7189,8 @@ function renderSpawnProfileOptions(container) {
   const models = Object.keys(entries);
   const providers = catalogProviders(newSessionCatalog);
   const efforts = entries[selection.model]?.efforts || [];
+  const contextAvailable = newSessionCatalog.features?.code_context_v1?.providers?.includes(selection.provider);
+  if (!contextAvailable) newSessionCodeContext = false;
   const title = document.getElementById('new-session-title');
   const subtitle = document.getElementById('new-session-subtitle');
   if (title) title.textContent = 'New Chat';
@@ -7198,7 +7201,11 @@ function renderSpawnProfileOptions(container) {
       <div class="spawn-profile-row"><label for="spawn-model">Model</label><select id="spawn-model" class="spawn-profile-control" aria-label="Model">${models.map((model) => `<option value="${esc(model)}"${model === selection.model ? ' selected' : ''}>${esc(modelLabel(model))}</option>`).join('')}</select></div>
       <div class="spawn-profile-row"><label for="spawn-effort">Effort</label><select id="spawn-effort" class="spawn-profile-control" aria-label="Reasoning effort">${efforts.map((effort) => `<option value="${esc(effort)}"${effort === selection.effort ? ' selected' : ''}>${esc(effort)}</option>`).join('')}</select></div>
       ${spawnAccountControl(selection.provider, newSessionLocation, selection.account)}
+      ${contextAvailable ? `<div class="spawn-profile-row spawn-context-option"><label for="spawn-code-context"><input type="checkbox" id="spawn-code-context"${newSessionCodeContext ? ' checked' : ''} aria-describedby="spawn-code-context-help"> Use local code context (optional)</label></div><p id="spawn-code-context-help" class="spawn-context-help">Helps the agent find relevant code in a project. Normal search stays available.</p>` : ['claude', 'codex'].includes(selection.provider) ? '<p class="spawn-context-help">Local code context needs an updated Pentacle service. Normal search is available.</p>' : ''}
     </div>`;
+  container.querySelector('#spawn-code-context')?.addEventListener('change', event => {
+    newSessionCodeContext = event.target.checked;
+  });
   container.querySelectorAll('[data-account-selection]').forEach(control => { control.value = control.dataset.accountSelection; });
   container.querySelector('#spawn-provider')?.addEventListener('change', (event) => {
     newSessionSelection = selectionForProvider(event.target.value);
@@ -7330,6 +7337,7 @@ function renderNewSessionModal() {
 }
 
 function showNewSessionModal(terminalMode = false) {
+  newSessionCodeContext = false;
   newSessionTerminalMode = !!terminalMode;
   newSessionStep = 'machine';
   newSessionError = '';
@@ -7361,6 +7369,7 @@ async function newSession(options = {}, locationOverride = null) {
   if (!selection) return null;
   const defaultAlias = newSessionCatalog?.account_status?.defaults?.find(row => row.host === location && row.provider === selection.provider)?.alias;
   const account = selection.account === defaultAlias ? undefined : selection.account;
+  const requestedCodeContext = input.codeContext === true || (!Object.keys(input).length && newSessionCodeContext);
   const profileDefault = newSessionCatalog.profiles?.desktop_manual?.[selection.provider] || [];
   const myToken = ++newSessionSubmitToken;
   newSessionSubmitting = true;
@@ -7381,6 +7390,7 @@ async function newSession(options = {}, locationOverride = null) {
         model: selection.model,
         effort: selection.effort,
         ...(account !== undefined ? { account } : {}),
+        ...(requestedCodeContext && newSessionCatalog.features?.code_context_v1?.providers?.includes(selection.provider) ? { codeContext: true } : {}),
         spawnProfile: 'desktop_manual',
         catalogVersion: newSessionCatalog.catalog_version,
         resolutionSource: input.provider && input.model && input.effort
@@ -7419,6 +7429,9 @@ async function newSession(options = {}, locationOverride = null) {
     return null;
   }
   if (result.session.account_binding?.alias) showToast(`Started account ${result.session.account_binding.alias}`);
+  if (result.session.code_context?.requested && !result.session.code_context.active) {
+    showToast('Local code context is unavailable on this machine. Your chat will use normal search.');
+  }
   hideNewSessionModal();
   const sessionName = result.session.sessionName || result.session.session_name;
   const hostId = result.session.hostId || location;

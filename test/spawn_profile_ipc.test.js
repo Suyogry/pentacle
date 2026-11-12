@@ -33,3 +33,13 @@ test('main returns tuple readback and structured spawn errors', () => {
   assert.match(main, /actualLaunch: session\?\.actual_launch_tuple/);
   assert.match(main, /remediation:/);
 });
+
+test('opt-in traverses the real client wire method and absence stays absent', () => {
+  const prototype = Object.getPrototypeOf(require('../main/chat_stream_client'));
+  const sent = [];
+  const client = { sendCommand: payload => { sent.push(payload); return payload; } };
+  prototype.spawnSession.call(client, { host: 'fixture', provider: 'codex', codeContext: true });
+  prototype.spawnSession.call(client, { host: 'fixture', provider: 'codex' });
+  assert.equal(sent[0].code_context, true);
+  assert.equal(Object.hasOwn(sent[1], 'code_context'), false);
+});

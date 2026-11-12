@@ -285,8 +285,10 @@ def test_spawn_returns_a_durable_queue_handle(
             ctl = SpawnCtl(store, sessions, tmux=tmux)
             gates = {name: asyncio.Event() for name in ("first", "second", "third")}
             started: list[str] = []
+            context_choices = []
 
-            async def resolve(*_args: object, **_kwargs: object):
+            async def resolve(message, *_args: object, **_kwargs: object):
+                context_choices.append(message.get('code_context'))
                 return "provider", {"resolved_launch_tuple": {"provider": "codex"}}, {
                     "provider": "codex", "effective_model": "gpt-5.6-sol",
                     "effective_effort": "high",
@@ -312,7 +314,7 @@ def test_spawn_returns_a_durable_queue_handle(
             while started != ["first"]:
                 await asyncio.sleep(0)
             second = await ctl.spawn(
-                {"objective": "Exercise the existing spawn contract", "provider": "codex", "session_name": "second", "request_id": "r2"}, "hostb",
+                {"objective": "Exercise the existing spawn contract", "provider": "codex", "session_name": "second", "request_id": "r2", "code_context": True}, "hostb",
             )
             third = await ctl.spawn(
                 {"objective": "Exercise the existing spawn contract", "provider": "codex", "session_name": "third", "request_id": "r3"}, "hostb",
@@ -347,6 +349,7 @@ def test_spawn_returns_a_durable_queue_handle(
             ]
             assert states[-3:] == ["queued", "starting", "ready"]
             assert ctl.boot_queue_depths()["hostb"] == 0
+            assert context_choices == [None, True, None], 'queued launch retains only its own explicit opt-in'
         finally:
             store.stop()
 

@@ -54,7 +54,7 @@ test('modelLabel formats catalog ids and keeps the raw fallback', () => {
   assert.equal(modelLabel(''), '');
 });
 
-function renderProfileForTest(selection, models, emissions, catalogOverride = null, providerSelections = [], submissions = [], accountLabels = {}) {
+function renderProfileForTest(selection, models, emissions, catalogOverride = null, providerSelections = [], submissions = [], accountLabels = {}, spawnReply = null, notices = []) {
   const dom = new JSDOM('<main><h1 id="new-session-title"></h1><p id="new-session-subtitle"></p><div id="profile"></div></main>');
   const catalog = catalogOverride || {
     profiles: { desktop_manual: { [selection.provider]: [selection.model, selection.effort] } },
@@ -65,16 +65,18 @@ function renderProfileForTest(selection, models, emissions, catalogOverride = nu
     'catalogTuple', 'catalogProviders', 'providerLabelForHero', 'saveSpawnPreference',
     'selectionForProvider', 'renderNewSessionModal',
     'newSessionSelection', 'newSessionCatalog', 'newSessionError', 'newSessionLocation',
-    'submissions', 'accountLabels',
-    `const CONFIG = { chatStream: { accountLabels } };
+    'submissions', 'accountLabels', 'spawnReply', 'notices',
+    `const CONFIG = { chatStream: { accountLabels }, agents: {} };
      let newSessionSubmitting = false; let newSessionSubmitToken = 0;
+     let newSessionCodeContext = false;
      const state = { slots: [null] };
-     const window = { cc: { chatSpawnV2: async request => { submissions.push(request); return { ok: true }; } } };
+     const window = { cc: { chatSpawnV2: async request => { submissions.push(request); return spawnReply || { ok: true }; } } };
+     const showToast = text => notices.push(text), attachSession = async () => {}, updateSlotViewMode = () => {};
      const waitForNewSessionSpawn = promise => promise; const NEW_SESSION_LONG_WAIT_MS = 100;
      const hideNewSessionModal = () => {};
      ${extractFunction('spawnAccountControl')}; ${extractFunction('renderSpawnProfileOptions')};
      ${extractFunction('newSession')};
-     return { render: renderSpawnProfileOptions, selection: () => newSessionSelection, submit: () => newSession() };`,
+     return { render: renderSpawnProfileOptions, selection: () => newSessionSelection, submit: (options) => newSession(options) };`,
   )(
     dom.window.document,
     String,
@@ -102,11 +104,56 @@ function renderProfileForTest(selection, models, emissions, catalogOverride = nu
     'fixture-host',
     submissions,
     accountLabels,
+    spawnReply,
+    notices,
   );
   const container = dom.window.document.getElementById('profile');
   controller.render(container);
-  return { dom, container, selection: controller.selection, submit: controller.submit };
+  return { dom, container, selection: controller.selection, submit: controller.submit,
+    rerender: () => controller.render(container), catalog };
 }
+
+test('code context is off by default, opt-in only and kept across same-modal renders', async () => {
+  const requests = [];
+  const model = 'gpt-6.1-sol';
+  const catalog = { profiles: { desktop_manual: { codex: [model, 'high'] } },
+    models: { codex: { [model]: { efforts: ['high'] } } },
+    features: { code_context_v1: { providers: ['claude', 'codex'], version: 1 } } };
+  const ui = renderProfileForTest({ provider: 'codex', model, effort: 'high' }, catalog.models.codex, [], catalog, [], requests);
+  let checkbox = ui.container.querySelector('#spawn-code-context');
+  assert.ok(checkbox); assert.equal(checkbox.checked, false);
+  await ui.submit(); assert.equal(Object.hasOwn(requests[0], 'codeContext'), false);
+  checkbox.checked = true; checkbox.dispatchEvent(new ui.dom.window.Event('change'));
+  ui.rerender(); assert.equal(ui.container.querySelector('#spawn-code-context').checked, true);
+  await ui.submit(); assert.equal(requests[1].codeContext, true);
+  await ui.submit({ provider: 'codex', model, effort: 'high' });
+  assert.equal(Object.hasOwn(requests[2], 'codeContext'), false, 'programmatic spawns do not inherit a modal choice');
+  delete ui.catalog.features; ui.rerender();
+  assert.equal(ui.container.querySelector('#spawn-code-context'), null);
+  assert.match(ui.container.textContent, /needs an updated Pentacle service.*Normal search is available/);
+  await ui.submit(); assert.equal(Object.hasOwn(requests[3], 'codeContext'), false);
+});
+
+test('opening a new modal resets code context using the real modal controller', () => {
+  const dom = new JSDOM('<div id="new-session-overlay"></div><h1 id="new-session-title" tabindex="-1"></h1>');
+  const controller = new Function('document', `
+    let newSessionCodeContext = true, newSessionTerminalMode, newSessionStep, newSessionError, newSessionSubmitting;
+    const renderNewSessionModal = () => {}, setNewSessionBackgroundInert = () => {};
+    ${extractFunction('showNewSessionModal')};
+    showNewSessionModal(); return newSessionCodeContext;
+  `);
+  assert.equal(controller(dom.window.document), false);
+});
+
+test('helper unavailable notice still attaches the ordinary chat', async () => {
+  const notices = [], model = 'gpt-6.1-sol';
+  const reply = { ok: true, session: { session_name: 'fixture-chat', code_context: { requested: true, active: false } } };
+  const ui = renderProfileForTest({ provider: 'codex', model, effort: 'high' }, { [model]: { efforts: ['high'] } }, [], null, [], [], {}, reply, notices);
+  const result = await ui.submit();
+  assert.equal(result.sessionName, 'fixture-chat');
+  assert.equal(notices.length, 1);
+  assert.match(notices[0], /unavailable.*normal search/);
+});
 
 function lateCatalogPicker(previousAccount) {
   const dom = new JSDOM('<h1 id="new-session-title"></h1><p id="new-session-subtitle"></p><div id="profile"></div>');

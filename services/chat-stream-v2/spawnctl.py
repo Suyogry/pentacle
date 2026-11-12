@@ -1628,6 +1628,12 @@ class SpawnCtl:
 
     async def spawn(self, msg: dict[str, Any], local_host: str) -> dict[str, Any]:
         """Keep the durable spawn obligation running after request cancellation."""
+        if "code_context" in msg:
+            from code_context_launch import validate
+            try:
+                validate(msg)
+            except ValueError as exc:
+                raise VerbError(str(exc), str(exc)) from None
         from provider_accounts import AccountError, reject_overrides
         try:
             reject_overrides(msg, allow_account=True)
@@ -1961,7 +1967,7 @@ class SpawnCtl:
                     return {
                         "type": "spawn.ok", "ok": True,
                         "stream_id": f"{host}:{recorded_name}",
-                        "session": session,
+                        "session": {**session, **({"code_context": receipt["code_context"]} if "code_context" in receipt else {})},
                         "initial_prompt_delivery": receipt,
                         **({"handoff": receipt["handoff"]} if "handoff" in receipt else {}),
                         "replayed": True,
@@ -2361,6 +2367,8 @@ class SpawnCtl:
                 delivery_receipt=delivery_receipt,
                 native_initial_prompt=native_initial_prompt,
             )
+            if "code_context" in resolution:
+                delivery_receipt["code_context"] = resolution["code_context"]
             if native_initial_prompt and self.instance_id:
                 delivery_receipt["spawn_daemon_instance_id"] = self.instance_id
             # Graph admission ends before boot. A winning parent close makes
@@ -3504,6 +3512,12 @@ class SpawnCtl:
         own private seat credential and target-host PATH envelope.
         """
         explicit = str(msg.get("command") or "").strip()
+        if "code_context" in msg:
+            from code_context_launch import validate as validate_code_context
+            try:
+                validate_code_context(msg)
+            except ValueError as exc:
+                raise VerbError(str(exc), str(exc)) from None
         provider = str(msg.get("provider") or "").strip()
         handoff = bool(msg.get("handoff"))
         account_runtime = getattr(self, "account_runtime", None)
@@ -3586,6 +3600,15 @@ class SpawnCtl:
         if account_binding is not None:
             launch_model, launch_effort = model, effort
 
+        context_instruction = ""
+        context_disposition = None
+        if msg.get("code_context"):
+            from code_context_launch import prepare
+            machine = self._launch_machine(host, provider)
+            if machine is not None:
+                context_instruction, context_disposition = await prepare(self.hosts, host, machine, provider, account_binding)
+            else:
+                context_disposition = {"requested": True, "active": False, "reason": "helper_unavailable"}
         session_id = jsonl_path = token_hash = ""
         deferred_launch_plan: launch.LaunchPlan | None = None
         if explicit:
@@ -3627,6 +3650,7 @@ class SpawnCtl:
                         str(msg.get("cwd") or "") or None
                     ),
                     account_binding=account_binding,
+                    code_context_instruction=context_instruction,
                 )
                 plan = await asyncio.to_thread(build_plan) if provider == "cursor" else build_plan()
             except ValueError as exc:
@@ -3657,6 +3681,8 @@ class SpawnCtl:
         }
         if deferred_launch_plan is not None:
             resolution["_deferred_launch_plan"] = deferred_launch_plan
+        if context_disposition is not None:
+            resolution["code_context"] = context_disposition
         if resolved.get("_handoff_model_change_warning"):
             resolution["handoff_model_change_warning"] = resolved["_handoff_model_change_warning"]
         overrides: dict[str, Any] = {

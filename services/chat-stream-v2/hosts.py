@@ -222,6 +222,17 @@ class Hosts:
             timeout=timeout,
         )
 
+    async def run_command_bounded(self, host: str, *args: str, timeout: float = 2.0) -> tuple[int, str]:
+        """Small optional capability probes; ordinary command behavior is unchanged."""
+        from code_context_launch import limited_exec
+        if host == self.local_host:
+            return await limited_exec(*args, timeout=timeout)
+        peer = self.peers.get(host)
+        if peer is None:
+            return 127, ""
+        return await limited_exec(*ssh_command(peer.ssh_target, shlex.join(args), ssh_bin=self.ssh_bin,
+            connect_timeout=self.cfg.connect_timeout_s, multiplex=False), timeout=timeout)
+
     # -- probe -------------------------------------------------------------
 
     async def probe_once(self, host: str) -> bool:

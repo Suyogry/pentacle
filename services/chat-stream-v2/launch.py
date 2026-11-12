@@ -444,6 +444,7 @@ def _claude_command(
     operator_facing: bool = False,
     resume: bool = False,
     resume_cwd: str | None = None,
+    code_context_instruction: str = "",
 ) -> str:
     """The claude launch shell command (v1 session.py:1417). `launch_model`/
     `launch_effort` are the flags v1 passes ONLY when the client explicitly asked
@@ -452,10 +453,10 @@ def _claude_command(
     claude_bin = _resolve_local_executable(_shell_executable(machine.claude_bin))
     model_flag = f"--model {shlex.quote(launch_model)} " if launch_model else ""
     effort_flag = f"--effort {shlex.quote(launch_effort)} " if launch_effort else ""
-    metadata_flag = (
-        f"--append-system-prompt {shlex.quote(VISIBLE_SESSION_METADATA_INSTRUCTION)} "
-        if operator_facing else ""
-    )
+    instructions = ([VISIBLE_SESSION_METADATA_INSTRUCTION] if operator_facing else [])
+    if code_context_instruction:
+        instructions.append(code_context_instruction)
+    metadata_flag = f"--append-system-prompt {shlex.quote(chr(10).join(instructions))} " if instructions else ""
     identity_flag = "--resume" if resume else "--session-id"
     return (
         f"cd {shlex.quote(resume_cwd or machine.cwd)} && "
@@ -518,6 +519,7 @@ def _codex_command(
     operator_facing: bool = False,
     initial_prompt_file: str | None = None,
     launch_cwd: str | None = None,
+    code_context_instruction: str = "",
 ) -> str:
     """The codex launch shell command (v1 codex_provider.py:_codex_launch_prefix).
 
@@ -571,6 +573,8 @@ def _codex_command(
     required_instructions = [CODEX_OPERATOR_QUESTION_INSTRUCTION]
     if operator_facing:
         required_instructions.append(VISIBLE_SESSION_METADATA_INSTRUCTION)
+    if code_context_instruction:
+        required_instructions.append(code_context_instruction)
     merged_parts = [existing] if existing else []
     merged_parts.extend(
         instruction for instruction in required_instructions
@@ -645,12 +649,15 @@ def build_launch(
     resume_cwd: str | None = None,
     cwd: str | None = None,
     account_binding: Any = None,
+    code_context_instruction: str = "",
 ) -> LaunchPlan:
     """Turn a RESOLVED (provider, model, effort) tuple into the exact launch v1
     emits. `launch_model`/`launch_effort` are None for a profile-default spawn
     (no flag passed, CLI default used) and the canonical value for an explicit
     request — matching v1's `launch_model = model if requested_model is not None`.
     """
+    if code_context_instruction and (provider not in {"claude", "codex"} or resume_session_id is not None):
+        raise ValueError("code_context_unsupported_launch")
     if account_binding is not None and provider == "cursor":
         raise ValueError("cursor_named_accounts_unsupported")
     if provider == "cursor" and resume_session_id is not None:
@@ -672,7 +679,8 @@ def build_launch(
         plan = build_launch(selected_machine, provider=provider, tmux_session=tmux_session,
             launch_model=launch_model, launch_effort=launch_effort, operator_facing=operator_facing,
             initial_prompt_file=initial_prompt_file, resume_session_id=resume_session_id,
-            resume_jsonl_path=resume_jsonl_path, resume_cwd=resume_cwd, cwd=cwd)
+            resume_jsonl_path=resume_jsonl_path, resume_cwd=resume_cwd, cwd=cwd,
+            code_context_instruction=code_context_instruction)
         if provider == "claude":
             # Keep the curated common settings and instructions; project/local
             # authentication helpers cannot override the selected subscription.
@@ -697,6 +705,7 @@ def build_launch(
             operator_facing=operator_facing,
             resume=resume_session_id is not None,
             resume_cwd=resume_cwd,
+            code_context_instruction=code_context_instruction,
         )
         jsonl_path = (
             resume_jsonl_path
@@ -719,6 +728,7 @@ def build_launch(
             operator_facing=operator_facing,
             initial_prompt_file=initial_prompt_file,
             launch_cwd=cwd,
+            code_context_instruction=code_context_instruction,
         )
         return LaunchPlan(
             command=command,

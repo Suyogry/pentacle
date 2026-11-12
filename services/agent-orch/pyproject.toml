@@ -8,8 +8,12 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = ["websockets>=12"]
 
+[project.optional-dependencies]
+code-context = ["tree-sitter>=0.25,<0.26", "tree-sitter-javascript>=0.23,<0.26", "tree-sitter-typescript>=0.23,<0.24"]
+
 [project.scripts]
 agent-orch = "agent_orch.cli:main"
+pentacle-code-context = "agent_orch.code_context.cli:main"
 
 # `deploy/` holds operator-deployable config templates (sshd_config drop-in,
 # per-host install README) and is intentionally NOT a Python package. Restrict

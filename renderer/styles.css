@@ -4305,6 +4305,10 @@ body.web-sidebar-narrow .grid.maximized .grid-cell.narrow-active {
 .spawn-profile-row label { color: var(--fg-dim); font-size: 12px; font-weight: 700; }
 .spawn-profile-control { width: 100%; min-height: 34px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); padding: 6px 9px; font: inherit; text-align: left; }
 .spawn-profile-control:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.spawn-context-option { grid-template-columns: 1fr; }
+.spawn-context-option label { display: flex; gap: 8px; align-items: center; }
+.modal .spawn-context-option input { width: auto; flex: 0 0 auto; margin: 0; padding: 0; }
+.spawn-context-help { margin: 0; color: var(--fg-dim); font-size: 12px; line-height: 1.4; }
 .spawn-provider-toggle { cursor: pointer; }
 .spawn-profile-control option:disabled { color: var(--fg-dim); }
 .new-session-status { min-height: 18px; margin-top: 10px; color: var(--fg-dim); font-size: 12px; }
