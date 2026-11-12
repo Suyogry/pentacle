@@ -1,0 +1,12 @@
+{
+  "base": "9caadf1736c3c03cc8b373a9f8f2edfd8ea6bec7",
+  "contentIdentity": "27e58fe8928e6ff56adb9e0d52fcf9ea558445d31cce65bed7675e3068c083d7",
+  "files": {
+    "main/provider_relogin.js": "2f3375dec395d5d76d665c600b51e78e433e507770d29d850cb123561fda63f7",
+    "renderer/provider_relogin_ui.js": "bedf8ac7bbc57fbe214658ce892bc4c02050efba0cf58651bd14e4104a8c7383",
+    "docs/provider_relogin.md": "63aba7e5a3b0ab8f7d8e5309a8b6809206d0a2adf0e595862541151362880730",
+    "test/provider_relogin.test.js": "d20eb74b92eb0a8beeecc967a0c1cad8be493891a8effe857cf276b8742773d9",
+    "test/provider_relogin_ui.test.js": "d2f80182bdee9d6072e1a2dbd9ed2bd234277a21f98f3cd79cf1c41121b5f4da",
+    "test/compat/claude_relogin.test.js": "595c5f996a029f0e848c4829dd528d5eefdd71c102d2338b634c6579716ff51c"
+  }
+}

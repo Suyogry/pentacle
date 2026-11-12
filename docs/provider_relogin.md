@@ -14,8 +14,9 @@ Use **Open on this device** only when this is the intended browser device.
 For Codex, use a browser on the selected execution host: for a WSL target, use
 its Windows browser. A browser on another machine cannot reach the target's
 localhost callback. This flow does not create callback tunnels or substitute
-device authentication. Claude may require the one-time code shown by the
-provider; enter it in the dialog's password field, never in a chat.
+device authentication. Claude also opens a localhost callback listener. Use a
+browser on the execution host for that callback, or enter the one-time code if
+the provider offers one. Enter codes in the dialog's password field, never in a chat.
 
 Keep the dialog open until it reports **Sign-in verified**. That outcome requires
 a successful login process and a separate CLI authentication check on the same
@@ -26,6 +27,9 @@ Claude CLI output may place its URL after â€œIf the browser didn't open, visit:â
 Pentacle recognizes that complete line as well as a standalone URL, including
 the visible URL text of terminal hyperlinks. Hidden terminal metadata is ignored;
 the same provider URL checks still apply.
+Claude Code 2.1.318 uses `https://claude.com/cai/oauth/authorize`. Pentacle accepts
+that exact origin/path pair alongside the previously supported endpoints;
+arbitrary paths on those domains remain refused.
 
 Cancel, closing Settings, reloading, disconnecting, or quitting stops the owned
 attempt. **Could not confirm the provider stopped** means cleanup is uncertain;
@@ -63,13 +67,30 @@ proxy mismatch. Disconnected auth requests are never queued or replayed.
 
 ## Validation and current limits
 
-The focused suite uses synthetic providers, temporary tokens/profiles and DOM
+The default focused suite uses synthetic providers, temporary tokens/profiles and DOM
 fixtures; its native PTY check replaces the provider executable with a harmless
 fixture before spawning. It never invokes a real provider login or status check.
 
 ```
 node --test test/provider_relogin.test.js test/provider_relogin_ui.test.js test/provider_relogin_transport.test.js
 ```
+
+An opt-in compatibility test runs an actual Claude binary under native PTY with
+a disposable home, config and secure-storage namespace. It requires POSIX,
+`node-pty`, `lsof`, and an explicitly selected CLI with an exact expected version:
+
+```sh
+CLAUDE_COMPAT_BIN=/absolute/path/to/claude CLAUDE_COMPAT_VERSION=2.1.318 \
+  node --test test/compat/claude_relogin.test.js
+```
+
+This test never installs or upgrades a CLI. It checks the real browser handoff,
+owned localhost listener, cancellation, accelerated timeout cleanup, telemetry
+privacy and logged-out status before and after. It does not open a browser,
+submit authorization codes or sign in an account. The timeout case uses four
+seconds; the production deadline remains five minutes. The real 2.1.318 test
+fails against the previous endpoint allowlist even though the fixture suite passes.
+No authorization URLs or codes are written as test evidence.
 
 The full source gate is `npm run prestart && npm test && npm run build:web`.
 Use an isolated tmux namespace and temporary test state for terminal tests.

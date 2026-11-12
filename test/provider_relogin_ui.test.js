@@ -25,6 +25,10 @@ for(const provider of ['codex','claude'])test(`${provider}: provider and executi
   assert.equal(f.el('start').disabled,true);assert.equal(f.calls.length,0);
   await f.start();assert.equal(f.calls[0][1].provider,provider);assert.equal(f.calls[0][1].host,'target-b');assert.equal(f.calls[0][1].available,true);
   if(provider==='codex')assert.match(f.el('browser-guide').textContent,/different machine cannot reach/);
+  else {
+    assert.match(f.el('browser-guide').textContent,/target-b.*localhost callback/);
+    assert.match(f.el('browser-guide').textContent,/If Claude shows a one-time code instead/);
+  }
   assert.equal(f.calls.some(c=>c[0]==='open'),false);
 });
 test('URL and code are transient; code has password input and terminal success clears material',async t=>{

@@ -9,10 +9,11 @@ const BUG_REF = 'spec_pentacle__provider_relogin_buttons_2026_09';
 const MAX_OUTPUT = 65536;
 const PROVIDERS = {
   codex: { login: ['codex', 'login'], verify: ['codex', 'login', 'status'], marker: 'Successfully logged in',
-    origins: ['https://auth.openai.com'], browser: '/bin/true' },
+    endpoints: [['https://auth.openai.com', '/oauth/authorize']], browser: '/bin/true' },
   claude: { login: ['claude', '--debug-file', '/dev/null', 'auth', 'login', '--claudeai'],
     verify: ['claude', '--debug-file', '/dev/null', 'auth', 'status', '--json'], marker: 'Login successful',
-    origins: ['https://claude.ai', 'https://console.anthropic.com', 'https://platform.claude.com'], browser: '/bin/echo' },
+    endpoints: [['https://claude.ai', '/oauth/authorize'], ['https://console.anthropic.com', '/oauth/authorize'],
+      ['https://platform.claude.com', '/oauth/authorize'], ['https://claude.com', '/cai/oauth/authorize']], browser: '/bin/echo' },
 };
 
 function terminalText(text) {
@@ -35,7 +36,9 @@ function authorizationUrl(text, provider) {
     if (!raw.startsWith('https://') || raw.length > 16384 || /\s/.test(raw)) continue;
     try {
       const url = new URL(raw);
-      if (PROVIDERS[provider].origins.includes(url.origin) && url.pathname === '/oauth/authorize'
+      // Keep origin and path paired: Claude 2.1.318 moved its Claude.ai flow
+      // to claude.com/cai/oauth/authorize; this does not authorize other paths.
+      if (PROVIDERS[provider].endpoints.some(([origin, pathname]) => url.origin === origin && url.pathname === pathname)
         && !url.username && !url.password && !url.hash && url.searchParams.get('state')
         && url.searchParams.get('client_id') && url.searchParams.get('code_challenge')) return raw;
     } catch { /* untrusted output is never reflected as an error */ }

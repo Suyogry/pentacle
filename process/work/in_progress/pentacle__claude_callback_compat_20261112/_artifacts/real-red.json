@@ -1,0 +1,60 @@
+{
+  "result": "RED: actual target starts and opens callback listener but controller stays starting",
+  "version": "2.1.318 (Claude Code)",
+  "binarySha256": "677a2ea7bf576cedd20e191d973914ed8a41796f53a63b1923381ddc4d5b5e7d",
+  "package": "@anthropic-ai/claude-code-darwin-arm64@2.1.318",
+  "sourceCandidate": "9caadf1736c3c03cc8b373a9f8f2edfd8ea6bec7",
+  "controller": "production main/provider_relogin.js",
+  "transport": "real node-pty + production loginCommand; claude executable redirected to exact isolated target",
+  "isolation": "constructed env HOME, USER, LOGNAME, CLAUDE_CONFIG_DIR, CLAUDE_SECURESTORAGE_CONFIG_DIR; unique temporary config and keychain service; no default user auth reads or writes by login probe",
+  "statusBefore": {
+    "exitCode": 1,
+    "loggedIn": false
+  },
+  "start": {
+    "ok": true
+  },
+  "listenersDuring": [
+    "127.0.0.1:60226"
+  ],
+  "hadVisiblePrefix": true,
+  "hadSignInAtPrefix": false,
+  "hadOSC": true,
+  "outputBytes": 1040,
+  "visibleAuthorizationShape": {
+    "origin": "https://claude.com",
+    "path": "/cai/oauth/authorize",
+    "queryKeys": [
+      "code",
+      "client_id",
+      "response_type",
+      "redirect_uri",
+      "scope",
+      "code_challenge",
+      "code_challenge_method",
+      "state"
+    ],
+    "hasState": true,
+    "hasChallenge": true,
+    "hasClient": true
+  },
+  "states": [
+    "starting",
+    "stopping",
+    "cancelled"
+  ],
+  "cancellation": {
+    "ok": true,
+    "state": "cancelled"
+  },
+  "statusAfter": {
+    "exitCode": 1,
+    "loggedIn": false
+  },
+  "listenersAfter": [],
+  "limitations": [
+    "No real account browser authorization attempted",
+    "Five-minute deadline not exercised; probe cancelled at four seconds",
+    "Initial separate harness failed by assigning native read-only onData; excluded from product evidence, owned child explicitly SIGINT cleaned and corrected probe rerun"
+  ]
+}

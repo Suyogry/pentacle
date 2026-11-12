@@ -96,6 +96,32 @@ test('Claude accepts its CLI prefix only on a complete validated authorization l
     assert.equal(authorizationUrl(prefix + url + '\n', 'claude'), null);
   }
 });
+test('Claude 2.1.318 callback endpoint is paired with its exact origin and path',()=>{
+  const url = URLS.claude.replace('https://claude.ai/oauth/authorize', 'https://claude.com/cai/oauth/authorize');
+  assert.equal(authorizationUrl(url + '\n', 'claude'), url);
+  assert.equal(authorizationUrl("If the browser didn't open, visit: " + url + '\n', 'claude'), url);
+  assert.equal(authorizationUrl(url, 'claude'), null);
+  assert.equal(authorizationUrl(url + '\n', 'codex'), null);
+  for (const bad of [url.replace('/cai/oauth/', '/oauth/'),
+    url.replace('claude.com/', 'claude.ai/'), url.replace('claude.com/', 'platform.claude.com/'),
+    url.replace('claude.com/', 'claude.com.evil.invalid/'), url.replace('https:', 'http:'),
+    url.replace('https://', 'https://user@'), url + '#fragment',
+    url.replace('state=SENTINEL_STATE', 'missing=x'), url.replace('client_id=fixture', 'missing=x'),
+    url.replace('code_challenge=abc', 'missing=x')]) assert.equal(authorizationUrl(bad + '\n', 'claude'), null);
+});
+test('Claude 2.1.318 visible OSC8 callback URL reaches awaiting_browser only after its newline', t=>{
+  const h = harness(t); h.begin('claude');
+  const url = URLS.claude.replace('https://claude.ai/oauth/authorize', 'https://claude.com/cai/oauth/authorize')
+    + '&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback&code_challenge_method=S256';
+  const output = "Opening browser to sign in…\r\nIf the browser didn't open, visit: "
+    + '\x1b]8;;' + url + '\x07' + url + '\x1b]8;;\x07\r\n';
+  for (const char of output.slice(0, -1)) h.processes[0].data(char);
+  assert.deepEqual(h.states(), ['starting']);
+  h.processes[0].data('\n');
+  assert.equal(h.s.events.at(-1).value.url, url);
+  assert.deepEqual(h.states(), ['starting', 'awaiting_browser']);
+  assert.equal(JSON.stringify(h.logs).includes('SENTINEL'), false);
+});
 for (const terminator of ['\x07', '\x1b\\']) {
   test(`Claude prefixed OSC8 output preserves the full visible URL across chunks (${terminator.length})`, t=>{
     const h = harness(t); h.begin('claude');

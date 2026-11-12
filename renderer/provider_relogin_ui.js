@@ -90,7 +90,7 @@ function createProviderRelogin({ document, cc, parent, makeId = () => {
     el('warning').textContent = `Starting ${LABELS[provider]} sign-in on ${selection.host} may clear or replace its current login. Cancelling or failing can leave this host signed out. Cancellation does not restore the prior login.`;
     el('browser-guide').textContent = provider === 'codex'
       ? `Open the URL in a browser on ${selection.host}, using Windows for a WSL host. A browser on a different machine cannot reach this login's localhost callback. Nothing opens automatically.`
-      : 'Open the temporary URL when ready, then enter the one-time code here. Nothing opens automatically.';
+      : `Open the URL in a browser on ${selection.host} for its localhost callback, using Windows for a WSL host. If Claude shows a one-time code instead, enter it here. Nothing opens automatically.`;
     el('available').checked = false;
     el('confirmation').hidden = false;
     el('start').hidden = false;
