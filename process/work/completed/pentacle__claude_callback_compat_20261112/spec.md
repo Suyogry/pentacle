@@ -2,11 +2,12 @@
 id: spec_claude_callback_compat_20261112
 title: Qualify Claude callback sign-in with the real CLI
 type: spec
-status: in_progress
+status: completed
 canonical: false
 created_at: '2026-11-12'
 updated_at: '2026-11-12'
-source_path: work/in_progress/pentacle__claude_callback_compat_20261112/spec.md
+completed_at: '2026-11-12'
+source_path: work/completed/pentacle__claude_callback_compat_20261112/spec.md
 machine: local
 owner: maintainer
 tags: [authentication, compatibility]
@@ -141,3 +142,26 @@ profile retained, complete rollback copy verified. Live user-started login
 reaches awaiting_browser and is left open. Receipt: `_artifacts/deployment.md`.
 Next: save/push owned source and deployment record to the personal fork, then
 close this item with the source disposition. No further provider interaction.
+
+## Closure — shipped
+
+Owned source fix merged on the personal fork's main and pushed at
+`fcfb3ca5ea3e7d8b5825adeb5b32b0130e27b881`; remote main read back at that exact
+SHA. Scoped installed desktop hotfix activated with artifact identity and
+actual running app readbacks in `_artifacts/deployment.md`. All acceptance
+criteria are satisfied within those stated bounds. App remains open with the
+user's in-progress browser sign-in; no more deployment work requires it to end.
+
+Full account authorization, five-minute endurance, other platforms and fleet
+certification were never acceptance criteria for this bounded compatibility fix.
+Raw private receipts and complete rollback remain available. Owned source
+changes are committed; final metadata disposition is saved separately.
+
+## Retro
+
+The exact provider executable exposed a new origin/path that synthetic output
+could not reveal. Pair endpoint trust instead of broadening URL scraping. For
+packaged releases, verify physical unpacked native permissions separately from
+archive metadata: execute bits can be lost even when header flags match. A no-op
+baseline rebuild made the surgical UI diff demonstrable. Preserve user activity
+when a live sign-in begins during verification.
