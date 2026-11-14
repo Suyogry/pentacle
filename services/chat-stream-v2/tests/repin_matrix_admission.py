@@ -129,6 +129,10 @@ async def prepare(case,j,mp,current,parent,tmp_path,attempt):
         count=await runtime.run(lambda a:a.conn.execute("SELECT count(*) FROM kv WHERE k GLOB 'provider_cli.admission:host-a:matrix-refused*'").fetchone()[0])
         assert count==0
     finally:
+        if consumer=="handoff":
+            # The refusal above uses an open source. Recovery requires it to
+            # drain; retain its checkpoint and tuple for resolver inheritance.
+            await store.update_session(old.host,"matrix-handoff-source",status="closed")
         await store.set_spawn_admission_hold(old.host,held_until=runtime.clock()+1000,reason="finish admission matrix recovery")
         if damaged:damaged[0].write_bytes(damaged[1]);damaged[0].chmod(0o600)
     async def after():
