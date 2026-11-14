@@ -16,6 +16,7 @@ def test_authenticated_operator_hello_negotiates_composite_history(tmp_path):
     token = tmp_path / 'synthetic-token'
     token.write_text(operator_auth.encode_envelope('00000000-0000-4000-8000-000000000001',
         'pentacle', b'x' * operator_auth.AUTH_PROOF_BYTES))
+    token.chmod(0o600)
     nonce = operator_auth.encode_b64url(b'n' * operator_auth.AUTH_NONCE_BYTES)
     hello = core.operator_hello(token, {'auth': {'operator': {'nonce': nonce}}})
     assert hello.get('capabilities', {}).get('assistant_composite_v1') is True

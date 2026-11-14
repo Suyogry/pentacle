@@ -79,8 +79,15 @@ def test_unscoped_qa_spawn_warns_and_keeps_commission():
     from store import Store
     from test_spec_binding_provenance import SpawnTmux
 
+    class CredentialTmux(SpawnTmux):
+        token_staged = False
+
+        async def stage_text(self, path, data):
+            assert path and isinstance(data, bytes) and data
+            self.token_staged = True
+
     async def run():
-        store = Store(); store.start(); tmux = SpawnTmux()
+        store = Store(); store.start(); tmux = CredentialTmux()
         sessions = Sessions(store, tmux=tmux, local_host='localhost')
         ctl = SpawnCtl(store, sessions, tmux=tmux)
         try:
@@ -92,6 +99,7 @@ def test_unscoped_qa_spawn_warns_and_keeps_commission():
                 'from_stream_id': LEAD, 'stream_token': TOKEN, 'role': 'qa'}
             result = await ctl.spawn(msg, 'localhost')
             assert result['type'] == 'spawn.ok'
+            assert tmux.token_staged
             assert 'warnings' in result, result
             assert any('scope' in str(w).lower() and 'unknown' in str(w).lower() for w in result['warnings'])
             row = await store.submit(lambda conn: conn.execute(
