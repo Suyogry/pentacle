@@ -840,3 +840,20 @@ def test_saved_failure_receipt_is_readable_after_settlement(tmp_path,monkeypatch
                 assert row["host_receipt"] is None or set(row["host_receipt"])=={"state","outcome","kind"}
         finally:store.stop()
     asyncio.run(run())
+
+
+def test_saved_receipts_project_codes_only():
+    import sqlite3
+    from types import SimpleNamespace
+    from account_repin_state import rows,saved_receipts
+    from provider_cli_pin import canonical
+    conn=sqlite3.connect(":memory:");conn.row_factory=sqlite3.Row
+    conn.execute("CREATE TABLE v2_account_recovery (binding_key TEXT PRIMARY KEY, state TEXT NOT NULL, data TEXT NOT NULL)")
+    value={"host":"h","provider":"codex","account":"a"};secret={"proof":"SYNTHETIC_PRIVATE_PROOF"}
+    saved={"arguments":{**value,"operation_id":"op"},"status":secret,"park_reason":secret,
+        "host_receipt":{"state":"done","outcome":secret,"kind":"repin","proof":secret,"binding":secret}}
+    conn.execute("INSERT INTO v2_account_recovery VALUES (?,?,?)",("repin:h:codex:a:op","parked",canonical(saved)))
+    projected=saved_receipts(rows(SimpleNamespace(conn=conn),"repin:",value))
+    assert projected==[{"operation_id":"op","status":None,"park_reason":None,
+        "host_receipt":{"state":"done","outcome":None,"kind":"repin"}}]
+    assert "SYNTHETIC_PRIVATE_PROOF" not in str(projected)

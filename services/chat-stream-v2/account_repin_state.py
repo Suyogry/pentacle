@@ -279,8 +279,8 @@ def saved_receipts(attempts):
         receipt=state.get("host_receipt")
         saved=({k:receipt[k] if type(receipt.get(k)) in {str,int} else None for k in ("state","outcome","kind")}
             if isinstance(receipt,dict) else None)
-        reason=state.get("park_reason")
-        result.append({"operation_id":state["arguments"]["operation_id"],"status":state.get("status"),
+        status,reason=state.get("status"),state.get("park_reason")
+        result.append({"operation_id":state["arguments"]["operation_id"],"status":status if isinstance(status,str) else None,
             "park_reason":reason if isinstance(reason,str) else None,"host_receipt":saved})
     return sorted(result,key=lambda x:x["operation_id"])
 
