@@ -11,6 +11,7 @@ backfilled. Changes that land between releases accumulate under `Unreleased`.
 
 ## Unreleased
 
+- Make coordinated deploy restoration wait up to 60 s for a satellite host to reconnect after the daemon restarts, instead of failing the release.
 - Let a seat acquire and clear one maintenance hold with a server-verified operator dispatch and advisor ruling, without operator privileges.
 
 - Add stable release records and tools for checking and updating a single-user install.
