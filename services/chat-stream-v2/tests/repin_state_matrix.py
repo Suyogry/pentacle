@@ -404,12 +404,12 @@ async def run(case,tmp_path,mp):
         mp.setattr(provider_cli_artifact,"verify",verify)
         if late_dispatch and case.row=="B-Z-late":
             baseline=list(native)
-            with pytest.raises(AccountError,match="account_host_failed"):
+            with pytest.raises(AccountError,match="^account_operation_sealed$"):
                 await execute(*late_dispatch[0],**late_dispatch[1])
-            # The exact host error is checked independently of the transport's
-            # intentionally closed error vocabulary.
+            # Transport preserves the typed refusal; the direct host must
+            # agree and neither path may dispatch the sealed operation.
             args,kwargs=late_dispatch
-            with pytest.raises(AccountError,match="account_operation_sealed"):
+            with pytest.raises(AccountError,match="^account_operation_sealed$"):
                 host.handle(args[1],provider=args[0].provider,alias=args[0].alias,expected_generation=args[0].generation,
                     operation_id=hashlib.sha256(args[2].encode()).hexdigest(),generation=args[3],pin=kwargs.get("pin"),reconcile=kwargs.get("reconcile"))
             assert native==baseline

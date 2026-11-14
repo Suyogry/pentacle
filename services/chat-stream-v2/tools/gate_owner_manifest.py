@@ -93,6 +93,30 @@ def _exists(pid: int) -> bool:
     return pid > 0
 
 
+def _libproc_identity(pid: int) -> str | None:
+    """Read the start time of a named process without launching ps on Darwin."""
+    if sys.platform != "darwin" or pid <= 0:
+        return None
+    try:
+        import ctypes
+
+        class BSDInfo(ctypes.Structure):
+            _fields_ = [("header", ctypes.c_uint32 * 12), ("comm", ctypes.c_char * 16),
+                        ("name", ctypes.c_char * 32), ("tail", ctypes.c_uint32 * 6),
+                        ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64)]
+
+        info = BSDInfo()
+        proc_pidinfo = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True).proc_pidinfo
+        proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        proc_pidinfo.restype = ctypes.c_int
+        size = proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+        if size != ctypes.sizeof(info) or info.header[3] != pid or not info.start_sec:
+            return None
+        return f"libproc:{info.start_sec}:{info.start_usec}"
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
 def process_start_identity(pid: int) -> str | None:
     """Return a PID-reuse-resistant identity without test Popen patches.
 
@@ -111,9 +135,18 @@ def process_start_identity(pid: int) -> str | None:
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                               env=dict(os.environ, TZ="UTC0", LC_ALL="C"))
         stdout, _ = process.communicate(timeout=2)
-        return stdout.strip() or None
+        return stdout.strip() or _libproc_identity(pid)
     except (OSError, subprocess.SubprocessError):
-        return None
+        return _libproc_identity(pid)
+
+def _identity_for(pid: int, recorded: str) -> str | None:
+    # Old ps-format manifests and new libproc identities must never be compared
+    # across formats as if they proved PID reuse.
+    if recorded.startswith("libproc:"):
+        return _libproc_identity(pid)
+    observed = process_start_identity(pid)
+    return None if observed and observed.startswith("libproc:") else observed
+
 def _owner(data: dict[str, Any]) -> tuple[int, str, str]:
     try:
         pid = int(data.get("owner_pid", 0))
@@ -126,11 +159,11 @@ def _stale(data: dict[str, Any]) -> bool:
     pid, identity, _ = _owner(data)
     if not _exists(pid):
         return True
-    observed = process_start_identity(pid)
+    observed = _identity_for(pid, identity)
     return observed is not None and bool(identity) and observed != identity
 def _current(data: dict[str, Any]) -> bool:
     pid, identity, _ = _owner(data)
-    return pid == os.getpid() and identity == process_start_identity(pid)
+    return pid == os.getpid() and identity == _identity_for(pid, identity)
 def _read(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -244,7 +277,7 @@ class _ExitEvent:
 def _matching_leader(pgid: int, pid: int, identity: str) -> bool:
     if not _exists(pid):
         return False
-    if not identity or process_start_identity(pid) != identity:
+    if not identity or _identity_for(pid, identity) != identity:
         raise ManifestError("live leader identity is unreadable or recycled")
     try:
         if os.getpgid(pid) != pgid:
@@ -311,25 +344,6 @@ def leader_pgid(pid: int, timeout: float = 2.0) -> int:
         time.sleep(.01)
 
 
-def _entry_signalable(item: dict[str, Any]) -> bool:
-    """True only when the recorded group still holds the recorded process.
-
-    A bare pgid is never signalled: the number alone cannot distinguish the
-    original group from an unrelated one that inherited it after pid reuse.
-    """
-    pgid, pid = item.get("pgid"), item.get("leader_pid")
-    if not isinstance(pgid, int) or not isinstance(pid, int) or pid <= 0:
-        return False
-    if not _exists(pid):
-        return False
-    recorded = item.get("leader_start_identity")
-    observed = process_start_identity(pid)
-    if not isinstance(recorded, str) or not recorded or not observed or observed != recorded:
-        return False
-    try:
-        return os.getpgid(pid) == pgid
-    except (ProcessLookupError, PermissionError):
-        return False
 
 
 def _socket_binding(socket: str, binding: dict[str, Any]) -> dict[str, Any]:
@@ -375,7 +389,7 @@ def _socket_objects(socket: str, binding: dict[str, Any]) -> tuple[int, bool]:
 def _check_socket_identity(pid: int, identity: str) -> None:
     # Exit/reap can occur between the PID probe and the identity read. A missing
     # identity is terminal only with ESRCH; unreadable live/recycled PIDs refuse.
-    observed = process_start_identity(pid)
+    observed = _identity_for(pid, identity)
     if observed != identity and (observed is not None or _exists(pid)):
         raise ManifestError("tmux server identity is unreadable or recycled")
 

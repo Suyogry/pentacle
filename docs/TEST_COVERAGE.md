@@ -162,9 +162,21 @@ and `test/e2e/web_chat_width_gate.cjs`. Neither changes the reference flow.
 [`gate_env.py`](../scripts/gate_env.py) maps the closed target list and provisions
 the declared dependencies. Daemon `v2-pytest` adds four capability invariants to
 every requested selection; it does not substitute for the full merge gate.
-`v2-merge-capacity` retains unit 1800s / smoke 900s; CI uses its separately
-declared `v2-merge-ci` profile. The shell smoke/soak wrappers call the same
+`v2-merge` uses the configured measured bounds and four unit workers. Public CI runs six serial
+`v2-unit-ci-shard` cells followed by one `v2-smoke` invocation.
+The shell smoke/soak wrappers call the same
 `run_gate.py`; their existence does not add tests to merge.
+
+Gate calibration on the frozen `cca674eb` base measured a serial macOS unit
+tier of 1553.424s. The candidate at `3945cf1e` measured 648.759s with two
+workers and the same executable pass-set, a 58.2% reduction. These are
+calibration measurements, not the final three-run acceptance series. Local
+unit and merge profiles use four workers with worker restarts disabled; the
+each hosted partition stays serial. An earlier
+serial calibration measured 1830.653s; it does not measure the new partitions.
+Smoke and the standalone unit cap remain 900s. The capacity budget remains
+unchanged until the new candidate meets its timing acceptance.
+
 
 [`gate_web.py`](../scripts/gate_web.py) invokes
 [`web_gate.js`](../test/e2e/web_gate.js) and the separate interrupt test.
@@ -210,7 +222,7 @@ assertion completeness, uninspected fake boundaries and runtime cost are UNKNOWN
 | Session lifecycle and work coordination | Daemon/CLI `test_session*`, `test_spawn*`, `test_close*`, `test_work*`, `test_report*`; root `test/work*` | Existing daemon/CLI/root runners, and browser `web-work-lanes`, `scheduled-section`, closed-slot/reconnect scenarios. File families locate lifecycle, dispatch and work obligations; assertion semantics and real/fake dependencies outside the named send/spawn/pin references UNKNOWN. |
 | Client rendering, history and workspace | Root `test/chat*`, `test/renderer*`, `test/sidebar*`; chat-core tests; browser registry/history follow-ons | Root component/DOM tests, standalone core and real-browser served candidate fixture journeys protect different boundaries. Selector `client_wire_render` names its inspected seam and version limitations. Actual provider turn round trip, arbitrary installed versions and native/mobile rendering are not certified here. |
 | Satellite transport and pin transitions | Daemon `test_satellite*`, `test_event_push*`, `test_account_satellite_roots.py`; selector `satellite_transition` | Selector documents controlled-peer retry/dedupe and exact-pin fixtures. Real deployment/update/restart/rollback on installed hosts is a separate gate; individual assertions/fake boundaries outside cited selection evidence UNKNOWN. |
-| Release/deploy invocation | Daemon `test_deploy*`, `test_release_selection.py`; selector `deploy_invocation`; root hook tests | Selector records subprocess invocation, refusal/evidence and rollback fixture checks. Source fixtures do not activate installed services or prove host health. Root [`pre_push_hook.test.js`](../test/pre_push_hook.test.js) protects hook behavior separately. |
+| Release/deploy invocation | Daemon `test_deploy*`, `test_nightly_release_path.py`; selector `deploy_invocation`; root hook tests | Selector records subprocess invocation, refusal/evidence and rollback fixture checks. Source fixtures do not activate installed services or prove host health. Root [`pre_push_hook.test.js`](../test/pre_push_hook.test.js) protects hook behavior separately. |
 | Voice, audio and microphone | `mic-server/test/`, daemon `test_voice*`, root `test/*voice*`/`test/*mic*`, browser voice/mic registry | Separate contracts pytest, daemon, root and browser entries. Synthetic audio/state/service fixtures do not establish physical microphone or remote ASR behavior. Per-file assertion/fake-boundary audit UNKNOWN. |
 | Selection, environment and cleanup | [`test_select_tests.py`](../scripts/test_select_tests.py), [`test_gate_env.py`](../scripts/test_gate_env.py), daemon [`test_harness_reaping.py`](../services/chat-stream-v2/tests/test_harness_reaping.py); explicit self-tests / daemon unit | Inspected selector tests use real disposable Git objects and synthetic files to check mapping, rename/shared/missing-evidence fallback and invalid input refusal. Reaping tests inspect real owned processes, identity-safe refusal and a 60s hermetic isolation observation. That intentional cost alone is not BLOAT. |
 | Dashboard and optional adapters | Vendor [`public_boards.test.js`](../vendor/dashboard-library/tests/public_boards.test.js), browser dashboard registry; other convention candidates in census | Vendor package/CI and browser entries are distinct. Optional integrations and unclassified filenames remain UNKNOWN until assertions and dependencies are inspected. |
@@ -375,8 +387,8 @@ selected merely from the generic `soak` marker. No such rehearsal was run here.
 | **B1 — boot gates spawn and initial input.** external audit, source re-inspected | `test_spawn_boot_gate.py:50–62,77–83` / D parks spawn and await_spawn until the gate opens. `test_spawn_initial_prompt_bootstrap.py:117–130`, `test_spawn_delivery_race.py:254–265`, `test_spawn_prompt_receipt_truthful.py:66–79` / D cover first input, collapsed delivery and truthful receipt seams. | Real dispatch with stub SpawnCtl; other tests exercise Sessions/SpawnCtl or Store with fake panes/events. Protects premature boot-window execution, treating a draft as delivered and claiming prebrief delivery without evidence. | Source assertions across separate seams; actual provider boot plus initial-prompt delivery remains UNKNOWN. A fake pane is not runtime readiness proof. |
 | **B2 — cancel/close preserve ownership.** audited at c40f2ebe (external audit, fleet-verified sample); source re-inspected | `test_close_ladder.py:213–224,615–634,689–708` / D covers persisted close and identity fences. F2: `test_spawn_cancel_fence_holes.py:303–336` and `test_approved_close_retry.py:149–177` / D cover cancellation/approved close across Store reopen. `test_close_progeny_cli.py:15–54` / D crosses CLI/socket. | F2 cancel: reopen DB, adopt zero, no open row or orphan fake pane. Approved close: preserved request/generation fences and exactly one fake kill. CLI test uses real CLI/Server/Store and a local test pane but only verifies unsupported-close refusal preserves it; no restart. | In-process restart assertions plus separate CLI refusal evidence, not a real-process CLI/RPC close across daemon restart. Tests that use real panes are indexed here, not run. See G2. |
 | **B3 — restart continuity retains truthful ownership.** audited at c40f2ebe (external audit, fleet-verified sample); source re-inspected | `test_restart_continuity_daemon.py:79–102,368–384,418–427,441–451` / D covers drain, same-key replay and pasted/not-pasted distinctions. F2's cancel/approved-close nodes above also apply. `tests/soak/test_restart_continuity.py:40–51` invokes `tests/soak/restart_matrix.py:491–587` / R. | Unit tests use Store with fake tmux/proof. R starts isolated daemon processes, RPC/DB and a stub-provider pane: success oracle `restart_matrix.py:445–456` checks one pane/open row/prompt, released reservation, delivered/ready state and keyed replay; failure and fresh-key recovery oracle `459–476` checks no pane/open row before a new-key recovery. | R is source-inspected, not executed or selected by merge. Signal-driven restart with a stub provider is not installed service-manager or real-provider qualification. Spawn continuity does not supply G2's close composition. |
-| **C1 — release admission requires bounded evidence.** external audit, source re-inspected | `test_deploy_release_selection.py:173–186` / D asserts exact affected child, qualified-affected verdict, omitted targets UNTESTED and no full-fleet acceptance. `test_deploy_log_guard.py:373–410`, `test_deploy_script.py:127–161,231–240`, `test_deploy_fleet_verdict.py:181–196` / D cover uncertain logs, runtime verification/deadline and missing verdict evidence. | Real isolated Git/preimage/log bytes with synthetic runtime receipts and service-manager/socket counterparts. Protects stale/absent evidence being promoted to successful qualification; not-selected is not passed. | Fixture acceptance/refusal evidence. Source fixtures do not activate installed services or prove their health. Selector `deploy_invocation` is narrower than D and does not by itself include every cited deploy test. |
-| **C2 — rollback uses actual preimage and fresh receipts.** audited at c40f2ebe (external audit, fleet-verified sample); source re-inspected | `test_deploy_release_selection.py:290–315` / D rejects target receipts for rollback, then checks prior SHA, actual checkout and a second activation call. Drift/non-green-child controls are at `244–285`. `test_event_push_pin.py:65–77,265–331` / D covers prior pin and preflight boundaries. | Real disposable Git/durable transaction state, synthetic installed/runtime observations and activation calls. Protects stale receipt reuse, wrong rollback source and unsupported success claims. This is explicit rollback, not proof of automatic rollback after every product failure. | Source fixture evidence only. Historical availability or health of real runtime receipts cannot be established from the repository. G3 is a runtime-evidence requirement, not a missing fixture assertion. |
+| **C1 — release admission requires bounded evidence.** external audit, source re-inspected | Selective-admission fixture coverage is retired. `test_deploy_log_guard.py:373–410`, `test_deploy_script.py:127–161,231–240`, `test_deploy_fleet_verdict.py:181–196` / D cover uncertain logs, runtime verification/deadline and missing verdict evidence. | Real isolated Git/preimage/log bytes with synthetic runtime receipts and service-manager/socket counterparts. Protects stale/absent evidence being promoted to successful qualification; not-selected is not passed. | Fixture acceptance/refusal evidence. Source fixtures do not activate installed services or prove their health. Selector `deploy_invocation` is narrower than D and does not by itself include every cited deploy test. |
+| **C2 — rollback uses actual preimage and fresh receipts.** audited at c40f2ebe (external audit, fleet-verified sample); source re-inspected | Selective-admission rollback fixtures are retired; sealed coordinated and ordinary rollback retain their own tests. `test_event_push_pin.py:65–77,265–331` / D covers prior pin and preflight boundaries. | Real disposable Git/durable transaction state, synthetic installed/runtime observations and activation calls. Protects stale receipt reuse, wrong rollback source and unsupported success claims. This is explicit rollback, not proof of automatic rollback after every product failure. | Source fixture evidence only. Historical availability or health of real runtime receipts cannot be established from the repository. G3 is a runtime-evidence requirement, not a missing fixture assertion. |
 | **C3 — cold restore rebinds once and notices remain bounded.** external audit, source re-inspected | `test_assistant_restore.py:638–668,706–755` / D checks one resume/rebind episode and crash recovery. `test_restart_notice.py:132–145` / D covers disabled notices. `tests/soak/test_restart_notice.py:140–153,177–197` / R checks isolated restart notices. | Restore has real Store/Sessions/Composite/Restore but fake tmux/process/clock/SpawnCtl and a deduplicating notice callback (`test_assistant_restore.py:167–169`). One retained notice does not prove one callback invocation. R uses a real isolated daemon and stub provider; queued **or** delivered is accepted at line 147. | Separate in-process restore and opt-in restart-notice evidence. No composed cold restore through an actual browser/provider rendering proof; R's aggregate count is not that proof. |
 
 ### Bounded gap decisions (G1–G3 only)
@@ -413,7 +425,7 @@ do not close this close-specific assertion gap.
 No claim that all close/restart assertions are missing is warranted.
 
 **G3 — CONFIRMED, runtime-evidence gap; no regression slice.** Inspected
-`test_deploy_release_selection.py:290–315`, `test_event_push_pin.py:65–77,265–331`
+the former selective-admission fixture (now retired), `test_event_push_pin.py:65–77,265–331`
 and this document's existing release/deploy boundary. The missing evidence is
 installed-service rollback activation/health, beyond synthetic runtime receipts
 in source fixtures. Acceptance path: **fleet-owned runtime receipt, isolated
@@ -427,18 +439,9 @@ No runtime tests, full suites, daemon processes or closing gate were run for
 this docs-only change. Existing full acceptance requirements are unchanged;
 this section neither certifies runtime deployment nor commissions extra work.
 
-### Hosted daemon CI budget
+### Hosted daemon CI
 
-The serial hosted unit tier uses 4320s, with the existing 900s smoke tier,
-for a 5220s merge target and maximum. Successful hosted unit logs measured
-2059.04s and 2071.48s. Another run exhausted its former 2100s unit limit
-after 13010 of 13285 nodes; average-throughput extrapolation gives about
-2144s, an estimate rather than a completed measurement. Twice the larger
-observed or projected cost, rounded up to a minute, gives the new unit
-envelope. Individual test timers and assertions remain unchanged.
-
-The existing runner allowances produce a 5340s deadline and 5370s outer
-gate limit. The daemon job allows 110 minutes, leaving 630s after that
-outer limit and the existing 600s package step for other setup and artifact
-retention. This changes the suite and job envelopes; it does not enable
-parallel hosted workers or alter local gate budgets.
+Pushes and pull requests run six serial unit partitions, assigned by a stable
+hash of the test file path. The aggregate requires every partition and the
+smoke job to pass. Local merge gates use four file-grouped pytest workers.
+The serial and parallel test sets are compared once for this change.

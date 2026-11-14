@@ -26,6 +26,9 @@ async def prepare(case,j,mp,current,parent,tmp_path,attempt):
     verify=provider_cli_artifact.verify;settle=state._settle;expected_logins=len(logins)
     historical=await store.open_session(old.host,"hatch-prior-session",provider=old.provider,
         session_generation="hatch-old-attribution",account_binding=old.public())
+    # Retained history must not claim an open, unattested native launcher.
+    # Drain it before preparing the parked state, preserving its attribution.
+    await store.update_session(old.host,"hatch-prior-session",status="closed")
     runtime._matrix_hatch_history={"session":historical,"old":old.public()}
     variant=case.variant
     split_kind=case.row in {"B-hatch-races","B-hatch-refusals"} or variant in {"S0","S1","X-missing","X-fork","X-origin","R2","F1-default","F1-health","F1-policy","F2","F3","combined","sticky-auth"}

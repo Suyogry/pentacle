@@ -86,8 +86,8 @@ and actual native loopback transport. This secret grants no general command,
 inventory subscription or shell authority. These commands send their per-RPC
 credential directly; they do not require an operator hello.
 
-`read_daemon_stats.py`, `client_contract_probe.py`, `picker_under_load_probe.py`
-and `tools/working_state_probe.py` read `AGENT_ORCH_TOKEN_FILE` or
+`read_daemon_stats.py`, `client_contract_probe.py` and
+`tools/working_state_probe.py` read `AGENT_ORCH_TOKEN_FILE` or
 `PENTACLE_OPERATOR_TOKEN_FILE` (otherwise the default operator file) and use v2
 proof authentication. Live-window tools keep their explicit token-path option.
 Satellite event/host producers keep their own secret protocol. Deployment health

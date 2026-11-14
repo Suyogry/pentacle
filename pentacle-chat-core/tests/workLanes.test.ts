@@ -48,13 +48,15 @@ test('structured spec fields survive normalization and older frames default safe
   for (const key of ['worked', 'lead_seat', 'status_line', 'next_line']) {
     assert.deepEqual((member as Record<string, unknown>)[key], cell.inventory_frame.lanes[0].members[0][key]);
   }
-  assert.equal(member.status_line, 'Tests pass.');
+  assert.equal(member.status_line, 'Tests pass. Review pending');
+  assert.equal('blocked_line' in member, false);
   assert.equal(member.lead_seat?.active_step, 'Review the result.');
   assert.equal(member.criteria, undefined);
   assert.equal(member.transitions, undefined);
   const detail = normalizeWorkLanesInventory({ ...cell.inventory_frame, lanes: [cell.show_projection] })!.lanes[0].progress!.members[0];
   assert.deepEqual(detail.criteria, cell.show_projection.members[0].criteria);
   assert.deepEqual(detail.transitions, cell.show_projection.members[0].transitions);
+  assert.equal(detail.blocked_line, null);
   const old = normalizeWorkLanesInventory(fixture.inventory_frame)!.lanes[0];
   assert.equal(old.icon, null);
 });
@@ -218,4 +220,21 @@ test('a v1 lane without progress facts normalizes progress to null; malformed me
   assert.deepEqual(lane.progress!.members.map((m) => m.spec_id), ['spec_demo__ok']);
   assert.equal(lane.progress!.members[0].terminal, null);
   assert.equal(lane.progress!.members[0].estimate, null);
+});
+
+test('park record is additive and malformed values never drop a lane', () => {
+  for (const [raw, expected] of [
+    [{ at: '2026-01-01T00:00:00Z', reason: 'Later' }, { at: '2026-01-01T00:00:00Z', reason: 'Later' }],
+    [{ at: null, reason: '' }, { at: null, reason: null }],
+    ['parked', undefined], [undefined, undefined],
+  ]) {
+    const frame = { lanes: [{ lane_id: 'parked', state: 'paused', parked: raw }] };
+    const lane = normalizeWorkLanesInventory(frame)!.lanes[0];
+    assert.equal(lane.state, 'paused');
+    assert.deepEqual(lane.parked, expected);
+    assert.equal(Object.hasOwn(lane, 'parked'), expected !== undefined);
+  }
+  const cell = fixture.parked_v1;
+  assert.deepEqual(normalizeWorkLanesInventory(cell.inventory_frame)!.lanes[0].parked,
+    cell.inventory_frame.lanes[0].parked);
 });

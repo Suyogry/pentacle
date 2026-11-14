@@ -168,6 +168,10 @@ _CODEX_USAGE_LIMIT_RE = re.compile(r"hit your usage limit", re.IGNORECASE)
 _CODEX_RESET_AT_RE = re.compile(r"try again at\s+(.+?)\s*\.", re.IGNORECASE)
 
 
+class RpcTimeout(RuntimeError):
+    """The client RPC exhausted its own wait budget."""
+
+
 class CodexQuotaExhausted(RuntimeError):
     """A codex cell that failed because its account is over its usage limit.
 
@@ -563,8 +567,19 @@ def _operator_connection(
             request_id = str(uuid.uuid4())
             started = time.monotonic()
             stream_chunks: list[dict] = []
-            if deadline is None and prefix in {"spawn_catalog_get", "asset.list", "ping"}:
-                deadline = time.monotonic() + CONTROL_PLANE_P95_LIMIT_MS / 1000
+            if deadline is None:
+                budget = (CONTROL_PLANE_P95_LIMIT_MS / 1000
+                          if prefix in {"spawn_catalog_get", "asset.list", "ping"} else timeout)
+                deadline = started + budget
+            budget = max(0.0, deadline - started)
+
+            def timed_out() -> RpcTimeout:
+                if prefix in {"spawn_catalog_get", "asset.list", "ping"}:
+                    control_latencies_ms.append(None)
+                return RpcTimeout(
+                    f"{prefix} timed out; budget={budget:.3f}s; elapsed={time.monotonic() - started:.3f}s"
+                )
+
             try:
                 ws.send(json.dumps({**payload, "request_id": request_id}))
             except Exception as exc:
@@ -577,10 +592,11 @@ def _operator_connection(
                 if deadline is not None:
                     receive_timeout = deadline - time.monotonic()
                     if receive_timeout <= 0:
-                        if prefix in {"spawn_catalog_get", "asset.list", "ping"}:
-                            control_latencies_ms.append(None)
-                        raise RuntimeError(f"{prefix} timed out")
-                frame = receive(receive_timeout)
+                        raise timed_out()
+                try:
+                    frame = receive(receive_timeout)
+                except TimeoutError as exc:
+                    raise timed_out() from exc
                 if frame.get("type") in _PUSH_TYPES:
                     record_push(frame)
                     continue
@@ -658,7 +674,8 @@ def _operator_connection(
             # between the two is never mistaken for the complete turn.
             # Every read after the first must finish inside the settle bound;
             # a set still changing at the bound fails rather than being used.
-            settle_deadline = time.monotonic() + EVENT_SETTLE_LIMIT_S
+            settle_start = time.monotonic()
+            settle_deadline = settle_start + EVENT_SETTLE_LIMIT_S
             previous_seqs = None
             while True:
                 deadline = time.monotonic() + HISTORY_HEARTBEAT_DEADLINE_MS / 1000
@@ -668,10 +685,11 @@ def _operator_connection(
                     replay = rpc({
                         "type": "request_stream_events", "stream_id": stream_id, "limit": 500,
                     }, "request_stream_events", deadline=deadline)
-                except RuntimeError as exc:
-                    if previous_seqs is not None and "timed out" in str(exc):
+                except RpcTimeout as exc:
+                    if previous_seqs is not None and deadline == settle_deadline:
                         raise RuntimeError(
-                            f"event: authoritative event set did not settle within {EVENT_SETTLE_LIMIT_S}s"
+                            f"event: authoritative event set did not settle within {EVENT_SETTLE_LIMIT_S}s; "
+                            f"elapsed={time.monotonic() - settle_start:.3f}s; {exc}"
                         ) from exc
                     raise
                 expected = replay.get("events")
@@ -683,7 +701,8 @@ def _operator_connection(
                     break
                 if time.monotonic() + EVENT_SETTLE_INTERVAL_S >= settle_deadline:
                     raise RuntimeError(
-                        f"event: authoritative event set did not settle within {EVENT_SETTLE_LIMIT_S}s"
+                        f"event: authoritative event set did not settle within {EVENT_SETTLE_LIMIT_S}s; "
+                        f"elapsed={time.monotonic() - settle_start:.3f}s"
                     )
                 previous_seqs = seqs
                 time.sleep(EVENT_SETTLE_INTERVAL_S)
@@ -745,7 +764,11 @@ def _operator_connection(
                 return gate
 
             while time.monotonic() < convergence_deadline:
-                inventory = rpc({"type": "list_sessions"}, "list_sessions", deadline=convergence_deadline)
+                try:
+                    inventory = rpc({"type": "list_sessions"}, "list_sessions", deadline=convergence_deadline)
+                except RpcTimeout as exc:
+                    convergence_gate["error"] = str(exc)
+                    break
                 authoritative_rows = inventory.get("active")
                 if not isinstance(authoritative_rows, list):
                     raise RuntimeError(f"convergence: invalid authoritative roster: {inventory}")
@@ -862,9 +885,7 @@ def _operator_connection(
                         item.get("stream_id") == owned.stream_id for item in inventory(deadline)
                     ):
                         return True
-                except RuntimeError as error:
-                    if str(error) != "list_sessions timed out":
-                        raise
+                except RpcTimeout:
                     return False
                 time.sleep(0.5)
             return False
@@ -955,6 +976,7 @@ def run_matrix(
     provider_probe=None,
     accounts=None,
     test_profile_snapshot=None,
+    report_only=False,
 ) -> list[dict[str, object]]:
     if cells is None:
         cells = smoke_plan()["cells"]
@@ -1018,6 +1040,8 @@ def run_matrix(
                     failures.append(row)
                     if evidence is not None:
                         evidence.append({"outcome": "UNTESTED", **row})
+                    if report_only:
+                        continue
                     try:
                         reset = f"; try again at {exc.reset_at}" if exc.reset_at else ""
                         row["smoke_card"] = publish_smoke_card({
@@ -1043,6 +1067,8 @@ def run_matrix(
                     failures.append(row)
                     if evidence is not None and classification["class"] == "untested":
                         evidence.append({"outcome": "UNTESTED", **row})
+                    if report_only:
+                        continue
                     if classification["class"] == "untested":
                         try:
                             row["smoke_card"] = publish_smoke_card({
@@ -1074,7 +1100,7 @@ def run_matrix(
             failures.append(row)
             if evidence is not None and classification["class"] == "untested":
                 evidence.append({"outcome": "UNTESTED", **row})
-            if classification["class"] == "failure":
+            if classification["class"] == "failure" and not report_only:
                 _notify_failure(row, _failure_card(host, provider, prompt_mode, row["stage"], exc, account))
     return failures
 
@@ -1103,6 +1129,8 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true",
         help="print the resolved full matrix without opening a connection or spawning",
     )
+    parser.add_argument("--report-only", action="store_true",
+                        help="retain reports without per-cell cards or notifications; caller aggregates failures")
     parser.add_argument("--token-path", type=Path, default=None,
                         help="operator credential for the explicitly selected endpoint")
     parser.add_argument("--provider-tuple", type=Path, default=None,
@@ -1175,6 +1203,7 @@ def main(argv: list[str] | None = None) -> int:
         url, args.token_path or DEFAULT_TOKEN_PATH, DEFAULT_TIMEOUT, cells, evidence=evidence,
         test_profile_snapshot=profile,
         allow_legacy_close=args.allow_legacy_close,
+        **({"report_only": True} if args.report_only else {}),
         **({"accounts": accounts} if accounts else {}),
         **({"provider_probe": provider_probe} if provider_probe is not None else {}),
     )

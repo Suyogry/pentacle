@@ -1,11 +1,9 @@
 # Changelog
 
-User-visible changes to Pentacle, newest release first. Each dated section is one
-promoted release. Its heading date is the UTC date the section was cut on the
-candidate branch; a later cut on the same date adds ` (2)`, ` (3)`. The exact
-commit is the annotated `v2-gate/<sha>` tag that promotion created for that
-candidate, the same SHA shown as the build and runtime SHA in Settings. List
-them with `git for-each-ref --sort=-creatordate refs/tags/v2-gate/`. A release
+User-visible changes to Pentacle, newest dated section first. A heading date is
+the UTC date the section was cut; a later section on the same date adds
+` (2)`, ` (3)`. Stable versions and their exact commits are recorded in
+`releases/manifest.json`, with the dated sections first included by each version. A section
 with no user-visible change carries the single bullet `Internal changes only.`
 
 This file starts at the release that introduced it; earlier history is not
@@ -13,6 +11,23 @@ backfilled. Changes that land between releases accumulate under `Unreleased`.
 
 ## Unreleased
 
+- Make coordinated deploy restoration wait up to 60 s for a satellite host to reconnect after the daemon restarts, instead of failing the release.
+- Let a seat acquire and clear one maintenance hold with a server-verified operator dispatch and advisor ruling, without operator privileges.
+
+- Add stable release records and tools for checking and updating a single-user install.
+- Show each saved account repin attempt's park reason and host receipt codes in front desk account status, including settled attempts.
+
+## 2026-11-14
+
+- Let agents request their own context compaction with `agent-orch compact`, submitting immediately through ordinary provider input without interrupting the current turn.
+
+## 2026-11-13
+
+- Reduce idle transcript identity probes while retaining fresh checks before reads and appends, with an opt-out switch and minute intake timing summaries.
+
+## 2026-11-12
+
+- Use ordinary daemon releases with automatic restoration on failed serving proof, report later check failures without rollback, and run the deployed release checks nightly.
 - Require a dedicated live non-FD lane lead for active work, safe drained holds and succession, and show actual work by any assigned agent beyond preview caps.
 - Add source-backed checkpoint detail, full-membership visibility counts, goal prose and current-checkpoint validation for new implementation readiness reports.
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from store_host_transfer import effective_ruling
 import asyncio
+from datetime import datetime, timezone
 from contextlib import nullcontext
 import hashlib
 import json
@@ -17,6 +18,8 @@ import re
 import sqlite3
 import time
 import uuid
+
+UNANSWERED_AFTER_SECONDS = 300
 from pathlib import Path
 from typing import Any
 
@@ -145,18 +148,38 @@ def _work_item(spec_id: str) -> tuple[dict[str, Any], str | None]:
         goal = re.search(r"(?ims)^## Goal\s*\n(.*?)(?=^## |\Z)", text)
         if goal:
             item["agent_authored_goal"] = scrub(goal.group(1), 600) or ""
-        tracking = re.search(r"(?ims)^## Tracking\s*\n(.*?)(?=^## |\Z)", text)
-        if tracking:
-            pattern = r'(?im)^- Operator request(?: \([^\n)]*\))?: ["“]([^"”\n]*)["”]'
-            origin = re.search(pattern, tracking.group(1))
-            if origin:
-                item.update(origin=scrub(origin.group(1), 600) or "", origin_missing=False,
-                            origin_line=scrub(origin.group(0), 600) or "")
-            for line in re.finditer(r"(?m)^- Operator request[^\n]*", tracking.group(1)):
-                if not re.match(pattern, line.group(0)):
-                    item.update(origin_malformed=True,
-                                origin_location=f"## Tracking, line {text.count(chr(10), 0, tracking.start(1) + line.start()) + 1}")
-                    break
+        # Locate the operator request by content in any Tracking section.
+        tracking_level = None
+        fence = None
+        for line in text.splitlines():
+            fence_marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+            if fence_marker:
+                marker = fence_marker.group(1)
+                if fence is None:
+                    fence = marker
+                elif marker[0] == fence[0] and len(marker) >= len(fence):
+                    fence = None
+                continue
+            if fence is not None:
+                continue
+            heading = re.match(r"^\s*(#{1,6})\s+(.+?)\s*#*\s*$", line)
+            if heading:
+                level, title = len(heading.group(1)), heading.group(2)
+                if re.match(r"(?i)^tracking\b", title):
+                    tracking_level = level
+                elif tracking_level is not None and level <= tracking_level:
+                    tracking_level = None
+                continue
+            if tracking_level is not None:
+                origin = re.search(r"(?i)\boperator[\s_-]+request\b(.*)", line)
+                if origin:
+                    value = origin.group(1).strip().lstrip("*_ ")
+                    value = re.sub(r"^\([^)]*\)\s*", "", value).lstrip("*_ :—–-\t")
+                    value = value.strip().strip('"“”')
+                    if value:
+                        item.update(origin=scrub(value, 600) or "", origin_missing=False,
+                                    origin_line=scrub(line, 600) or "")
+                        break
         return item, None
     except Exception as exc:
         return item, "spec_unresolved" if isinstance(exc, ValueError) and str(exc) == "spec_unresolved" else "spec_unavailable"
@@ -546,6 +569,12 @@ class AssistantLaneRulings:
                 errors.append({"code": code, "field": field, "correction": scrub(text, 500) or ""})
 
         brief = ""
+        if str(message.get("objective") or "").strip():
+            message.pop("objective_source", None)
+            if known:
+                objective, _, _ = resolve_objective(message["objective"], objective_supported=True,
+                                                     parent_stream_id=message.get("parent_stream_id"))
+                message["objective"] = objective
         if known and not str(message.get("objective") or "").strip():
             # A legacy producer's derived objective belongs to the frozen
             # intent too; replay must not depend on a mutable blob/spec read.
@@ -619,8 +648,7 @@ class AssistantLaneRulings:
                         raise VerbError("work_assignment_required", "Supply this commission's assigned spec with --spec-id.")
                     refusal = await spawnctl._work_link_refusal(authenticated, spec_binding)
                     if refusal is not None:
-                        # The resolved spec is still independently readable even
-                        # when its product-lane link needs repair.
+                        # The resolved spec is still independently readable.
                         correction(refusal.code, "spec_id", str(refusal))
                 elif not spec_id:
                     raise VerbError("work_assignment_required", f"{auth['stream_id']} requires an assigned spec")
@@ -628,16 +656,13 @@ class AssistantLaneRulings:
                 code = ("spec_unavailable" if exc.code == "spec_unresolved" and "spec_resolution" in exc.extra
                         and exc.extra["spec_resolution"] is None else exc.code)
                 correction(code, "spec_id", "Restore fresh spec resolution before resubmitting." if code == "spec_unavailable"
-                           else "Supply a resolvable assigned --spec-id linked to this commission's open product lane.")
+                           else "Supply a resolvable assigned --spec-id for this commission.")
                 spec_id = ""  # Origin and link depend on this prerequisite.
             if spec_id:
                 item, item_error = _work_item(spec_id)
                 if item_error:
                     correction(item_error, "spec_id", "Restore readable canonical spec content before resubmitting."
                                if item_error == "spec_unavailable" else "Supply a uniquely resolvable canonical --spec-id.")
-                elif item.get("origin_malformed"):
-                    correction("origin_malformed", "work_item.origin",
-                        f'{item["origin_location"]}: expected - Operator request (source): "exact operator text"; preserve the existing source and quote.')
                 if hasattr(self.store, "open_lanes_for_spec"):
                     item["lane_ids"] = [lane["lane_id"] for lane in await self.store.open_lanes_for_spec(spec_id)]
             if errors:
@@ -648,6 +673,10 @@ class AssistantLaneRulings:
             binding=binding, target=target, target_generation="", covered=True,
             work_item=item, brief_text=brief,
         )
+        if (known and request["state"] == "release_blocked"
+                and request.get("ruling") == "approve"):
+            await self._release(request, retry_spawn=True)
+            request = await self._fetch(request["ruling_request_id"])
         if request["state"] == "bypassed":
             return None
         if request["state"] == "done" and request.get("outcome_json"):
@@ -779,32 +808,28 @@ class AssistantLaneRulings:
                 # already bound a generation. Normalize only for comparison;
                 # never rewrite the durable intent or its digest on replay.
                 prior_safe.setdefault("expected_generation", prior["target_generation"])
-            report = await self.store.find_report(target_stream_id, statuses=("done", "error", "aborted"),
-                                                  session_generation=target_generation)
-            replay_waiver = isinstance(prior_intent.get("_ruling_report_waiver"), dict)
-            if replay_waiver:
+            if prior:
                 if (prior["requester_stream_id"] != requester or prior["requester_generation"] != generation
                         or prior["target_stream_id"] != target_stream_id or prior["target_generation"] != target_generation
                         or prior_safe != message):
                     raise ValueError("assistant_ruling_request_key_conflict")
                 message = prior_intent
-            if report is None or replay_waiver:
-                if not await policy.manager_holds(auth):
-                    raise ValueError("assistant_lane_close_report_required")
-                if code := policy.manager_request_code(msg):
-                    raise ValueError(code)
-                message["_ruling_report_waiver"] = {
-                    "manager_stream_id": requester, "manager_generation": generation,
-                    "target_generation": target_generation, "reason": scrub(msg["reason"], MAX_REASON),
-                }
             else:
-                message["_ruling_report"] = {
-                    "report_id": report.get("report_id"), "summary": str(report.get("summary") or "")[:1200],
-                    "qa_verdict": report.get("qa_verdict"), "residuals": report.get("next_action"),
-                    "digest": _digest(report),
-                }
-                if prior and "expected_generation" not in prior_intent and expected is None:
-                    message.pop("expected_generation")
+                try:
+                    report = await asyncio.wait_for(self.store.find_report(
+                        target_stream_id, statuses=("done", "error", "aborted"),
+                        session_generation=target_generation), timeout=5)
+                    report_status = "missing"
+                except Exception:
+                    report, report_status = None, "unknown"
+                if report is None:
+                    message["_ruling_report"] = {"status": report_status}
+                else:
+                    message["_ruling_report"] = {
+                        "report_id": report.get("report_id"), "summary": str(report.get("summary") or "")[:1200],
+                        "qa_verdict": report.get("qa_verdict"), "residuals": report.get("next_action"),
+                        "digest": _digest(report),
+                    }
             request = await self._create(
                 action="session_close", key="session_close:" + key, intent=message,
                 requester=requester, requester_generation=generation, binding=binding,
@@ -972,9 +997,6 @@ class AssistantLaneRulings:
                     conn.execute("UPDATE v2_assistant_lane_rulings SET reason='bypassed' WHERE ruling_request_id=?", (request_id,))
                     self._audit_conn(conn, request_id, "bypassed", requester, requester_generation)
                 self._audit_conn(conn, request_id, "request", requester, requester_generation, action)
-                if isinstance(intent.get("_ruling_report_waiver"), dict):
-                    self._audit_conn(conn, request_id, "report_prerequisite_waived", requester,
-                                     requester_generation, scrub(intent.get("reason"), 500) or "")
                 return dict(conn.execute(
                     "SELECT * FROM v2_assistant_lane_rulings WHERE ruling_request_id=?", (request_id,)
                 ).fetchone())
@@ -1068,7 +1090,7 @@ class AssistantLaneRulings:
                 ("assistant-lane-ruling:" + rid,)).fetchone() is not None):
             return
         intent = json.loads(request["intent_json"])
-        fields = {key: intent.get(key) for key in ("objective", "provider", "model", "effort", "spec_id", "role", "budget", "eta", "_ruling_report", "_ruling_report_waiver")
+        fields = {key: intent.get(key) for key in ("objective", "provider", "model", "effort", "spec_id", "role", "budget", "eta", "_ruling_report")
                   if intent.get(key) is not None}
         if request["action"] == "spawn":
             fields["acceptance"] = _acceptance_brief(intent)
@@ -1169,20 +1191,24 @@ class AssistantLaneRulings:
                 and not request.get("conditions")):
             return
         rid = request["ruling_request_id"]
-        await self.store.enqueue_outbound_notice(
-            notice_id="assistant-lane-ruling-result:" + rid,
-            kind="assistant_lane_ruling_result", dedupe_key="assistant-lane-ruling-result:" + rid,
-            recipient_stream_id=request["requester_stream_id"],
-            tell_id="assistant-lane-ruling-result:" + rid,
-            source_stream_id=request["authority_stream_id"],
-            body="[Assistant lane ruling] " + _canonical({
+        body = "[Assistant lane ruling] " + _canonical({
                 "ruling_request_id": rid, "action": request["action"],
                 "target": request["target_stream_id"], "ruling": request["ruling"],
                 "state": request["state"], "reason": request["reason"],
                 "conditions": request["conditions"],
                 "outcome": _compact_outcome(json.loads(request["outcome_json"])) if request.get("outcome_json") else None,
                 "detail_ref": {"table": "v2_assistant_lane_rulings", "ruling_request_id": rid},
-            }),
+            })
+        notice_id = "assistant-lane-ruling-result:" + rid
+        if request["action"] == "spawn" and request.get("ruling") == "approve":
+            previous = await self.store.submit(lambda conn: conn.execute(
+                "SELECT body FROM v2_outbound_notices WHERE notice_id=?", (notice_id,)).fetchone())
+            if previous is not None and previous[0] != body:
+                notice_id += ":" + hashlib.sha256(body.encode()).hexdigest()
+        await self.store.enqueue_outbound_notice(
+            notice_id=notice_id, kind="assistant_lane_ruling_result", dedupe_key=notice_id,
+            recipient_stream_id=request["requester_stream_id"], tell_id=notice_id,
+            source_stream_id=request["authority_stream_id"], body=body,
             metadata={"authority_generation": request["requester_generation"]},
         )
 
@@ -1422,7 +1448,8 @@ class AssistantLaneRulings:
                 conn.execute("UPDATE v2_assistant_lane_rulings SET mirror_sent=1 WHERE ruling_request_id=?", (rid,))
         await self.store.submit(mark)
 
-    async def _release(self, request: dict[str, Any], *, lifecycle_locked: bool = False) -> None:
+    async def _release(self, request: dict[str, Any], *, lifecycle_locked: bool = False,
+                       retry_spawn: bool = False) -> None:
         # A question must be published while its producer is still the current
         # open generation. Handoff/close hold this same lock across question
         # transfer and retirement. Take it before the release lock: an immediate
@@ -1440,13 +1467,27 @@ class AssistantLaneRulings:
         fd_fence = self.server.sessions.assistant.front_desk_mode and not lifecycle_locked
         gate = self.store.front_desk_fence() if fd_fence else nullcontext()
         async with gate, lifecycle:
-            await self._release_serial(request, fd_fence=fd_fence)
+            await self._release_serial(request, fd_fence=fd_fence, retry_spawn=retry_spawn)
 
-    async def _release_serial(self, request: dict[str, Any], *, fd_fence: bool = False) -> None:
+    async def _release_serial(self, request: dict[str, Any], *, fd_fence: bool = False,
+                              retry_spawn: bool = False) -> None:
         rid = request["ruling_request_id"]
         lock = self._release_locks.setdefault(rid, asyncio.Lock())
         async with lock:
             current = await self._fetch(rid)
+            if (retry_spawn and current and current["action"] == "spawn"
+                    and current["state"] == "release_blocked" and current.get("ruling") == "approve"):
+                # Only an authenticated same-intent request may re-arm a blocked
+                # approved spawn. Keep the original ruling/conditions and intent.
+                # Serializing re-arm with release avoids a stale retry overwriting
+                # done and retains SpawnCtl's durable successful-spawn protection.
+                def rearm(conn):
+                    with conn:
+                        conn.execute("UPDATE v2_assistant_lane_rulings SET state='approved' "
+                                     "WHERE ruling_request_id=? AND action='spawn' "
+                                     "AND state='release_blocked' AND ruling='approve'", (rid,))
+                await self.store.submit(rearm)
+                current = await self._fetch(rid)
             if current is None or current["state"] not in {"approved", "unruled", "unruled_disabled", "bypassed"}:
                 return
             if current.get("covered") and current["state"] == "unruled":
@@ -1461,7 +1502,7 @@ class AssistantLaneRulings:
             intent["_auth_context"] = {
                 "token_verified": True, "stream_id": current["requester_stream_id"],
                 "session_generation": current["requester_generation"],
-                # The task link was checked when this request was admitted (R4).
+                # The assignment was checked when this request was admitted.
                 "ruled_release": True,
             }
             # Under fd_fence no binding change commits between this check and
@@ -1483,6 +1524,9 @@ class AssistantLaneRulings:
                         await self._mark(rid, "release_blocked", result)
                         return
                 elif current["action"] == "spawn":
+                    if intent.get("objective_source") == "derived":
+                        intent = {**intent}
+                        intent.pop("objective", None)
                     result = await self.server.spawnctl.spawn(intent, self.server.local_host)
                     if result.get("type") != "spawn.ok":
                         await self._mark(rid, "release_blocked", result)
@@ -1541,20 +1585,6 @@ class AssistantLaneRulings:
                             or target.get("session_generation") != expected):
                         await self._mark(rid, "approved_but_not_closed", {"error": "target_generation_changed"})
                         return
-                    if isinstance(intent.get("_ruling_report_waiver"), dict):
-                        policy = self.server.sessions.assistant
-                        if (not await policy.manager_holds(intent["_auth_context"])
-                                or policy.manager_request_code(intent)):
-                            await self._mark(rid, "approved_but_not_closed", {"error": "manager_waiver_authority_lost"})
-                            return
-                    else:
-                        report = await self.store.find_report(
-                            admitted['stream_id'], statuses=("done", "error", "aborted"),
-                            session_generation=admitted['generation'],
-                        )
-                        if report is None or report.get("report_id") != intent.get("_ruling_report", {}).get("report_id"):
-                            await self._mark(rid, "approved_but_not_closed", {"error": "report_fence_moved"})
-                            return
                     # Project only this release invocation. Keep the durable
                     # original intent, digest and report provenance unchanged.
                     intent.update(host=target_host, session_name=target_name, expected_generation=expected)
@@ -1647,7 +1677,65 @@ class AssistantLaneRulings:
                     "SELECT * FROM v2_assistant_lane_rulings WHERE state='unruled_disabled'")]
         return await self.store.submit(op)
 
+    async def _mark_unanswered(self, now: float | None = None) -> None:
+        composite = self._composite()
+        if composite is None or not composite.enabled:
+            return
+        now = time.time() if now is None else now
+        stream_id = composite.config.stream_id
+        def write(conn):
+            with conn:
+                if not self.store._strict_publication_state_conn(conn, stream_id)["enabled"]:
+                    return []
+                host, _, name = stream_id.partition(":")
+                session = conn.execute("SELECT created_at FROM sessions WHERE host=? AND session_name=? "
+                                       "AND status='open' AND provider='composite'", (host, name)).fetchone()
+                if session is None:
+                    return []
+                rows = conn.execute(
+                    "SELECT r.* FROM v2_assistant_composite_routes r WHERE r.stream_id=? "
+                    "AND r.routing_state='resolved' AND r.delivery_state='landed' "
+                    "AND json_extract(r.route_json,'$.admission_mode')='direct_primary' "
+                    "AND COALESCE(json_extract(r.route_json,'$.desk_dispatch'),0)=0 "
+                    "AND NOT EXISTS (SELECT 1 FROM v2_assistant_composite_publications p "
+                    "WHERE p.stream_id=r.stream_id AND p.dispatch_id=r.dispatch_id) "
+                    "AND json_extract(r.route_json,'$.unanswered_marker_recorded') IS NULL",
+                    (stream_id,)).fetchall()
+                inserted = []
+                for row in rows:
+                    payload = json.loads(row["route_json"] or "{}")
+                    timings = payload.get("timings", {})
+                    stamp = timings.get("landed_at") or timings.get("delivery_recorded_at")
+                    try:
+                        landed = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+                    except (AttributeError, TypeError, ValueError):
+                        continue
+                    if now - landed < UNANSWERED_AFTER_SECONDS:
+                        continue
+                    timestamp = datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z")
+                    event = {"stream_id": stream_id, "provider": "composite", "kind": "ASSIST_TEXT",
+                             "text": f"No reply from {composite.config.title} yet to this message.", "publish_kind": "unanswered",
+                             "reply_to_message_id": row["input_identity"], "timestamp": timestamp,
+                             "attachments": [], "raw": {"assistant_composite": True,
+                             "dispatch_id": row["dispatch_id"], "publish_kind": "unanswered"}}
+                    event_id = self.store._insert_session_event_conn(
+                        conn, stream_id, session["created_at"], event, "dispatch-unanswered:" + row["dispatch_id"])
+                    conn.execute("UPDATE v2_assistant_composite_routes SET route_json=json_set("
+                                 "COALESCE(route_json,'{}'),'$.unanswered_marker_recorded',1) WHERE route_id=?",
+                                 (row["route_id"],))
+                    if event_id is not None:
+                        inserted.append({**event, "daemon_seq": event_id})
+                return inserted
+        for event in await self.store.submit(write):
+            composite._advance_summary(event)
+            if self.server.broadcast is not None:
+                await self.server.broadcast({"type": "chat.event", "event": event})
+
     async def tick(self) -> None:
+        try:
+            await self._mark_unanswered()
+        except Exception:
+            log.exception("assistant unanswered-marker check failed; will retry")
         try:
             await self._check_authority_loss()
         except Exception:

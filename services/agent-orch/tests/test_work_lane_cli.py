@@ -48,7 +48,8 @@ def test_list_and_show_are_read_verbs(monkeypatch, capsys):
 
 def test_show_prints_structured_details_without_members_flag(monkeypatch, capsys):
     member = {"spec_id": "spec_demo__detail", "status": "in_progress", "status_line": "Tests pass.",
-              "status_text": "Tests pass. Awaiting F12 review.", "progress_text": "Fixed v2.3; 12 checks pass.",
+              "status_text": "Tests pass. Awaiting F12 review.", "blockers_text": "Waiting for the release window.",
+              "progress_text": "Retired field.",
               "next_action_text": "Review the result.",
               "next_line": "Review the result.", "worked": {"active_h": 0.5},
               "lead_seat": {"stream_id": "host-a:lead"},
@@ -59,10 +60,30 @@ def test_show_prints_structured_details_without_members_flag(monkeypatch, capsys
     assert _run(["work-lane", "show", "wl-1"]) == 0
     output = capsys.readouterr().out
     assert "icon: phone" in output
-    for key in ("worked", "lead_seat", "criteria", "transitions", "Progress", "Status", "Next action"):
+    for key in ("worked", "lead_seat", "criteria", "transitions", "Status", "Next action", "Blockers"):
         assert f"{key}:" in output
     assert "Check `code`" in output and "Tests pass." in output
-    assert "F12 review" in output and "Fixed v2.3; 12 checks pass." in output
+    assert "F12 review" in output and "Waiting for the release window." in output
+    assert "Progress:" not in output and "Retired field." not in output
+
+
+def test_show_prints_lane_progress_keys(monkeypatch, capsys):
+    entry = {"at": "2026-11-10T10:00:00Z", "spec_id": "spec_demo__detail", "kind": "checks", "count": 1}
+    member = {"spec_id": "spec_demo__detail", "status": "in_progress", "progress_at": "2026-11-10T10:00:00Z",
+              "summary_line": "Readable summary.", "estimate_first": {"p25": 1, "p75": 3, "median": 2},
+              "unblocks": [{"spec_id": "spec_demo__waiting", "title": "Waiting item"}], "recent": [entry]}
+    projection = {"lane_id": "wl-1", "goal_classes": "wq-", "goal_counts": [1, 0, 1, 0],
+                  "progress_at": "2026-11-10T10:00:00Z", "state_at": "2026-11-09T08:00:00Z",
+                  "goals": [{"goal_id": "g_" + "a" * 24, "left_h": 3.5, "moving": 1}],
+                  "default_goal": {"state": "in_progress", "left_h": None}, "recent": [entry]}
+    _wire(monkeypatch, {"type": "work_lanes.show.ok", "lane": {"lane_id": "wl-1"},
+                        "projection": projection, "members": [member]})
+    assert _run(["work-lane", "show", "wl-1"]) == 0
+    output = capsys.readouterr().out
+    for key in ("goal_classes", "goal_counts", "progress_at", "state_at", "goals", "default_goal", "recent",
+                "summary_line", "estimate_first", "unblocks"):
+        assert f"{key}:" in output, key
+    assert "Waiting item" in output and '"left_h": 3.5' in output and "2026-11-09T08:00:00Z" in output
 
 
 def test_detail_rendering_follows_released_policy_declarations(monkeypatch, capsys):
@@ -330,3 +351,47 @@ def test_add_member_explicit_request_id_survives_conflict(monkeypatch):
     sent = _wire(monkeypatch, reply)
     assert _run(["work-lane", "add-member", "wl-1", "spec_demo__new", "--request-id", "caller-id"]) == 0
     assert len(sent) == 4
+
+
+def test_parked_flag_and_usage_rejection(monkeypatch):
+    sent = _wire(monkeypatch, {"type": "assistant.operation.ok"})
+    base = ["work-lane", "set-state", "wl-1", "--parked", "--reason", "Later", "--expected-version", "3", "--request-id", "park"]
+    assert _run(base + ["--to", "paused"]) == 0
+    assert sent[-1]["payload"] == {"to": "paused", "parked": True, "reason": "Later"}
+    for target in ("active", "blocked", "done"):
+        assert _run(base + ["--to", target]) == 2
+    assert len(sent) == 1
+
+
+def test_parked_printed_in_list_and_show(monkeypatch, capsys):
+    lane = {"lane_id": "wl-1", "state": "paused", "parked": {"at": "2026-01-01T00:00:00Z", "reason": "Later"}}
+    _wire(monkeypatch, {"type": "work_lanes.list.ok", "lanes": [lane]})
+    assert _run(["work-lane", "list"]) == 0
+    assert "PARKED since 2026-01-01T00:00:00Z: Later" in capsys.readouterr().out
+    _wire(monkeypatch, {"type": "work_lanes.show.ok", "projection": lane, "lane": lane})
+    assert _run(["work-lane", "show", "wl-1"]) == 0
+    assert "PARKED since 2026-01-01T00:00:00Z: Later" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('flags,payload', [
+    (['--icon', 'briefcase'], {'icon': 'briefcase'}),
+    (['--icon', 'film', '--title', 'Studio'], {'icon': 'film', 'title': 'Studio'}),
+    (['--clear-icon'], {'icon': None}),
+    (['--clear-icon', '--summary', 'New summary'], {'icon': None, 'summary': 'New summary'}),
+])
+def test_set_text_icon_flags(monkeypatch, flags, payload):
+    sent = _wire(monkeypatch, {'type': 'assistant.operation.ok'})
+    assert _run(['work-lane', 'set-text', 'wl-1', '--expected-version', '3', '--request-id', 'icon', *flags]) == 0
+    assert sent[-1]['payload'] == payload
+    assert sent[-1]['expected_lane_version'] == 3 and sent[-1]['request_id'] == 'icon'
+
+
+def test_set_text_icon_usage_and_daemon_refusal(monkeypatch, capsys):
+    sent = _wire(monkeypatch, {'type': 'assistant.operation.error', 'error': 'work_lane_icon_invalid'})
+    base = ['work-lane', 'set-text', 'wl-1', '--expected-version', '3', '--request-id', 'icon']
+    assert _run(base) == 2
+    with pytest.raises(SystemExit) as error:
+        _run(base + ['--icon', 'film', '--clear-icon'])
+    assert error.value.code == 2 and sent == []
+    assert _run(base + ['--icon', 'unknown']) == 1
+    assert 'work_lane_icon_invalid' in capsys.readouterr().out

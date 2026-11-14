@@ -66,6 +66,7 @@ def test_rollback_start_verify_never_invokes_model_smoke(runtime_preparation, mo
         observed.append('zero-input')
         return {'outcome': 'passed', 'mode': 'zero_input', 'cells': [{'outcome':'passed'}]}
     monkeypatch.setattr(runtime, 'restoration_proof', restore, raising=False)
+    monkeypatch.setattr(runtime, 'prior_still_running', lambda *a: True)
     monkeypatch.setattr(runtime, 'dispatched_proofs', lambda *a: [{'fresh':True}])
     actual_runner = runtime.runner
     def runner(argv, cwd):
@@ -131,14 +132,14 @@ def test_zero_input_verifier_raw_rpc_and_owned_close(tmp_path, monkeypatch, bind
     assert prepared and closed == owned and len(closed) == binding_count
     assert [p['type'] for p in wire].count('spawn') == binding_count
 
-def test_coordinated_recovery_rejects_missing_typed_restoration(transaction, monkeypatch):
+def test_coordinated_recovery_accepts_serving_prior_without_optional_report(transaction, monkeypatch):
     tx, adapter, intent, receipt = transaction
     tx.prepare(intent, receipt)
     tx.apply(intent, receipt)
     monkeypatch.setattr(adapter, 'start_verify', lambda *a, **k:{'outcome':'passed'})
     result = tx.rollback(receipt)
-    assert result['phase'] == 'recovery_required'
-    assert result['outcome'] == 'failed'
+    assert result['phase'] == 'rolled_back'
+    assert result['outcome'] == 'passed'
 
 
 @pytest.mark.parametrize('failure', ['account','readiness','binding','cleanup'])
@@ -233,17 +234,17 @@ def test_old_receipt_cannot_be_reinterpreted_under_new_policy(tmp_path):
 def test_full_scope_restoration_is_not_fresh_full_fleet_model_acceptance():
     receipt={'receipt_path':'/private/receipt','receipt_sha256':'a'*64,'intent':{'excluded_hosts':[]}}
     result=c.Transaction.result(receipt,{'phase':'rolled_back','rollback_result':{'restoration':{'outcome':'passed'}}},explicit_rollback=True)
-    assert result['exit_code']==0 and result['outcome']=='passed'
+    assert result['disposition']=='active and checks passed' and result['outcome']=='passed'
     assert result['verification_kind']=='restoration' and result['full_fleet_acceptance'] is False
 
 
 @pytest.mark.parametrize('restoration_result',[None,{'outcome':'failed'},{'outcome':'passed'}])
-def test_direct_rollback_exit_requires_explicit_restoration(monkeypatch,restoration_result):
-    stamp={'verification_kind':'restoration','sha':'a'*40,'model_canary':{'outcome':'not_run_by_design'}}
+def test_direct_rollback_exit_uses_serving_disposition_not_restoration_report(monkeypatch,restoration_result):
+    stamp={'verification_kind':'restoration','sha':'a'*40,'model_canary':{'outcome':'not_run_by_design'}, 'disposition':'active and checks passed'}
     if restoration_result is not None: stamp['restoration']=restoration_result
     monkeypatch.setattr(deploy_mod,'deploy',lambda *a,**k:stamp)
     code=deploy_mod.main(['chat-streamd-v2','--release-checkout','/unused','--rollback'])
-    assert code==(0 if restoration_result=={'outcome':'passed'} else deploy_mod.EXIT_FLEET_SMOKE_FAILED)
+    assert code == 0
 
 
 def test_direct_post_activation_uses_no_input_proof_only(tmp_path,monkeypatch):
@@ -435,3 +436,67 @@ def test_no_input_recovers_committed_spawn_without_second_probe(tmp_path, monkey
     assert result['cells'][0]['stream_id'] == original
     assert rows == {} and events == [('spawn', original), ('close', original)]
     assert json.loads((tmp_path/'owned.0.json').read_text())['owned'] == []
+
+
+def _satellite_restoration(tmp_path, monkeypatch, refusals, error='satellite_not_current'):
+    """Fake wire whose first `refusals` spawns are refused, then admitted."""
+    from contextlib import contextmanager
+    from deploy import restoration
+    from _shared.spawn_profiles import catalog
+    binding = {'host':'peer','provider':'claude','alias':'primary','generation':'one','enabled':True}
+    spawns=[]; closed=[]; owned=[]; sleeps=[]; row={}
+    def rpc(payload, prefix):
+        if prefix=='spawn_catalog_get': return catalog()
+        if prefix=='account': return {'accounts':[binding]}
+        if prefix=='spawn':
+            spawns.append(dict(payload))
+            if len(spawns) <= refusals:
+                raise RuntimeError(str({'type':'spawn.error','error_code':'provider_cli_verification_unavailable',
+                    'error':'provider_cli_verification_unavailable','host':'peer','reason':error,
+                    'provider':'claude','account':'primary','request_id':payload['request_id']}))
+            row.update(stream_id=payload['host']+':'+payload['session_name'],session_generation='fresh',
+                       bootstrap_state='ready',account_binding=binding)
+            return dict(row)
+        if prefix=='list_sessions': return {'active':[row]}
+        raise AssertionError(prefix)
+    @contextmanager
+    def connection(*a,**k):
+        def register(payload, result): owned.append(result['stream_id'])
+        register.prepare_owned_spawn=lambda payload:None
+        yield rpc,lambda sid:None,lambda *a:pytest.fail('inference'),register,closed.append
+    clock=[0.0]
+    def sleep(seconds): sleeps.append(seconds); clock[0]+=seconds
+    monkeypatch.setattr(restoration,'_operator_connection',connection)
+    monkeypatch.setattr(restoration,'time',SimpleNamespace(sleep=sleep,monotonic=lambda: clock[0]),raising=False)
+    return restoration, binding, spawns, closed, owned, sleeps
+
+
+def test_restoration_waits_for_satellite_current_with_fresh_keys(tmp_path, monkeypatch):
+    restoration, binding, spawns, closed, owned, sleeps = _satellite_restoration(tmp_path, monkeypatch, refusals=3)
+    result = restoration.verify_no_input([binding], tmp_path/'owned')
+    assert result['outcome']=='passed'
+    assert len(spawns)==4 and len({s['idempotency_key'] for s in spawns})==4
+    assert len({s['session_name'] for s in spawns})==4 and len({s['request_id'] for s in spawns})==4
+    assert sleeps==[restoration.SATELLITE_BACKOFF_SECONDS]*3
+    waits=result['cells'][0]['satellite_waits']
+    assert [w['attempt'] for w in waits]==[1,2,3] and all(w['reason']=='satellite_not_current' for w in waits)
+    assert owned==closed==[spawns[-1]['host']+':'+spawns[-1]['session_name']]
+    assert json.loads((tmp_path/'owned.0.spawn.json').read_text())=={'spawn':None}
+
+
+def test_restoration_satellite_wait_is_bounded(tmp_path, monkeypatch):
+    restoration, binding, spawns, closed, owned, sleeps = _satellite_restoration(tmp_path, monkeypatch, refusals=10**6)
+    with pytest.raises(RuntimeError, match='satellite_not_current') as info:
+        restoration.verify_no_input([binding], tmp_path/'owned')
+    assert sum(sleeps) <= restoration.SATELLITE_WAIT_SECONDS
+    assert len(spawns)==len(sleeps)+1 and len(info.value.satellite_waits)==len(spawns)
+    assert closed==owned==[]
+    assert json.loads((tmp_path/'owned.0.spawn.json').read_text())=={'spawn':None}
+
+
+@pytest.mark.parametrize('error', ['pin_mismatch','offline'])
+def test_restoration_other_refusals_stay_immediate(tmp_path, monkeypatch, error):
+    restoration, binding, spawns, closed, owned, sleeps = _satellite_restoration(tmp_path, monkeypatch, refusals=1, error=error)
+    with pytest.raises(RuntimeError, match=error):
+        restoration.verify_no_input([binding], tmp_path/'owned')
+    assert len(spawns)==1 and sleeps==[]
