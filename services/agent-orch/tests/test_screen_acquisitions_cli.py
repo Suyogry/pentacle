@@ -31,11 +31,11 @@ def test_v4_real_cli_file_identity_without_credential_fallback(monkeypatch, tmp_
         'AGENT_ORCH_TOKEN': 'ENV-operator-never-use',
         'AGENT_ORCH_STREAM_TOKEN': 'ENV-seat-never-use'})
     if state == 'unreadable':
-        original = Path.read_text
+        original = os.open
         def read(path, *a, **kw):
-            if path == token: raise PermissionError('synthetic unreadable file')
+            if path == token or path == str(token): raise PermissionError('synthetic unreadable file')
             return original(path, *a, **kw)
-        monkeypatch.setattr(Path, 'read_text', read)
+        monkeypatch.setattr(os, 'open', read)
     def forbidden(*a, **kw):
         pytest.fail('operator or seat fallback attempted')
     monkeypatch.setattr(boundary, 'resolve_operator_token', forbidden)

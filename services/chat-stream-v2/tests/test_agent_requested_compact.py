@@ -72,18 +72,22 @@ def test_busy_below_threshold_self_compact_is_bare_ordinary_input(tmp_path, prov
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("overrides", [
-    {"stream_token": None}, {"stream_token": "invalid"}, {"from_stream_id": "elsewhere:seat"},
-    {"stream_id": "elsewhere:seat"}, {"to_stream_id": "elsewhere:seat"},
-    {"host": "elsewhere"}, {"session_name": "another"},
-    {"stream_token": None, "_auth_context": {"token_verified": True, "stream_id": SID}},
+@pytest.mark.parametrize("overrides,code", [
+    ({"stream_token": None}, "authentication_required"),
+    ({"stream_token": "invalid"}, "authentication_required"),
+    ({"from_stream_id": "elsewhere:seat"}, "authentication_required"),
+    ({"stream_id": "elsewhere:seat"}, "compact_self_only"),
+    ({"to_stream_id": "elsewhere:seat"}, "compact_self_only"),
+    ({"host": "elsewhere"}, "compact_self_only"),
+    ({"session_name": "another"}, "compact_self_only"),
+    ({"stream_token": None, "_auth_context": {"token_verified": True, "stream_id": SID}}, "authentication_required"),
 ])
-def test_dispatch_refuses_unverified_or_other_seat_without_input(tmp_path, overrides):
+def test_dispatch_refuses_unverified_or_other_seat_without_input(tmp_path, overrides, code):
     async def run():
         server, tmux, store, _ = await setup(tmp_path)
         try:
             reply = await request(server, **overrides)
-            assert reply["error_code"] == "compact_self_only", reply
+            assert reply["error_code"] == code, reply
             assert tmux.pastes == [] and tmux.escapes == 0
         finally:
             store.stop()
