@@ -11,6 +11,8 @@ backfilled. Changes that land between releases accumulate under `Unreleased`.
 
 ## Unreleased
 
+- Let a seat acquire and clear one maintenance hold with a server-verified operator dispatch and advisor ruling, without operator privileges.
+
 - Add stable release records and tools for checking and updating a single-user install.
 - Show each saved account repin attempt's park reason and host receipt codes in front desk account status, including settled attempts.
 
