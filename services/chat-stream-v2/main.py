@@ -334,6 +334,7 @@ def _spec_catalog(sessions: Sessions) -> object | None:
 
 
 async def run(args: argparse.Namespace) -> int:
+    daemon_started_monotonic = time.monotonic()
     # A malformed value fails startup before anything is opened.
     from assistant_restore import parse_auto_restore_flag
     auto_restore_enabled = parse_auto_restore_flag(os.environ)
@@ -342,6 +343,7 @@ async def run(args: argparse.Namespace) -> int:
     lifecycle = DaemonLifecycle(store, host=args.local_host)
     tmux = Tmux(args.tmux_bin)
     alerts = Alerts(store)
+    store.call_diag.alert = alerts.error
     watchdog = LoopWatchdog.from_env(store, alerts)
     # Peers come from `machines.json` (lifted v1 config: PENTACLE_MACHINES_JSON /
     # PENTACLE_MACHINES_FILE / ~/.config/pentacle-stream/machines.json). Every
@@ -587,6 +589,11 @@ async def run(args: argparse.Namespace) -> int:
                 return result
         return None
 
+    from assistant_guidelines import AssistantGuidelines
+    guidelines = AssistantGuidelines(store, assistant_composite, server.lane_rulings, comms)
+    assistant_composite.guidelines = guidelines
+    comms.guidelines = guidelines
+    server.guidelines = guidelines
     comms.assistant_ingress_policy = _assistant_ingress_policy
     comms.front_desk_digest = assistant_composite.front_desk_digest
     outbound.front_desk_digest = assistant_composite.front_desk_digest
@@ -719,6 +726,7 @@ async def run(args: argparse.Namespace) -> int:
         notify=notify,
         broadcast=server.broadcast,
         inventory_emitter=inventory_emitter,
+        guidelines=guidelines,
         assistant_backend_binding=(
             lambda stream_id, generation: assistant_composite.config.enabled and bool(generation) and stream_id in {
                 assistant_composite.config.astra_stream_id,
@@ -1112,7 +1120,8 @@ async def run(args: argparse.Namespace) -> int:
                         local_host=args.local_host, recent_limit=RECENT_LIMIT, config=icfg,
                         routing_integrity=routing_integrity,
                         inventory_emitter=inventory_emitter,
-                        provenance=provenance_sink, alerts=alerts)
+                        provenance=provenance_sink, alerts=alerts,
+                        started_monotonic=daemon_started_monotonic)
         tasks.append(asyncio.create_task(ingest.run_forever(), name="ingest"))
         log.info("ingest: every %.1fs, cap %d events/pass", icfg.interval_s, icfg.max_events_per_pass)
 

@@ -58,6 +58,20 @@ def _public_test_environment():
     yield
 
 
+@pytest.fixture(autouse=True)
+def _legacy_full_replay_contract(request, monkeypatch):
+    """Existing replay contracts select the documented rollback mode explicitly.
+
+    Persisted-position behavior has its own real-process restart tests. Keep the
+    older per-event replay, repair and accounting assertions unchanged.
+    """
+    if request.module.__name__.rsplit(".", 1)[-1] in {
+        "test_ingest", "test_restart_replay", "test_tell_ingest_proof",
+        "test_usage_accounting", "test_usage_provenance",
+    }:
+        monkeypatch.setenv("PENTACLE_INGEST_FORCE_FULL_REPLAY", "1")
+
+
 @pytest.fixture
 def ruling_spec_root(tmp_path, monkeypatch):
     """Ruling tests commission readable canonical work, without host memory."""
@@ -126,3 +140,41 @@ def _no_live_smoke_notify(tmp_path, monkeypatch):
 def _isolated_chat_checkpoint(tmp_path, monkeypatch):
     import satellite
     monkeypatch.setattr(satellite, "DEFAULT_CHAT_CHECKPOINT_PATH", str(tmp_path / "satellite-chat.json"))
+
+
+@pytest.fixture
+def virtual_submission_clock(monkeypatch):
+    """Advance proof polling with the existing clock; Store reads and loop timers stay real."""
+    import asyncio
+    from types import SimpleNamespace
+
+    import submission_events
+    from test_submission_events import _Clock
+
+    clock = _Clock()
+    monkeypatch.setattr(submission_events, "time", SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(submission_events, "asyncio", SimpleNamespace(
+        sleep=clock.sleep, wait_for=asyncio.wait_for, TimeoutError=asyncio.TimeoutError,
+    ))
+    return clock
+
+
+@pytest.fixture
+def fixed_satellite_stats(monkeypatch):
+    """Valid stats for usage journeys; machine sampling has dedicated coverage."""
+    import satellite
+
+    monkeypatch.setattr(satellite, "sample_machine_stats", lambda host: {
+        "host": host, "cpu_load_1m": 0, "memory_used_bytes": 1,
+        "memory_total_bytes": 2, "disk_used_bytes": 1,
+        "disk_total_bytes": 2, "uptime_seconds": 10,
+    })
+
+
+@pytest.fixture
+def short_pane_evidence_wait(monkeypatch):
+    """Bound absent input proof for static synthetic panes through the existing knobs."""
+    import comms
+
+    monkeypatch.setattr(comms, "SUBMISSION_EVIDENCE_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(comms, "SUBMISSION_EVIDENCE_POLL_S", 0.001)

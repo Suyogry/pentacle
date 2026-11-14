@@ -223,9 +223,12 @@ reachability, credentials, every nested field, or completeness of host maps.
 
 ## Upgrading an existing install
 
-The web client updates on its public-code host. The upstream Electron app is
-deprecated; this fork retains its desktop isolation fix. Desktop packages must
-be rebuilt to consume source changes.
+Follow [UPGRADE.md](../UPGRADE.md) to upgrade the daemon and web host together,
+including dependencies, database copies and the final doctor check. Refresh the
+browser afterwards to load the new client code.
+
+The upstream Electron app is deprecated; this fork retains its desktop isolation
+fix. Desktop packages must be rebuilt to consume source changes.
 
 Keep your private overlay outside the app/repository at
 `~/.config/pentacle/pentacle.config.js`; it survives package replacement and

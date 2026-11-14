@@ -9,7 +9,7 @@ attestations are unsupported and fail closed, including on recovered rows.
 
 from __future__ import annotations
 
-from _shared.spawn_objective import objective_error, resolve_objective
+from _shared.spawn_objective import resolve_objective
 
 import asyncio
 import base64
@@ -612,9 +612,7 @@ class WindowSchedule:
         parent_stream_id = str(msg.get("parent_stream_id") or "").strip() or None
         if parent_stream_id is not None and await self._session(parent_stream_id) is None:
             raise VerbError("parent_not_found", "scheduled parent must exist at create")
-        # Mirror live-spawn admission: a parented scheduled child requires an
-        # objective; a top-level/handoff scheduled spawn derives one from its
-        # brief so the stored row carries a concrete objective for fire.
+        # Resolve an objective before storing the schedule.
         objective, objective_source, error = resolve_objective(
             msg.get("objective"), objective_supported=msg.get("objective_supported"),
             parent_stream_id=parent_stream_id,
@@ -986,13 +984,6 @@ class WindowSchedule:
                 schedule = _row(conn.execute("SELECT * FROM v2_schedules WHERE schedule_id=?", (schedule_id,)).fetchone())
                 if schedule is None:
                     raise VerbError("not_found", "schedule not found")
-                # A properly-inserted schedule always carries a resolved objective
-                # (parented required, top-level derived at insert); a blank one is a
-                # legacy row to retire, so this re-validation stays presence-only.
-                if error := objective_error(schedule.get("objective")):
-                    conn.execute("UPDATE v2_schedules SET state='failed',last_error_code=?,terminal_at=?,updated_at=? WHERE schedule_id=?", (error, timestamp, timestamp, schedule_id))
-                    conn.commit()
-                    raise VerbError(error, error)
                 if schedule["state"] not in {"pending", "retry_pending"}:
                     raise VerbError("invalid_transition", "schedule already claimed")
                 owner_kind = "service" if schedule.get("owner_service_actor") else "seat"
@@ -1234,13 +1225,6 @@ class WindowSchedule:
         return result
 
     async def recover(self) -> None:
-        def retire_legacy(conn):
-            # Post-fix inserts always store a resolved objective (parented required,
-            # top-level derived), so a NULL objective marks a pre-objective legacy
-            # row that must not fire; retire it regardless of lineage.
-            conn.execute("UPDATE v2_schedules SET state='failed',last_error_code='objective_required',terminal_at=?,updated_at=? WHERE objective IS NULL AND state IN ('pending','retry_pending','firing')", (_now(), _now()))
-            conn.commit()
-        await self.store.submit(retire_legacy)
         def scan(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             return [dict(row) for row in conn.execute(
                 "SELECT d.*,s.state AS schedule_state,s.target_host,s.prompt_sha256,"
@@ -1407,12 +1391,52 @@ class WindowSchedule:
             ).fetchone())
         return await self.store.submit(op)
 
-    async def _recurring_target(self, msg: dict[str, Any], kind: str, actor: str) -> dict[str, Any]:
-        row = await self._recurring_row(str(msg.get("recurring_id") or ""))
-        # A seat reaches only the rules it created; absence and ownership look the same.
-        if row is None or (kind == "seat" and row.get("created_by_stream_id") != actor):
+    @staticmethod
+    def _retirement_creators_tx(conn: sqlite3.Connection, msg: dict[str, Any], actor: str) -> set[str]:
+        """Historical creators eligible for retirement by the exact current primary FD.
+
+        History only identifies targets. Authority comes from the generation-bound,
+        open, unretired current binding and its enabled lifecycle policy, in this
+        transaction. An unavailable proof never weakens ordinary creator access.
+        """
+        auth = msg.get("_auth_context") or {}
+        if not auth.get("token_verified") or auth.get("stream_id") != actor or not auth.get("session_generation"):
+            return set()
+        try:
+            import store_lifecycle_authority as authority
+            from store_assistant_binding import front_desk_aliases_conn
+            primary = authority.configured(conn)
+            # holder_is also supports legacy grants; this exception does not.
+            if not primary or not authority.holder_is(conn, actor, auth["session_generation"]):
+                return set()
+            return front_desk_aliases_conn(conn, primary)
+        except Exception:
+            log.warning("recurring retirement authority unavailable")
+            return set()
+
+    def _recurring_target_tx(
+        self, conn: sqlite3.Connection, msg: dict[str, Any], kind: str, actor: str, *, retirement: bool = False,
+    ) -> dict[str, Any]:
+        row = _row(conn.execute(
+            _RECURRING_SELECT + "WHERE r.recurring_id=?", (str(msg.get("recurring_id") or ""),),
+        ).fetchone())
+        if row is None or (kind == "seat" and row.get("created_by_stream_id") != actor
+                           and (not retirement or not row.get("created_by_stream_id")
+                                or row["created_by_stream_id"] not in self._retirement_creators_tx(conn, msg, actor))):
             raise VerbError("not_found", "recurring schedule not found")
         return row
+
+    async def _recurring_target(
+        self, msg: dict[str, Any], kind: str, actor: str, *, retirement: bool = False,
+    ) -> dict[str, Any]:
+        def op(conn: sqlite3.Connection) -> dict[str, Any]:
+            conn.execute("BEGIN")
+            try:
+                return self._recurring_target_tx(conn, msg, kind, actor, retirement=retirement)
+            finally:
+                conn.rollback()
+        async with self.store.front_desk_fence():
+            return await self.store.submit(op)
 
     async def _broadcast_recurring(
         self, event: str, recurring_id: str, *, row: dict[str, Any] | None = None,
@@ -1694,21 +1718,29 @@ class WindowSchedule:
 
     async def recurring_list(self, msg: dict[str, Any]) -> dict[str, Any]:
         kind, actor, _ = await self._actor(msg)
-        rows = await self.recurring_inventory()
-        return {"type": "schedule.recurring.list.ok", "recurring": [
-            row for row in rows
-            if kind != "seat" or row.get("created_by_stream_id") == actor
-        ]}
+        def op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            conn.execute("BEGIN")
+            try:
+                creators = {actor} | self._retirement_creators_tx(conn, msg, actor) if kind == "seat" else set()
+                rows = conn.execute(_RECURRING_SELECT + "ORDER BY r.created_at,r.recurring_id").fetchall()
+                return [_project_recurring(dict(row)) or {} for row in rows
+                        if kind != "seat" or row["created_by_stream_id"] in creators]
+            finally:
+                conn.rollback()
+        async with self.store.front_desk_fence():
+            rows = await self.store.submit(op)
+        return {"type": "schedule.recurring.list.ok", "recurring": rows}
 
     async def recurring_get(self, msg: dict[str, Any]) -> dict[str, Any]:
         kind, actor, _ = await self._actor(msg)
-        row = await self._recurring_target(msg, kind, actor)
+        row = await self._recurring_target(msg, kind, actor, retirement=True)
         return {"type": "schedule.recurring.get.ok", "recurring": _project_recurring(row, include_prompt=True)}
 
     async def _recurring_write(
         self, rule_row: dict[str, Any], assignments: dict[str, Any], *, expected_generation: Any,
         recompute: dict[str, Any] | None = None,
         recovery_proof: dict[str, Any] | None = None,
+        retirement_auth: tuple[dict[str, Any], str, str] | None = None,
     ) -> dict[str, Any]:
         """One CAS-guarded UPDATE: bumps ``generation`` and, with ``recompute``, re-arms from now."""
         recurring_id = str(rule_row["recurring_id"])
@@ -1721,6 +1753,8 @@ class WindowSchedule:
                 ).fetchone())
                 if current is None:
                     raise VerbError("not_found", "recurring schedule not found")
+                if retirement_auth is not None:
+                    self._recurring_target_tx(conn, *retirement_auth, retirement=True)
                 if expected_generation is not None and int(expected_generation) != int(current["generation"]):
                     raise VerbError("generation_conflict", "recurring schedule changed; re-read and retry")
                 if recovery_proof is not None and current["generation"] != rule_row["generation"]:
@@ -1751,7 +1785,8 @@ class WindowSchedule:
                 conn.rollback()
                 raise
 
-        await self.store.submit(op)
+        async with self.store.front_desk_fence():
+            await self.store.submit(op)
         return await self._recurring_row(recurring_id) or {}
 
     async def recurring_update(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -1814,11 +1849,12 @@ class WindowSchedule:
 
     async def recurring_pause(self, msg: dict[str, Any]) -> dict[str, Any]:
         kind, actor, _ = await self._actor(msg)
-        row = await self._recurring_target(msg, kind, actor)
+        row = await self._recurring_target(msg, kind, actor, retirement=True)
         if row["state"] == "paused":
             return {"type": "schedule.recurring.pause.ok", "recurring": _project_recurring(row)}
         updated = await self._recurring_write(
             row, {"state": "paused"}, expected_generation=msg.get("expected_generation"),
+            retirement_auth=(msg, kind, actor),
         )
         await self._broadcast_recurring("recurring_paused", str(row["recurring_id"]))
         return {"type": "schedule.recurring.pause.ok", "recurring": _project_recurring(updated)}
@@ -1838,14 +1874,21 @@ class WindowSchedule:
 
     async def recurring_delete(self, msg: dict[str, Any]) -> dict[str, Any]:
         kind, actor, _ = await self._actor(msg)
-        row = await self._recurring_target(msg, kind, actor)
-        recurring_id = str(row["recurring_id"])
+        recurring_id = str(msg.get("recurring_id") or "")
 
-        def op(conn: sqlite3.Connection) -> None:
-            conn.execute("DELETE FROM v2_recurring_schedules WHERE recurring_id=?", (recurring_id,))
-            conn.commit()
+        def op(conn: sqlite3.Connection) -> dict[str, Any]:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._recurring_target_tx(conn, msg, kind, actor, retirement=True)
+                conn.execute("DELETE FROM v2_recurring_schedules WHERE recurring_id=?", (recurring_id,))
+                conn.commit()
+                return row
+            except Exception:
+                conn.rollback()
+                raise
 
-        await self.store.submit(op)
+        async with self.store.front_desk_fence():
+            row = await self.store.submit(op)
         await self._broadcast_recurring("recurring_deleted", recurring_id, row=row)
         return {"type": "schedule.recurring.delete.ok", "recurring_id": recurring_id}
 

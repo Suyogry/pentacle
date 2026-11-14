@@ -57,12 +57,11 @@ from the daemon environment, when set); it does not inherit the previous stamped
 The installed scheduled smoke map is replaced accordingly. Repeat the declarations
 to keep an explicit map across forward deployments. Rollback uses its recorded map.
 Startup tuple probes select the tuple's alias explicitly. Wrapper/delivery probes
-and event-push canaries accept the same map. Daily-retro settings accept optional
-`account` and retain it in the original idempotent intent.
+and event-push canaries accept the same map.
 Assistant bootstrap and the busy-seat probe accept scalar `--account`. The
 commissioned recovery manifest accepts `target.account`; omitted selection retains
 the bound predecessor alias. These tools verify the admitted binding, and retained
-retro/recovery admissions are checked again before consuming work on replay.
+recovery admissions are checked again before consuming work on replay.
 
 Bound handoff, recovery and host transfer preserve the source alias when omitted,
 and fail if that target account is unavailable. Same-native-session resume and
@@ -324,6 +323,7 @@ The reviewed receiver checkout supplies the one private URL relay:
 python services/chat-stream-v2/tools/provider_account_operator_login.py \
   --policy /absolute/private-policy.json --host host-a --provider codex --account primary \
   --login-generation login-one --new-generation login-two --operation-id upgrade-one \
+  --ref message:operator-request-id \
   --expected-version 'codex-cli PINNED_VERSION' --expected-executable-sha256 "$NATIVE_SHA256" \
   --reason approved_bound_executable_upgrade
 ```
@@ -336,7 +336,8 @@ clearance guard, the real hold must remain valid, and no repin may be unresolved
 The coordinator supplies the immutable current pin and host clearance; missing
 clearance or coordinator reachability refuses before sign-in. The relay emits
 exactly one validated HTTPS authorization URL to the authenticated binding's
-private composite, then creates a separate Done / Not yet action prompt. Only
+private composite as a `problem` note referencing the message, report, or tell
+that started the enrollment, then creates a separate Done / Not yet action prompt. Only
 publication/prompt IDs and the safe native outcome reach stdout. Done is not
 login proof: native completion, subscription identity and the minimal turn must
 all succeed. No automated browser broker is used in this mode.
@@ -649,7 +650,7 @@ agent-orch spawn-freeze --host host-a --reason reviewed-home-slot --ttl 600 \
   --expected-hold-digest absent
 ```
 
-The authenticated operator/local-admin boundary is unchanged. The daemon
+The authenticated operator/local-admin path remains available. The daemon
 derives the home and captures current binding/session generations, creates the
 real host admission hold plus a durable input slot atomically, then settles
 dispatched creation outside locks. It never overwrites another slot or hold.
@@ -657,6 +658,31 @@ The home writer orders after an in-flight physical action; every later paste,
 Escape, Enter, compaction or resumed brief rechecks the durable fence. Other
 homes' existing work stays available; the host hold still refuses ordinary new
 launches on that host. Management, checkpoint/report and close remain available.
+
+**Delegated hold.** A token-verified loopback seat that is neither Dot nor scoped
+can also supply
+`--delegation-dispatch DISPATCH_ID --delegation-ruling TELL_ID` on both commands,
+with all maintenance fields on freeze and the same maintenance ID and comparison
+digests on clear. The daemon verifies a landed operator-origin dispatch to that
+seat generation and a tell with verified peer provenance from the current
+independent advisor binding. The tell must contain exactly one canonical line:
+
+```text
+DELEGATED-HOLD v1 dispatch=DISPATCH_ID actor=STREAM_ID/GENERATION host=HOST maintenance=MAINTENANCE_ID ttl_max_s=900
+```
+
+The requested TTL must fit the ruling and be at most 900 seconds. Each dispatch
+and ruling is reserved atomically for one host, maintenance ID and seat generation;
+retries replay the same receipt, and clear or expiry never renews the grant.
+`owner.delegation` records the operator source, scope and advisor binding snapshot.
+Clear checks that immutable reservation and the existing host proofs, so advisor
+rotation or tell eviction after acquire does not prevent clear, including expired
+recovery. A rotated advisor before acquire must reissue the ruling; a changed seat
+generation must be resolved with the advisor before acquiring, or use the existing
+operator-shell clear after acquiring. The daemon never silently rebinds either
+generation. Invalid grants return `maintenance_delegation_invalid` with a reason;
+reuse returns `maintenance_delegation_consumed`. This grants no other privileged
+RPC and requires neither seat operator authority nor a local-admin token.
 
 Frozen ingress, including a temporarily closed target, returns
 `provider_cli_input_maintenance`, `not_landed`, zero attempts and
@@ -786,7 +812,10 @@ identity failures stay distinct; they never initiate login automatically.
 An interrupted operation has two separate histories: attempts, including zero
 binding effects, and successful same-home binding links. Status reports the
 current pin, the union of `uncertain`, `split` and `conflict` causes, the chain's
-canonical tail, missing prerequisites and one FD next action. Offline or disabled
+canonical tail, missing prerequisites and one FD next action. Its
+`attempt_receipts` list every saved attempt, settled ones included, with the
+park reason and the saved host receipt's `state`, `outcome` and `kind` codes
+(`null` when absent); it never includes proofs, bindings or profiles. Offline or disabled
 consumers remain pending. Time, hold expiry and matching rollback bytes never
 clear a cause.
 

@@ -26,6 +26,7 @@ import wmi_brief_producer
 
 import asyncio
 import screen_monitor_principal
+import screen_acquisitions_principal
 import errno
 import functools
 import hmac
@@ -82,6 +83,8 @@ from v2_runtime import primary_assistant_name
 log = logging.getLogger("chat_streamd_v2.server")
 
 _monotonic = time.monotonic
+# One second leaves diagnostic headroom within the three-second delivery target.
+REQUEST_STORE_DIAG_SLOW_SECONDS = 1.0
 UNSUPPORTED_LOG_INTERVAL_SECONDS = 60.0
 MAX_UNSUPPORTED_LABEL_LENGTH = 128
 MAX_UNSUPPORTED_VERBS = 256
@@ -723,7 +726,7 @@ def _is_send_frame(raw: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return isinstance(msg, dict) and str(msg.get("type") or "") in {
-        "send", "notification.resolve", "notification.resolve_by_dedup", "prompt.answer",
+        "send", "compact", "notification.resolve", "notification.resolve_by_dedup", "prompt.answer",
         "voice_answer.answer",
     }
 
@@ -1031,6 +1034,7 @@ class Server:
             "close": self._on_close,
             "tell": self._on_tell,
             "send": self._on_send,
+            "compact": self._on_compact,
             "transcribe_blob": self._on_transcribe_blob,
             "assistant.publish": self._on_assistant_publish,
             "assistant.operation": self._on_assistant_operation,
@@ -2372,7 +2376,8 @@ class Server:
             return await self._dispatch_inner(raw, websocket=websocket)
         finally:
             timing.closed = True
-            self._diag_store_request(state, timing)
+            if _monotonic() - decision.started > REQUEST_STORE_DIAG_SLOW_SECONDS:
+                self._diag_store_request(state, timing)
             request_timing.reset(timing_token)
             self._diag_auth_finish(decision)
             _CONN_AUTH.reset(token)
@@ -2396,12 +2401,13 @@ class Server:
                 self._client_identities[websocket] = client
         handler = self.handlers.get(verb)
         report_actor = self._report_producer_id()
-        # Restricted report and bot producers get their typed verb refusal
+        # Restricted producers get their typed verb refusal
         # below, even for a verb this daemon does not implement.
         if handler is None and not (
             websocket is not None
             and (self._client_system_producers.get(websocket) == BOT_MESSAGING_PRODUCER_STREAM_ID
                  or self._client_system_producers.get(websocket) == WORK_REPORT_READER
+                 or self._client_system_producers.get(websocket) == screen_acquisitions_principal.ACTOR
                  or wmi_brief_producer.is_actor(self._client_system_producers.get(websocket))
                  or (report_actor is not None
                      and self._client_system_producers.get(websocket) == report_actor))
@@ -2446,6 +2452,11 @@ class Server:
                       and self.account_runtime.watcher_authorized(service_auth, msg.get("host"))
                       and msg.get("action") in {"probe", "observe-failure", "observation"}):
                     pass  # Typed payload and generation checks are in AccountRuntime.
+                elif service_auth["service_actor"] == screen_acquisitions_principal.ACTOR:
+                    if verb not in screen_acquisitions_principal.VERBS:
+                        return [self._auth_error_frame(verb, request_id, "system_producer_forbidden")]
+                    if not screen_acquisitions_principal.valid_request(msg):
+                        return [self._auth_error_frame(verb, request_id, "system_producer_payload_invalid")]
                 elif service_auth["service_actor"] == screen_monitor_principal.ACTOR:
                     if verb=='tell':
                         target=screen_monitor_principal.composite()
@@ -2516,11 +2527,19 @@ class Server:
                     "scoped_principal",
                 )) and not self._independent_recovery_admitted(verb, dispatch_msg, auth):
                     code = "authentication_required"
-            # Keep privileged admission behind mandatory authentication on every
-            # transport. Local-admin proof remains limited to recovery routes;
-            # it cannot mint credentials or change spawn admission.
+            # Every transport requires authentication. Local-admin recovery
+            # cannot mint credentials or change spawn admission; a verified seat
+            # may use only the independently checked maintenance delegation.
             if code is None and verb in {"grant_token", "spawn_freeze", "spawn_unfreeze"} and not auth.get("operator_authenticated"):
-                code = "operator_auth_required"
+                from maintenance_delegation import eligible
+                if (verb in {"spawn_freeze", "spawn_unfreeze"}
+                        and isinstance(dispatch_msg.get("delegation"), dict) and eligible(auth)
+                        and websocket not in self._client_dot_connections
+                        and websocket not in self._client_scoped_connections):
+                    # Server-only resolver; client underscore keys were stripped.
+                    dispatch_msg["_delegation_candidate"] = self.lane_rulings
+                else:
+                    code = "operator_auth_required"
             if code:
                 self._diag_auth_failure(websocket, code)
                 denied = {"type": f"{verb}.error", "error_code": code}
@@ -2958,6 +2977,7 @@ class Server:
         re-read on every RPC (removal/rotation revokes bound sockets too)."""
         sources = {
             screen_monitor_principal.ACTOR: os.environ.get(screen_monitor_principal.TOKEN_FILE_ENV),
+            screen_acquisitions_principal.ACTOR: os.environ.get(screen_acquisitions_principal.TOKEN_FILE_ENV),
             WORK_REPORT_READER: os.environ.get(WORK_REPORT_READER_TOKEN_FILE_ENV),
             WMI_BACKUP_PRODUCER_STREAM_ID: os.environ.get(WMI_BACKUP_STREAM_TOKEN_FILE_ENV),
             BOT_MESSAGING_PRODUCER_STREAM_ID: os.environ.get(BOT_MESSAGING_STREAM_TOKEN_FILE_ENV),
@@ -4086,7 +4106,8 @@ class Server:
             )
         session = with_bootstrap_state(session, event_seen=bootstrap_event)
         if self._composite_for(stream_id) is not None:
-            session = {**session, "assistant_mirror": await self.store.assistant_mirror_state(stream_id)}
+            session = {**session, "assistant_mirror": await self.store.assistant_mirror_state(stream_id),
+                       "assistant_strict_publication": await self.store.strict_publication_state(stream_id)}
         if report_id is not None:
             existing_report = await self.store.get_report(report_id)
             if existing_report is not None and existing_report.get("from_stream_id") != stream_id:
@@ -4128,6 +4149,8 @@ class Server:
                 stream_id == self.assistant_composite.config.direct_primary_stream_id) else None,
             "deferred_reap": await self.store.get_deferred_reap(stream_id),
             "usage_provenance": usage_provenance,
+            **({"assistant_guidelines": await self.guidelines.inspect(stream_id)}
+               if getattr(getattr(self, "guidelines", None), "enabled", False) else {}),
         }
 
     async def _on_rename(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -4197,6 +4220,8 @@ class Server:
         host = str(msg.get("host") or self.local_host).strip()
         runtime=getattr(self,"account_runtime",None)
         from provider_cli_maintenance import FIELDS,freeze,legacy
+        if "delegation" in msg and not FIELDS <= msg.keys():
+            raise VerbError("maintenance_delegation_invalid", "maintenance fields required", reason="maintenance_fields")
         if FIELDS & msg.keys():
             if runtime is None:raise VerbError("provider_cli_maintenance_unavailable","account runtime required")
             from provider_accounts import AccountError
@@ -4213,6 +4238,8 @@ class Server:
 
     async def _on_spawn_unfreeze(self, msg: dict[str, Any]) -> dict[str, Any]:
         host = str(msg.get("host") or self.local_host).strip()
+        if "delegation" in msg and not msg.get("maintenance_id"):
+            raise VerbError("maintenance_delegation_invalid", "maintenance id required", reason="maintenance_id")
         runtime=getattr(self,"account_runtime",None)
         if runtime is not None:
             from provider_cli_maintenance import slot,unfreeze,legacy
@@ -4500,6 +4527,13 @@ class Server:
         """
         delivered = 0
         for row in await self.store.claim_composite_tells(name=composite.config.name):
+            if row['from_stream_id'] == 'daemon:guidelines' and row['body'] == 'guidelines:refresh':
+                guidelines = getattr(self, 'guidelines', None)
+                if guidelines is not None and guidelines.enabled:
+                    await guidelines.front_desk()
+                await self.store.delete_composite_tell(seq=row['seq'])
+                delivered += 1
+                continue
             try:
                 result = await self._deliver_composite_tell(
                     composite, composite.config.stream_id, row["from_stream_id"],
@@ -4633,11 +4667,44 @@ class Server:
             physical["inbox"] = {**msg["inbox"], "to": target}
         return await self._on_send(physical)
 
+    async def _on_compact(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """A seat chooses when to submit its own ordinary compact command."""
+        from ledger import CONTEXT_COMPACT_COMMAND
+
+        auth = msg.get("_auth_context") or {}
+        caller = str(auth.get("stream_id") or "")
+        if auth.get("token_verified") is not True or not caller:
+            raise VerbError("compact_self_only", "compact requires the calling seat's token")
+        host, name = self.sessions.split(caller)
+        # Authorization boundary: a wire target must never select another seat.
+        for key, expected in (("stream_id", caller), ("to_stream_id", caller),
+                              ("host", host), ("session_name", name)):
+            if key in msg and msg[key] != expected:
+                raise VerbError("compact_self_only", "compact acts only on the calling seat")
+        request_id = str(msg.get("request_id") or "").strip()
+        if not request_id:
+            raise VerbError("bad_request", "request_id is required")
+        row = await self.store.fetch_session(host, name) or {}
+        send_request_id = f"compact:{request_id}"
+        result = await self.comms.send({
+            "stream_id": caller,
+            "request_id": send_request_id,
+            "text": CONTEXT_COMPACT_COMMAND if row.get("provider") == "claude" else "/compact",
+            "_self_compact_stream_id": caller,
+            # Preserve the trusted actor in receipts, without a peer-message
+            # sender field that would wrap the slash command in an envelope.
+            "_auth_context": auth,
+        })
+        return {**result, "type": "compact.error" if result.get("delivery") == "not_landed" else "compact.ok",
+                "request_id": request_id, "send_request_id": send_request_id}
+
     async def _on_send(self, msg: dict[str, Any]) -> dict[str, Any]:
         from provider_accounts import AccountError, reject_overrides
         try: reject_overrides(msg)
         except AccountError as exc: raise VerbError(str(exc), str(exc), **exc.context) from None
+        original_msg = msg
         msg = desk_stamp.stamp_message(msg)
+        desk_dispatch = msg is not original_msg
         if _is_primary_alias(msg.get("to_stream_id")):
             return await self._alias_send(msg)
         host, name = await self.sessions.resolve(msg)
@@ -4683,6 +4750,7 @@ class Server:
                 accepted = await composite.accept_input(
                     {**msg, "attachments": attachments},
                     operator_principal=str(auth.get("operator_principal") or "") or None,
+                    desk_dispatch=desk_dispatch,
                 )
             except ValueError as exc:
                 raise VerbError(str(exc), str(exc)) from exc
@@ -5028,7 +5096,7 @@ class Server:
                 "assistant_direct_actor_unverified", "assistant_direct_dispatch_unverified",
             }:
                 raise VerbError("publish_not_authorized", "file publication requires an authorized current publisher") from exc
-            raise VerbError(str(exc), str(exc)) from exc
+            raise VerbError(str(exc).split(":", 1)[0], str(exc)) from exc
 
     async def _assistant_question_operation(self, operation: str, msg: dict[str, Any]) -> dict[str, Any]:
         if self.notify is None:
@@ -5727,20 +5795,7 @@ class Server:
         close_kind = "session_close"
         coordinator_authorized = False
         manager_generation: str | None = None
-        ruling_manager_close = (
-            self.lane_rulings is not None
-            and msg.get("_ruling_release") is self.lane_rulings
-            and isinstance(msg.get("_ruling_report_waiver"), dict)
-        )
-        if ruling_manager_close:
-            # A derived no-report ruling intent must still enter manager
-            # admission when its requester is also the target's direct parent.
-            if not await self.sessions.assistant.manager_holds(auth):
-                raise VerbError("authority_holder_required", "manager ruling release lost its grant")
-            target = await self.store.fetch_session(host, name)
-            manager_generation = expected_generation or self._manager_target_generation(target)
-            close_kind = "manager_close"
-        elif caller_stream_id != target_stream_id:
+        if caller_stream_id != target_stream_id:
             target = await self.store.fetch_session(host, name) if self.store is not None else None
             if not (
                 caller_stream_id
@@ -5904,6 +5959,7 @@ class Server:
             "type": kind, "ok": True, "host": host, "session_name": name,
             "already_closed": result["already_closed"], "session": result.get("session"),
             "reap_status": result.get("reap_status", "unknown"),
+            "warnings": result.get("warnings", []),
             **_claim_wire_fields(claim_verified, claim_mismatch),
         }
 
@@ -5963,13 +6019,8 @@ class Server:
     async def _manager_lifecycle_fences(
         self, action: str, msg: dict[str, Any], host: str, name: str,
         target: dict[str, Any] | None, auth: dict[str, Any], expected_generation: str,
-    ) -> bool:
-        """Refuse (auditing the verified manager) unless every fence passes.
-
-        Requires the caller to still hold the grant, an explicit reason and
-        request id, no live children or pending spawns, and a non-protected
-        target. Return whether CLOSE needs an exact-generation report waiver.
-        """
+    ) -> None:
+        """Check manager authority, target generation and child preservation."""
         sid = f"{host}:{name}"
         generation = str((target or {}).get("session_generation") or "") or None
         code = None
@@ -5980,7 +6031,7 @@ class Server:
         elif generation != expected_generation:
             code = "lifecycle_generation_mismatch"
         elif action == "close" and target.get("status") == "closed":
-            return False  # Receipt only; Sessions keeps generation-fenced repeat semantics.
+            return  # Receipt only; Sessions keeps generation-fenced repeat semantics.
         if code is None:
             children = await self.sessions._live_children(sid)
             pending = await self.sessions._pending_child_spawns(sid)
@@ -5995,8 +6046,6 @@ class Server:
         if code is not None:
             await self._manager_audit(action, msg, auth, sid, generation, result="refused", refusal_code=code)
             raise VerbError(code, f"manager {action} refused: {code}")
-        return await self.store.find_report(
-            sid, statuses=INSPECT_TERMINAL_STATUSES, session_generation=generation) is None
 
     async def _operator_lane_protects(self, sid: str) -> bool:
         return any(lane.get("owner_kind") == "operator" and sid in {
@@ -6007,16 +6056,13 @@ class Server:
         self, msg: dict[str, Any], host: str, name: str, row: dict[str, Any] | None,
         expected_generation: str, auth: dict[str, Any], *, busy_override: bool = False,
     ) -> None:
-        waived = await self._manager_lifecycle_fences("close", msg, host, name, row, auth, expected_generation)
+        await self._manager_lifecycle_fences("close", msg, host, name, row, auth, expected_generation)
         if (row or {}).get("status") == "closed":
             return
         if busy_override and (row or {}).get("parent_stream_id") != auth.get("stream_id"):
             await self._manager_audit("close", msg, auth, f"{host}:{name}", expected_generation,
                                       result="refused", refusal_code="close_unauthorized")
             raise VerbError("close_unauthorized", "FD busy override requires its own child")
-        if waived:
-            await self._manager_audit("close_report_waived", msg, auth, f"{host}:{name}",
-                                      expected_generation, result="admitted")
         # Durable attribution precedes the effect: an audit failure refuses the close.
         await self._manager_audit("close", msg, auth, f"{host}:{name}", expected_generation, result="admitted")
         if self.sessions.assistant.front_desk_mode and (row or {}).get("status") == "open":

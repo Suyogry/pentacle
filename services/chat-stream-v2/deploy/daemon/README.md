@@ -103,6 +103,14 @@ systemctl --user disable --now pentacle-chat-streamd-v2.service  # Linux
 python3 install_daemon_service.py --rollback
 ```
 
+If a watchdog outside Pentacle restarts the daemon when it finds it down, mark any
+intentional stop outside `deploy.py` as maintenance first, using that watchdog's own
+runbook. This covers the `bootout` before `--rollback` and any manual
+`launchctl bootout`. Otherwise the watchdog starts the daemon again, and
+`--rollback` refuses because the service is no longer stopped. Remove the marker, or let
+it expire, when the stop is over. `deploy.py` needs no marker: the watchdog takes the
+same deploy lock.
+
 Rollback restores what was at the unit path before the first install: the earlier
 file, or nothing. It does not stop the service. It changes a file only when the
 service manager explicitly reports the service stopped (launchd no longer knows the
@@ -126,6 +134,60 @@ Omitting it raises before helper-body file or native effects. The CLI entrypoint
 passes its native runner explicitly; direct library callers must do the same only
 inside their authorized live path. Collector bootstrap failures propagate instead
 of being reported as a successful install.
+
+### Read-timing receipt (optional manual check)
+
+`--read-timing-receipt` is an optional manual check, not a forward-deploy
+requirement (operator decision 2026-11-11). A forward daemon deploy, plain or
+coordinated, proceeds without one; when a receipt **is** passed it is still
+validated for the exact target SHA, so the tool stays usable for a spot check
+before a risky read change. The read-regression class it watched for is now
+covered live by the per-call store-call lines, which name every slow call within
+the first hour after a release, for all calls rather than three, with rollback
+ungated.
+
+When you choose to run it, it times the candidate's main reads on copies of the
+live database:
+
+```sh
+python services/chat-stream-v2/tools/read_timing.py \
+  --candidate /absolute/clean-candidate-checkout --out /private/read-timing.json
+```
+
+Run it with the daemon's provisioned interpreter on a clean checkout of the
+candidate. It backs up `sessions.db` and the archive it is bound to through
+SQLite's backup API from read-only sources into one temporary directory, rebinds
+the copy to the copied archive, then starts the candidate's own `Store` on the
+copies. Before the candidate is imported, the `sqlite3` module's `Connection`,
+`Cursor` and `connect` are replaced with guarded versions, so every candidate
+connection, factory subclass and cursor checks its path and `ATTACH` target before
+SQLite opens it; replacing the authorizer or enabling extensions is refused, and
+any refusal makes the run NOT_EVALUATED. This stops accidents in ordinary
+repository code; deliberate bypass (`_sqlite3`, `ctypes`, raw file I/O, another
+process) is out of scope. Budget version 2 calls each read once untimed to warm the caches of the
+fresh copy, then three times timed, and compares the median store execution with
+the budget. It certifies warmed median execution only: not a cold first read, a
+read after cache invalidation, or tail latency. A failed or short invocation,
+warm-up included, makes that read NOT_EVALUATED. The reads are
+`list_open_sessions_with_event_summary` (3.0 s), the newest 200-event
+`fetch_session_event_page` of the open session with the most events, called as the
+daemon calls it for an open chat, without a generation (1.0 s, and
+the page must hold at least 10 user or tell events), and
+`list_open_usage_fence_rows` for every host with an open session (0.1 s each).
+It exits 0 for PASS, 1 for FAIL (a breach, or the 15-minute deadline) and 2 for
+NOT_EVALUATED (anything that kept a read from running). Both copies are always
+removed; the copies need free disk of both files plus 20%, and the backup holds a
+read transaction on the live database while it runs.
+
+`deploy.py` no longer refuses a forward deploy for a missing receipt. When a
+receipt **is** supplied it is still validated and refuses, before any service is
+stopped, if it is for another SHA or budget version (version 1 single-sample
+receipts included), from a dirty source, not passing, or has an absent, failing,
+unevaluated, repeated or contradictory read; it then requires a warm-up and
+exactly three finite non-negative samples with full output per read and per host,
+and recomputes the median itself. To re-check after a refusal, rerun the command,
+or change a budget by editing the spec and the command together. Rollback and
+coordinated recovery never need a receipt.
 
 ### Coordinated helper and daemon deployment
 
@@ -163,11 +225,13 @@ From the pinned controller root, use its provisioned interpreter:
 ```sh
 python services/chat-stream-v2/deploy/deploy.py chat-streamd-v2 \
   --release-checkout /absolute/runtime --coordinated-plan /private/intent.json \
-  --coordinated-receipt /private/receipt.json --prepare-only
+  --coordinated-receipt /private/receipt.json --prepare-only \
+  --read-timing-receipt /private/read-timing.json
 # Inside the separately granted deployment window:
 python services/chat-stream-v2/deploy/deploy.py chat-streamd-v2 \
   --release-checkout /absolute/runtime --coordinated-plan /private/intent.json \
-  --coordinated-receipt /private/receipt.json --deployer-stream-id host:deployer
+  --coordinated-receipt /private/receipt.json --deployer-stream-id host:deployer \
+  --read-timing-receipt /private/read-timing.json
 # Whole-transaction recovery, including a committed transaction or down daemon:
 python services/chat-stream-v2/deploy/deploy.py chat-streamd-v2 \
   --release-checkout /absolute/runtime --rollback \
@@ -195,8 +259,11 @@ Apply rechecks sealed inputs, sole-deployer/schedule/account quiescence and
 staged proofs. It unloads the old job and proves daemon/local helper exit before
 switching the checkout and included executor script fields. Other policy fields
 and excluded executors stay intact. It bootstraps and verifies the target,
-dispatched identities, included canaries, cleanup and slow-consumer evidence.
-No coordinated invocation accepts `--release-inputs` or `--skip-kickstart`.
+the boot line and exact served SHA plus dispatched helper identity. Only those
+serving checks decide restoration. Smoke, slow-consumer logs and the authenticated
+Front Desk reply run after commit, as reports; a failure leaves the serving target
+active and emits one aggregate BLOCKER.
+No coordinated invocation accepts `--skip-kickstart`.
 
 The immutable receipt links the intent digest to preimages, staged source,
 interpreter/dependency evidence, catalog/policy/pin digests and exact scope.
@@ -206,8 +273,9 @@ A separate owner-only journal lives beside the runtime checkout in
 effects: prepared, stopping, stopped, switching, verifying, committed,
 rolling_back, rolled_back, discarded or recovery_required. An unfinished journal blocks a
 new forward deploy. Recover explicitly with the same receipt after interruption.
-Plain `--rollback` refuses coordinated ancestry and prints that receipt path;
-unchanged-identity releases retain the ancestry in their stamps.
+Plain `--rollback` is allowed with coordinated ancestry when current and prior
+helper identity are equal. Identity-changing recovery still requires the receipt;
+unfinished transactions remain protected. Unchanged-identity releases retain ancestry.
 
 If apply has never begun, the same receipt-based `--rollback` command discards
 the preparation without stopping a daemon, restoring files, probing helpers or
@@ -219,45 +287,48 @@ again with fresh inputs, a new transaction ID and a new receipt path. Discard
 is idempotent until a new preparation supersedes the active receipt; it does
 not bypass any older coordinated ancestry in the live deployment stamp.
 
-Exit **11** means committed scoped success (or successful explicit restoration)
-with declared optional exclusions and `full_fleet_acceptance=false`. It requires
-every included forward model cell or rollback no-input binding cell to pass.
-Forward smoke preserves four `SKIPPED_DECLARED` rows per excluded host;
-rollback records the same excluded scope without inventing model-cell passes. Only a coordinated consumer that validates receipt digest,
-committed phase, admitted exclusions and complete included evidence may accept
-11; generic release gates continue to require 0. Scoped deployment never changes
-the recurring smoke schedule or satellite admission/pins.
+The public disposition, rather than individual report classifiers, determines exit:
 
-Exit **12** is an applied/recovered or recovery-required coordinated failure.
-Automatic rollback retains the original forward failure and never converts it
-to success. Inspect the journal and returned receipt, and GATE the owner when
-recovery is required. A stale receipt or post-commit source/policy/plist drift
-refuses before stop; prepare a new transaction rather than overwriting later
-work. Explicit rollback restores original source/policy/plist/stamp bytes and
-verifies fresh prior health/PID/birth/served SHA, restored bindings/catalog and
-one zero-input launch/readiness/owned-close for every included selected
-host/provider/account binding. Fresh strict native/helper dispatch proof and
-attributed slow-consumer/cleanup checks remain required. Raw RPC sends no
-prompt, brief, role baseline or subsequent input; the existing `promptless`
-smoke does send a marker and is not used for rollback.
+| Disposition | Exit |
+|---|---|
+| active and checks passed | 0 |
+| refused before change | 2 |
+| active with failed checks | 3 |
+| target not active, prior restored | 4 |
+| target not active, restore unproven | 5 |
 
-A failed forward health result is journaled as `result` (boot, runtime, fleet
-smoke, slow consumer and helper dispatch kept separate) before
-`candidate health failed` is raised. A verifier that raises journals the
-sub-results completed before it as `partial_result`; a journal write failure
-keeps the original failure and records `journal_failure`.
+Ordinary deployment fetches the exact target and verifies exact gate evidence
+before source mutation. It retains prior source and stamp/plist/policy bytes,
+modes and absence. When target boot or runtime SHA is not proved, automatic
+restoration first unloads the job and proves the process and owned children exited.
+It restores the entire prior source and saved files before bootstrap. An incomplete
+restore or unknown exit never starts the prior. A complete restore whose subsequent
+boot/SHA readback is unproven remains loaded and reports restore unproven.
+The restored prior stamp is not rewritten with the failed attempt report.
 
-Recovery never stops a prior that has proved its identity. When the exact prior
-source, policy and plist are restored, a fresh launchd boot with a new PID is
-observed and its loaded runtime SHA equals the receipt's prior SHA, a later
-restoration-proof, helper-dispatch or slow-consumer failure, or a journal write
-failure after a passed proof, leaves that daemon serving. The journal records
-`prior_running` {pid, birth, sha} and a failed `rollback_result` with
-`prior_identity`; the phase stays `recovery_required` (exit 12, not qualified).
-Launchd PID, process start and checkout SHA are re-read at that decision point;
-on any mismatch nothing is signalled and `prior_identity_mismatch` is recorded.
-A failure before that identity is proven still stops only the owned process,
-and a refusal before admission touches nothing.
+Coordinated apply retains sealed scope, preimages, authority, account/quiescence
+checks and helper identity proof. After serving success, canary/log/FD failures do
+not trigger recovery or stop that target. Restoration proofs, cleanup and dispatch
+reports after prior restoration do not veto a complete prior boot attempt or stop
+a fully restored prior. Restoration uses no provider prompts. A restarted daemon
+refuses a satellite host's spawn as `satellite_not_current` until that satellite's
+first admitted push, so the restoration spawn retries only that refusal with a fresh
+idempotency key every 2 s for up to 60 s and records each wait. Excluded scope remains
+explicit and does not imply fleet acceptance. Receipt preparation stays inert.
+
+The recurring deploy-time smoke installer is retired. Nightly checks report against
+the already deployed stamp and never deploy or select a target. The detailed smoke
+and log classifier reports remain available alongside the public disposition.
+
+Ordinary releases and nightly checks share the optional `release_exclusions`
+array in the installed machines JSON (`PENTACLE_MACHINES_FILE`). Each entry names
+an optional remote `host`, a nonempty `reason`, and an open `readiness_item`.
+For example: `{"host":"optional-host","reason":"CLI pin mismatch",
+"readiness_item":"provider-readiness-repair"}`. The front desk removes the entry
+when its readiness item closes. Declared hosts are not spawned and appear as
+`SKIPPED_DECLARED`; all included hosts must pass. Releases snapshot declarations
+on their stamp. Nightly reads the same home afresh and records its scope without
+rewriting the deployed stamp. Invocation environment overrides do not alter scope.
 
 A sealed receipt pins its controller SHA. To recover it from a repaired
 controller, the FD places an owner-only authorization file in the transaction

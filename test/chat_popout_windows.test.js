@@ -30,8 +30,8 @@ class FakeWindow extends EventEmitter {
 }
 
 function reset() { FakeWindow.instances = []; FakeWindow.nextId = 1; }
-function args(stream = 'hosta:provider_c-1') {
-  return { stream_id: stream, host: 'hosta', session_name: stream.split(':')[1], title: 'A chat' };
+function args(stream = 'host-a:provider_c-1') {
+  return { stream_id: stream, host: 'host-a', session_name: stream.split(':')[1], title: 'A chat' };
 }
 
 test('chat registry reuses a stream and supplies synchronous child context', () => {
@@ -43,18 +43,18 @@ test('chat registry reuses a stream and supplies synchronous child context', () 
   assert.equal(FakeWindow.instances[0].focusCalls, 1);
   const contextArg = FakeWindow.instances[0].options.webPreferences.additionalArguments[0];
   assert.match(contextArg, /^--pentacle-chat-popout=/);
-  assert.match(decodeURIComponent(contextArg), /"stream_id":"hosta:provider_c-1"/);
+  assert.match(decodeURIComponent(contextArg), /"stream_id":"host-a:provider_c-1"/);
 });
 
 test('chat registry broadcasts and docks only the matching child', () => {
   reset();
   const mainWindow = { webContents: new FakeWebContents(), isDestroyed: () => false };
   const manager = createChatPopoutManager({ BrowserWindow: FakeWindow, appRoot: '/tmp/public-desktop', getMainWindow: () => mainWindow });
-  manager.open(args('hosta:provider_c-1'));
-  manager.open(args('hosta:provider_c-2'));
+  manager.open(args('host-a:provider_c-1'));
+  manager.open(args('host-a:provider_c-2'));
   manager.broadcast('chat-stream:frame', { type: 'chat.event' });
   assert.equal(FakeWindow.instances.every((window) => window.webContents.sent.length === 1), true);
-  assert.deepEqual(manager.dock({ stream_id: 'hosta:provider_c-2' }), { ok: true, docked: true });
+  assert.deepEqual(manager.dock({ stream_id: 'host-a:provider_c-2' }), { ok: true, docked: true });
   assert.equal(FakeWindow.instances[0].destroyed, false);
   assert.equal(FakeWindow.instances[1].destroyed, true);
   assert.equal(mainWindow.webContents.sent[0].channel, 'chat:popout-dock');
@@ -66,7 +66,7 @@ test('chat registry closes a vanished session from the raw frame channel', () =>
   manager.open(args());
   manager.broadcast('chat-stream:frame', {
     type: 'session.inventory',
-    sessions: [{ host: 'hosta', session_name: 'other' }],
+    sessions: [{ host: 'host-a', session_name: 'other' }],
   });
   assert.equal(manager.size(), 0);
 });
@@ -81,7 +81,7 @@ test('chat raw frame inventory ignores malformed payloads and preserves a matchi
   }
   manager.broadcast('chat-stream:frame', {
     type: 'session.inventory',
-    sessions: [{ host: 'hosta', session_name: 'provider_c-1' }],
+    sessions: [{ host: 'host-a', session_name: 'provider_c-1' }],
   });
   assert.equal(manager.size(), 1);
 });

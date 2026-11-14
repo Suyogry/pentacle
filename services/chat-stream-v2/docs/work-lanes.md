@@ -57,9 +57,17 @@ Updates arrive both live (as a `chat.event` broadcast) and through history (`req
 
 Lane state is explicit: member attendance/activity never resumes a paused lane or hides ownership loss. The existing display-only `lead.presence.working` ORs actual working/background activity across every effectively assigned member seat, before member/seat/page caps, plus the bound lead's existing busy descendants. Lead identity, generation, qualification, status, online and card still describe the bound lead. Historical bindings remain available for fault display. Terminal/unresolved residual execution remains observable and grants no new execution. Existing client paused/blocked/done/needs-you motion gates remain; when all question-bearing members are beyond the eight-row preview, its final row is replaced with one such member.
 
-The shared execution guard runs on linked spawn/supporting work, resume, commissioned/ordinary work send, scheduled fire and effective assignment. It rechecks lane state and lead identity at the existing atomic commit/input fence. A queued commission cannot run after pause or owner loss. Existing read/control/report/tell/question/stop/repair paths stay available. Accepted idempotent replays return their existing outcome without new execution.
+Lanes are display and grouping state, not execution admission. Spawn, send,
+close and assignment changes do not depend on lane state or lead presence.
+Accepted idempotent replays retain their existing outcome without new execution.
+Authentication, routing integrity, receipts, readiness and advisor judgments remain.
 
-Pause, block and DONE use one drain check over effectively assigned/bound seats and pending spawn/send/schedule/native-queue deliveries. A refusal names `seat_ids` and `delivery_ids` with `work_lane_drain_required`; stop/checkpoint work and cancel or hold pending delivery first. Pause/block require `reason` and `next_action`; block also requires `blocker`. Resuming a blocked lane requires its `resolution`. Active binding clear, owner unassignment/role loss and normal close cannot release accountability: bind a qualifying successor first, or complete a drained hold/DONE transition. Sole-spec-owner disposition and recovery debt guards remain.
+Pause, block and DONE no longer drain assigned seats or pending deliveries first.
+Pause/block still require `reason` and `next_action`; block requires `blocker`,
+and resuming a blocked lane requires `resolution`. Explicit activation/adoption
+still requires a qualifying lead for the display binding. Departing a seat does
+not rewrite that historical binding. Member replacement retains its explicit
+in-use reason and source-epic checks, but does not stop work.
 
 - Lead loss: a coalesced refresh runs on every session-inventory recompute and every 60 s. Passes start at least `WORK_LANES_REFRESH_MIN_S` apart (default 2 seconds; `0` disables the spacing). The first refresh after a quiet interval runs at once; a request during the wait is served by the next pass, which reads current state. A pushed `work_lanes.inventory` frame therefore lags a change by at most the interval plus one pass while a pass is shorter than the interval (in general, the larger of the two plus one pass). Direct reads are not delayed. It never changes lane state or version, and lead loss never posts an update; it opens the `lead_lost` episode below. A handoff moves the lead (and a visible chat that pointed at the predecessor) to the successor before the predecessor closes, with one `lead_handoff` event and no state change.
 - Recovery of a lost binding is explicit; see [Owner loss](#owner-loss-lead_lost-fault). No migration silently rewrites legacy ownership/state.
@@ -144,8 +152,8 @@ No completion is inferred from report prose.
 Use `work-lane set-members <lane> --member spec_demo__bridge [--member ...]
 --expected-version N --request-id ID` for ordered full replacement. Only the
 authenticated current FD binding can write it. IDs are canonical, unique
-`spec_...` values; the legacy explicit subset permits 1–32 members. Source-derived
-membership is uncapped and moves only through the spec/summary epic reference;
+`spec_...` values; explicit and source-derived membership are uncapped. Source-derived
+membership moves only through the spec/summary epic reference;
 contradictory manual mutations fail with `work_lane_members_source_epic_required`. Empty membership requires
 `--no-spec-reason` (at most 280 characters). The daemon refuses newly added
 unresolved IDs with `work_lane_member_unresolved`; existing members are not
@@ -186,20 +194,10 @@ nothing. Item changes remain lane history and never publish chat updates.
 
 Migration extends the event CHECK with `set_members` and `item_change`,
 preserving rows, request receipts, indexes and publication references. The
-rollback tool runs against the current owned database in a stopped-daemon
-window: archive the two new event kinds, then restore the previous CHECK while
-preserving all other current rows and indexes. Additive member/snapshot data
-remain for a later upgrade. Never restore an old whole-database image over
-concurrent data. The FD retains an independent SQLite preimage and previous
-source/config/PID receipt before deployment.
-
-Forward migration runs through the existing Store schema initialization; no
-numbered migration or second database owner is introduced. Rehearse the
-read-only reverse plan with `python3 services/chat-stream-v2/tools/rollback_work_lane_progress.py
---db /path/to/owned-copy.db`. In the approved stopped-daemon window, add
-`--apply --confirm-offline` against the current database after retaining its
-backup. Re-upgrade restores archived membership/item receipts and refuses a
-conflicting receipt rather than overwriting it.
+one-off rollback utility is retired; git history retains its implementation.
+Forward migration still runs through the existing Store schema initialization.
+Any future reverse migration needs a separately reviewed stopped-writer plan;
+never restore an old whole-database image over concurrent data.
 
 At release the FD refreshes the census, reviews the title/member/estimate
 manifest, applies CAS mutations and reads each open lane back. Source validation
@@ -577,11 +575,11 @@ DB. Review the concrete rollback artifact before activation.
   - Store startup backfills open single-spec rows idempotently.
 - **New commissions.** A spawn from a token-verified agent stream that is not a handoff, resume, daemon fire or ruled release is a new commission. Seat operator elevation does not exempt it. Message text is never inspected.
   - It resolves its assignment from the first `--spec-id`, else from the source seat's effective assignment. Otherwise it is refused with `work_assignment_required`.
-  - The assignment must be a member of a non-done product lane. Otherwise it is refused with `work_lane_assignment_unlinked`, before any reservation or pane. The refusal prints the `agent-orch work-lane add-member <lane_id> <spec_id>` repair, with the lane filled in when the caller's own assignment has exactly one lane.
+  - Lane membership and state are not execution permission.
   - An admitted idempotent retry replays.
   - Operator-authenticated callers without a seat token are exempt, as are anonymous loopback spawns (a known local bypass), daemon fires, host transfer and recovery.
   - `schedule.insert` checks a non-handoff seat schedule at insert and stores its assignment first among the spec ids. A lane-ruling spawn is checked when its ruling request is admitted, not at release.
-- **Existing seats.** `agent-orch spec assign <stream> <spec>` attaches the spec when it is absent and sets the assignment. An agent caller is lane-checked. `spec unassign <stream>` clears it and keeps tags. Detaching the assigned spec clears it. Both store an explicit unassignment, which a handoff successor inherits; the single-spec fallback never reassigns that seat. The FD's own direct work is `spec assign` on the FD seat.
+- **Existing seats.** `agent-orch spec assign <stream> <spec>` attaches the spec when it is absent and sets the assignment. Assignment changes do not require an active lane. `spec unassign <stream>` clears it and keeps tags. Detaching the assigned spec clears it. Both store an explicit unassignment, which a handoff successor inherits; the single-spec fallback never reassigns that seat. The FD's own direct work is `spec assign` on the FD seat.
 - **Member removal.** `set-members` that removes a spec an open seat is assigned to is refused with `work_lane_member_in_use`, naming the seats. `--reason` proceeds and records the reason and seats on the event.
 - **Checkpoint.** `_shared/work_checkpoint.py` reads the current spec/summary with the existing parser.
   - Unrelated spec body publication is allowed only when a fresh seal proves the same declared identity. Board membership, aliases and uniqueness remain checked; the reported spec and summary are bound to their captured bytes. Membership changes and writes during a bounded read still return unverifiable. Other identity and WIP consumers keep the full byte seal.
@@ -634,8 +632,10 @@ work-progress freshness. Actual member-set replacement clears the former lane
 completion episode atomically, including replacement by already terminal work.
 
 `WorkLane.goals` contains at most eight records in inventory/list, with
-`goals_total` counting all named goals. Selection prefers `in_progress` goals,
-then rank/goal_id, and the selected records display in rank/goal_id order. Show
+`goals_total` counting all named goals. Selection takes working and moving
+goals first, then blocked, then the rest, by rank/goal_id inside each group (see
+[Derived lane progress](#derived-lane-progress)); the selected records display in
+rank/goal_id order. Show
 includes every named goal. Each record has `goal_id`, title, state, done, total,
 rank and optional target_date/icon. `goal_id` is `g_` plus the first 24 lowercase
 SHA256 hex characters of the epic ID; collisions are typed diagnostics. Title
@@ -700,20 +700,20 @@ preserve hue/order. Allocation/repair adds no work events, CAS/freshness changes
 source observation or goal digest input.
 
 Combined bounds remain <=800bytes/member added over the pre-fields baseline,
-<=2560bytes for the per-lane goal envelope (eight max records plus total/default/
+<=2624bytes for the per-lane goal envelope (eight max records plus total/default/
 revision/key overhead), <=320KiB for16x8 and <=1.25MiB for64x8 correlated frames.
 These include goal icons, hue, Unicode/escaping and all previous fields. The
 4MiB show ceiling is separate; no field dropping or budget increase is allowed.
 
 ## Source-backed checkpoint detail
 
-The released `services/_shared/checkpoint_policy.py` is the single field/rule definition for parsing, diagnostics, detail and CLI authoring-field display. Initial unfenced summary labels are Progress, Status, Next action and Blockers, each one plain-text value of 1–240 Unicode code points. Structural validation diagnoses duplicates, blank/overlength/placeholder values and lifecycle-only Status. Ordinary punctuation, Unicode, abbreviations and technical identifiers are preserved. This is not semantic truth validation.
+The released `services/_shared/checkpoint_policy.py` is the single field definition for parsing, diagnostics, detail and CLI authoring-field display; it takes each field's limit, rules and requirement from the shared readable-fields contract `pentacle-chat-core/tests/fixtures/summary_prose_cases.json` (`fields`), which memory copies byte for byte. The unfenced summary labels are Status, Next action and Blockers. Structural validation diagnoses missing, duplicate, empty and overlength values, and the contract rules `placeholder`, `stage_lead` (Status only) and `plain` (`<field>_placeholder`, `status_stage_lead`, `<field>_not_plain`). A Progress label is no longer read. This is not semantic truth validation.
 
-Existing `status_text`/`next_action_text` and short-line fields retain compatibility. Paginated show alone adds optional policy-defined detail fields (initially `progress_text`, `blockers_text`), `checkpoint_state` (`valid|invalid|unverifiable`), field-keyed `checkpoint_deficiencies` (`field,code,fix`), `checkpoint_revision`, `checkpoint_policy_revision`, `checkpoint_changed_at` and `checkpoint_first_observed_at`. Diagnostics contain at most eight fixed actionable entries, identifiers at most 64 ASCII bytes and repair text at most 256 ASCII bytes. The checkpoint/source-policy digests are fixed SHA256; changed-at starts null and changes only after an observed authored checkpoint/lifecycle change. Scans, file touches, unrelated history/criteria/estimate edits, activity, restart and policy-only changes do not manufacture progress age. Unavailable source is unverifiable even when last-good text survives.
+Existing `status_text`/`next_action_text` keep their raw values. `status_line`/`next_line` carry the whole label when it passes the contract, otherwise null. Paginated show alone adds `blocked_line`, optional policy-defined detail fields (`blockers_text`), `checkpoint_state` (`valid|invalid|unverifiable`), field-keyed `checkpoint_deficiencies` (`field,code,fix`), `checkpoint_revision`, `checkpoint_policy_revision`, `checkpoint_changed_at` and `checkpoint_first_observed_at`. Diagnostics contain at most eight fixed actionable entries, identifiers at most 64 ASCII bytes and repair text at most 256 ASCII bytes. The checkpoint/source-policy digests are fixed SHA256; the policy digest includes the loaded contract bytes, so a contract-only change re-evaluates cached facts. Changed-at starts null and changes only after an observed authored checkpoint/lifecycle change. Scans, file touches, unrelated history/criteria/estimate edits, activity, restart and policy- or contract-only changes do not manufacture progress age. Unavailable source is unverifiable even when last-good text survives.
 
 Spec `goal_text` is detail-only, normalized paragraph prose capped at 2000 code points, with `goal_text_truncated` and `goal_source` (`spec_id,revision`). A goal-filtered page adds one `projection.selected_goal` containing its summary/Goal prose (`summary_text`, `goal_text`, corresponding truncated flags and `source` canonical epic/revision), also capped at 2000 code points each. Goal previews carry no new prose. Detail-only `visibility_counts` on the lane and selected goal count distinct items over the full membership: unfinished, working, blocked, needs_answer and checkpoint_deficient. Unknown counts are null; `complete` discloses source/presence/questions availability. Counts never derive from capped seat/member arrays.
 
-Inventory budgets are unchanged: at most 800 added bytes per member over the existing pre-fields baseline, 2560 bytes per lane goal envelope, 327680 bytes at 16x8 and 1310720 at 64x8. No new checkpoint/prose metadata appears in inventory. A detail member adds at most 49152 encoded JSON bytes and selected-goal additions at most 65536; actual paginated responses remain at most 4194304 bytes with at most 32 members. New detail fields appear once in top-level `members`; `projection.members` retains its legacy fields for the same page. Normalizers preserve optional/retired policy fields; no duplicate checkpoint object or lane/goal narrative is created.
+Inventory budgets are unchanged: at most 800 added bytes per member over the existing pre-fields baseline, 2624 bytes per lane goal envelope, 327680 bytes at 16x8 and 1310720 at 64x8. No new checkpoint/prose metadata appears in inventory. A detail member adds at most 49152 encoded JSON bytes and selected-goal additions at most 65536; actual paginated responses remain at most 4194304 bytes with at most 32 members. New detail fields appear once in top-level `members`; `projection.members` retains its legacy fields for the same page. Normalizers preserve optional/retired policy fields; no duplicate checkpoint object or lane/goal narrative is created.
 
 A NEW open assigned execution lead's `implementation_ready` assertion requires a valid current coherently read checkpoint in addition to existing verified-QA requirements. Invalid/unverifiable source returns `work_checkpoint_invalid`/`work_checkpoint_unverifiable` and field repairs before the readiness row is stored. Ordinary progress/error/recovery/QA reports remain usable. Accepted report replay retains its original policy/source snapshot and payload identity even after source deletion or policy change; new assertions use current policy. These checks certify the recorded snapshot, never shipment or arbitrary prose truth.
 
@@ -721,4 +721,125 @@ A NEW open assigned execution lead's `implementation_ready` assertion requires a
 
 The authenticated current FD can use `agent-orch spawn --role lead --spec-id SPEC --provision-only [--lane-id LANE]` to create an ordinary promptless lead. The CLI sends neither task nor baseline input. The daemon verifies FD identity and role/input constraints again at commit. Explicit lane targeting resolves ambiguous membership. Then use existing `work-lane set-lead`, explicit `set-state --to active` (including blocked resolution), and ordinary admitted `send`. Binding alone never activates; a failed/spoofed provision delivers no task. Provisioning is control work; ordinary execution still follows existing commissioning rules.
 
-Before enforcement activation, the release owner inventories open lanes and pending work, binds legitimate non-FD leads or deliberately drains/holds them, removes FD execution assignments, and retains per-lane before/after evidence. Unresolved legacy ACTIVE ownership stops rollout. Preserve runtime artifacts and ownership/input history for rollback; no automatic state migration, new timer or forced kill is introduced.
+## Derived lane progress
+
+The daemon derives these facts from observations it already keeps; nothing is
+authored. All are additive and optional for older clients. Times are UTC to the
+second (`YYYY-MM-DDTHH:MM:SSZ`); null means unknown, never "now".
+
+**Goal classes.** Each goal, and the default goal when it has members, has one
+class, evaluated in order: done `d` (at least one counted member, all completed),
+working `w` (a seat effectively assigned to an unfinished member in any stage
+is working now, measured over all sessions before caps), moving
+`m` (a member in analysis, in_progress or needs_qa), blocked `b` (a member in
+blocked), queued `q` (everything else, including a goal with no members).
+Deprecated members are not counted. Clients read the letters only through
+chat-core `workLaneGoalClasses`.
+
+**Lane record (inventory, list and show).** `goal_classes` has one letter per
+record in `goals`, in order, then the default goal's letter or `-`.
+`goal_counts` is `[moving, blocked, queued, done]` over every goal and the
+default goal; working counts as moving. `progress_at` is the newest member
+`progress_at` over the full membership. `state_at` is the newest stored lane
+event whose next state differs from its prior state; a rename or membership
+edit does not move it. `freshness_at` and `updated_at` keep their meaning. At
+worst-case values the four keys add 158 bytes per lane; the goal envelope and
+frame limits are unchanged by these four keys. See [Complete goal road](#complete-goal-road)
+for the separate road and position bounds.
+
+**Detail goals.** Show goal records and `default_goal` add `moving`, `blocked`
+(member counts), `working` (class is working), `left_h` and `progress_at` over
+full membership. `left_h` sums estimate medians over members that are not
+completed, deprecated, missing or ambiguous and not estimate-exempt (the lane
+`open_estimate_h` population), rounded to one decimal and capped at 99999.9; it
+is null when that population is empty, any member has no estimate, or any is
+not fresh. Inventory goal records and `default_goal` omit these detail-only facts. A
+goal-filtered page's `selected_goal` adds `summary_line` (the epic `summary`
+when it passes `goal_summary`) and `recent`. The goal filter is unchanged; the
+default goal is its unplaced members in the unfiltered pages and has no
+`summary_line` or `recent`.
+
+**Member progress time.** The observation record keeps `progress_at`: the scan
+time of the newest stage change, checked-criteria rise, or change of a valid
+`status_line` to a different valid one under the same checkpoint policy
+revision. Null-to-valid lines and policy- or contract-only re-parses set a
+baseline. File touches, estimate edits, criteria rewording, goal moves and lane
+state changes are not progress. Records written before this field are filled
+once from stored `item_change` events showing a stage change or checked rise,
+else null.
+
+**Detail members.** Show members add `progress_at`, `summary_line` (spec.md
+`summary` when it passes `spec_summary`), `estimate_first` (the first valid
+`remaining_work_h` declaration as `p25,p75,median`), `unblocks` (up to four
+`spec_id,title` of work currently in blocked whose summary.md `blocked_by` names
+this spec, by spec id, repeated ids counted once, titles clipped like goal titles
+to 120 JSON bytes) and `recent`. `blocked_by` is parsed but never sent.
+
+**Progress trail.** `item_change` payload `prior`/`next` gain `status_line` and
+`blocked_line`; `prior.status_line` is null when the policy revision changed.
+`recent` lists at most six newest-first entries: `note` (`text`, a valid Status
+line replaced by a different valid line), `checks` (`count`, the checked rise),
+`done` (stage became completed) and `blocked` (`text`, the `blocked_line` then,
+or null). Every entry has `at`, `spec_id` and `kind`. It appears on
+`projection.recent` for the whole lane, on `selected_goal` for that goal's
+current members and on each detail member. Events of specs no longer in the lane
+or goal are skipped before the cap. The read walks at most the lane's 500 newest
+`item_change` events (by `created_at`, then `event_id`, on
+`idx_v2_work_lane_events_trail`). Events written before this change yield only
+`checks`, `done` and `blocked` entries with null text.
+
+Rollback is a revert: the previous daemon ignores the observation `progress_at`
+and the added payload keys, and the added index is unused.
+
+## Parked lanes
+
+A parked lane is still `state: "paused"`. Its inventory, list and show projection
+adds `parked: {at, reason}`; other lanes omit the key. `at` is the park time in
+UTC to the second, while `state_at` remains the time the lane entered its state.
+The stored show row also includes nullable `parked_at` and `parked_reason`.
+
+`agent-orch work-lane set-state <lane> --to paused --parked --reason "Later season"`
+parks an active, blocked, done or ordinary paused lane. The trimmed reason must
+contain 1–160 characters, without control characters. No next action is needed.
+The command retains version, request replay, owner confirmation/FD override and
+reopen membership checks. Parking twice refuses as an unchanged state.
+
+Any accepted state change clears the park record. A plain pause (including
+`parked: false`) unparks and requires the usual reason and next action. Other
+operations preserve the record. Paused ordering, hue, counts, membership and
+transition publications stay unchanged. Parked lanes suppress estimate-missing
+episodes; the next reconcile clears any existing episode. The web label and CLI
+list/show identify them as PARKED; older clients continue to display PAUSED.
+
+## Complete goal road
+
+Lane inventory, list and show projections include `goal_road`: one `d/w/m/b/q`
+letter per named goal in ascending rank, then goal ID order. Each sent goal has
+`pos`, its zero-based index in that road. The road length equals `goals_total`;
+zero goals produces `""`. The default goal contributes no road letter. Above
+64 named goals, both `goal_road` and every `pos` are omitted. The existing eight
+record selection and `goal_classes`/`goal_counts` shapes remain unchanged.
+
+Classes are evaluated in order: all completed (`d`); a working seat on any
+unfinished, non-deprecated member, in any stage (`w`); an analysis, in-progress
+or needs-QA member (`m`); a blocked member (`b`); otherwise queued (`q`). Working
+on a completed member cannot make a goal working. The same rule governs default
+goals, detail `working`, selection and counts; working counts as moving.
+
+The goal envelope limit is 2624 bytes to include eight `pos` fields and the
+nine-character icon key. The 64-letter road adds at most 79 bytes. Frame limits
+remain 327680 bytes at 16 lanes and 1310720 at 64 lanes, including parked reasons.
+The shared core accepts road alignment only when the length matches the total,
+letters are valid, and every raw goal has a distinct integer position inside
+the road. Otherwise it keeps the lane/goals with a null road and no positions.
+`workLaneGoalRoad` decodes a valid road to named classes for clients.
+
+## Lane icon selection
+
+The canonical palette appends `briefcase` (acquisition/business), `headset`
+(crm/support), `film` (animation/film), and `server` (host/server). Existing
+keyword matches retain their precedence. `work-lane set-text <lane> --icon <key>`
+sets an explicit icon; `--clear-icon` sends null and restores title fallback.
+These flags are mutually exclusive and may accompany `--title` or `--summary`.
+At least one text/icon flag is required. The daemon validates unknown keys as
+`work_lane_icon_invalid`; expected-version and request-id semantics are unchanged.

@@ -49,17 +49,6 @@ They must preserve the state checkpoint and bind receipts with candidate SHA,
 runtime PID, helper hash, evidence paths, close-capability state, and the
 durable closed-row/physical-tmux predicates through `write_receipt`.
 
-The supported D2 acceptance caller is `tools/d2_live_delivery.py`. It requires
-explicit release SHA, live PID, gate provenance and an external artifact directory;
-it uses generation-CAS mode only and preserves at least 60 seconds of delivery
-proof backoff. Run it once within the authorized release window. All independent
-observations collect failures, including runtime-after, terminal episode stability,
-4/4 durable cleanup, capability and foreign inventory, before the final verdict.
-Mutating RPC errors stop the journey; library cleanup still runs in its context
-manager. Foreign inventory is hashed before/after; equality is diagnostic only.
-Acceptance requires no foreign target in the ownership-guarded helper mutation
-audit or library cleanup receipts. Concurrent foreign inventory changes are allowed.
-
 Satellite discovery is a required boundary for remote seats. Its default
 `v2-*` admission covers `v2-fleet-smoke-{provider}-{uuid_prefix}` while its
 legacy smoke exception permits only eight hexadecimal characters. Keep the
@@ -72,3 +61,6 @@ never shorten the ownership suffix to satisfy the legacy smoke exception.
 Fleet smoke records client convergence (the existing two-second bound) separately from provider terminal idle (the cell timeout). A marker does not imply an idle provider. D2 compares durable delivered_at with controlled command start/end timestamps; the 60-second proof backoff observes durability and does not define delivery time. For helper-only repairs on a held runtime, --candidate-sha identifies the executed helper checkout and --runtime-sha identifies the frozen runtime; receipts retain both.
 
 Read-only SQLite polls close the connection on both success and query failure. The SQLite transaction context alone does not release the connection; relying on garbage collection can exhaust a low file-descriptor budget during long acceptance or teardown polling.
+
+The operator socket accepts messages up to 128 MiB, matching agent-orch so unrelated
+image-bearing broadcasts do not disconnect a smoke check.

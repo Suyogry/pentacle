@@ -8,8 +8,7 @@ creating a ruling, enqueueing its notice or launching/reserving a provider.
 correction}` entries in `errors`; account authorization remains fail-fast.
 The existing spec resolver, work binding and model tuple predicates are reused;
 no routing policy or advisor authority changes. Missing operator origin remains
-honest substantive input; malformed existing Tracking origin syntax is a
-mechanical error. New decision packets retain the exact resolved
+honest substantive input; Tracking text is interpreted by content. New decision packets retain the exact resolved
 `spec_content_sha256` and display-only `excerpt_rule`, with complete immutable
 intent in the existing ruling row. Existing pending requests retain their
 original evidence, and release still rechecks authority and safety.
@@ -227,7 +226,7 @@ release; this daemon release does not claim mobile remote interrupt support.
 
 An approved lane close that returns `close.deferred` stays actionable in the
 existing durable ruling loop. Each retry uses the ordinary close path and its
-generation, report, requester and liveness fences. Once capture proves idle,
+generation, requester and liveness checks. Once capture proves idle,
 the original request closes exactly once, including after a daemon restart.
 Definitive refusals remain terminal. The existing 600-second unruled deadline
 policy is unchanged.
@@ -351,6 +350,21 @@ reconnect and refetch.
 
 `v2_recurring_schedules` holds durable recurring rules (additive `CREATE TABLE IF NOT EXISTS`; a rollback to older code leaves it inert). `recurrence.py` is the pure next-occurrence math (`daily`, `weekdays`, `weekly`, an IANA zone, DST per the agent-orch README). `WindowSchedule` serves `schedule.recurring.create|list|get|update|pause|resume|run|delete`; admission mirrors `schedule.insert` and runs at create/update only. The `materialise_due_recurring()` pass runs inside `run_forever` before the one-shot due scan, and `recover()` applies the same evaluation to every due active rule. Missed (`late`, grace `RECURRING_LATE_FIRE_GRACE_S = 900`), overlap and unbound-parent policies are described under "Recurring" in the agent-orch README.
 
+The authenticated current primary front desk may also list, get, pause and delete
+rules whose creators are proved by the daemon's primary FD binding history,
+including open predecessors and earlier seat generations. This is a retirement
+exception: update, resume, run and one-shot access retain their existing scope.
+Creator identity, template and already-materialised occurrences remain unchanged.
+Parent mode alone never makes a rule eligible. Other named assistants are excluded.
+The exception requires the exact open, unretired bound generation and an enabled
+lifecycle policy; missing binding/history proof denies it without affecting normal
+creator or existing operator/service/nexus access. Reads use a durable snapshot;
+pause/delete recheck authority in their mutation transaction under the FD fence,
+so a superseded FD cannot mutate after a rebind. Repeated pause stays paused;
+delete after a lost successful response returns the usual `not_found`. Retirement
+prevents future materialisation across recovery; it does not cancel an occurrence
+that was already materialised.
+
 Frames reach authenticated operator clients only, like every `schedule.*` frame:
 
 - The hello snapshot carries `recurring: [rule, ...]` beside `schedules`.
@@ -387,6 +401,33 @@ restart and whole-pass backoff do not inherit this bound. Wall time is condition
 on bounded pass duration; a prompt buried within its own stream's history may
 still need more service before its durable USER proof appears. This scheduling
 bound alone does not guarantee readiness within the prompt-proof deadline.
+
+### Idle transcript proofs
+
+After initial replay completes, intake can skip an entire seat visit when its
+latest identity proof succeeded, its proof inputs are unchanged, no refusal,
+grace period or identity incident is pending, and the bound open transcript is
+still at its consumed offset. Path stat and descriptor stat must both match the
+recorded device, inode and link count, with both sizes equal to that offset.
+A skipped visit advances scheduling but performs no transcript reads, native
+header checks, binding, checkpoint or append work and changes no per-seat state.
+
+`PENTACLE_INGEST_IDLE_PROOF_S` is read once when intake is constructed. It defaults
+to 30 seconds; zero disables skipping. Invalid, negative or non-finite values
+log one warning and use 30. Age starts before the successful proof's probes and
+is never extended by a skip. At the first visit at or beyond the interval, or
+when any condition fails, the whole normal path runs with fresh identity probes.
+Bytes arriving after a skipped visit's stat wait for the next visit. An idle
+transcript header rewritten in place at the same size is checked at its next
+unskipped visit; pass scheduling and backoff mean this is not a wall-clock
+detection deadline. Active seats retain every proof guarding reads and appends.
+
+At the end of the first completed pass after each 60-second window, the INFO
+`ingest_pass_summary` JSON line reports `passes`, `pass_ms_median`, `pass_ms_max`,
+`seats_median` (rows visited, including backoff and idle skips), `backoff_skips`,
+`idle_skips`, `proof_calls` and `window_s`. Pass durations exclude the pump sleep;
+the summary also runs during replay. Proof calls count all identity-proof
+invocations, including refusals before a subprocess can launch.
 
 ### Busy-seat send probe
 
@@ -445,6 +486,15 @@ than proof of a network outage. Fallback resolution preserves this evidence.
 Committed history batches yield between broadcasts so existing socket writers can drain. Each client still has one writer and a 256-frame queue; a blocked writer remains subject to `1011 slow_consumer` isolation. Smoke failure records retain the full exception chain, including the original cell failure when teardown also fails. Preserve the smoke command's complete output when investigating a failed deployment; the deployment stamp contains only a shortened command detail.
 
 ## Context crossing and compaction
+
+`agent-orch compact` submits the authenticated calling seat's compact command
+immediately through ordinary `Comms.send`, even during a turn or below a context
+threshold. The provider CLI handles its native queue. This self-only request has
+no force or turn-end wait, and cannot follow handoff routing to another seat.
+The daemon generates a bare `/compact` for Codex or the existing preservation
+command for Claude. Existing atomic send receipts deduplicate retries by request
+ID; no new daemon queue or cooldown is involved. The [CLI contract](../agent-orch/README.md#request-context-compaction)
+distinguishes input acceptance from transcript-confirmed completion.
 
 `NudgeJob` sends a `context_advisory` notice to an open, reachable Claude
 seat and its current live non-Codex parent, including hidden and working seats.
@@ -512,14 +562,6 @@ and whole-pass error backoff with title/card work. Context gets the available
 slots first. `--disable-nudges` disables the combined job. Tagged logs use
 `subsystem=context_nudge bug_ref=context_notifications_handoff_proof` and retain
 source, kind, epoch, target, outcome and tell ID.
-
-The installed handoff verifier runs without daemon mutation:
-`python3 services/chat-stream-v2/tools/context_handoff_proof.py <evidence-directory>`.
-It checks delivered successor evidence, source/witness generations, inherited
-Fable 5.1/high tuple, predecessor closure and witness parentage. The evidence
-producer owns the three disposable seats and must verify all three are closed
-and their panes absent after capture. A successful spawn reply alone is
-insufficient: existing handoff post-steps are best-effort on reparent failure.
 
 ### QA dispatch containment
 

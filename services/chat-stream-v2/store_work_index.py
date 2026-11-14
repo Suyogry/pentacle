@@ -71,12 +71,43 @@ def effective_membership_ids_conn(conn) -> dict:
     return {"state": state, "goals": scoped, "assigned": assigned, "membership": membership}
 
 
-def effective_membership_conn(conn) -> dict:
-    """Enrich the canonical identity resolver for member/goal projection; no I/O."""
-    snapshot = effective_membership_ids_conn(conn)
+_SPEC_ID_CHUNK = 500
+
+
+def _decode_observations(conn, spec_ids, state: dict) -> dict:
+    """Decode the named observation rows (every row for `None`), each a fresh tree.
+
+    A fresh `json.loads` per identity is the independent per-identity copy: the
+    scan-clock overlay (`_observed_record`) and any later caller mutation land on
+    that copy and nowhere else. A named id with no row is simply absent, and
+    duplicate ids decode once. Runs on the caller's connection and transaction.
+    """
+    if spec_ids is None:
+        return {spec_id: _observed_record(json.loads(record_json), state)
+                for spec_id, record_json in conn.execute("SELECT spec_id,record_json FROM v2_work_item_observations")}
+    ids = list(dict.fromkeys(spec_ids))
+    records = {}
+    for start in range(0, len(ids), _SPEC_ID_CHUNK):
+        chunk = ids[start:start + _SPEC_ID_CHUNK]
+        marks = ",".join("?" for _ in chunk)
+        for spec_id, record_json in conn.execute(
+                f"SELECT spec_id,record_json FROM v2_work_item_observations WHERE spec_id IN ({marks})", chunk):
+            records[spec_id] = _observed_record(json.loads(record_json), state)
+    return records
+
+
+def effective_membership_conn(conn, *, spec_ids=None, snapshot: dict | None = None) -> dict:
+    """Enrich the canonical identity resolver for member/goal projection; no I/O.
+
+    `spec_ids` names the identities whose observations are decoded (the union of
+    `effective_member_ids` over the lanes a caller renders); the maps then hold
+    exactly those that have a row. `None` decodes every row -- the decode-all
+    mode kept for the test oracle. `snapshot` is an ids-level snapshot already
+    read in the same transaction.
+    """
+    snapshot = snapshot if snapshot is not None else effective_membership_ids_conn(conn)
     state, scoped = snapshot["state"], snapshot["goals"]
-    records = {row[0]: _observed_record(json.loads(row[1]), state) for row in conn.execute(
-        "SELECT spec_id,record_json FROM v2_work_item_observations")}
+    records = _decode_observations(conn, spec_ids, state)
     members = {}
     for identity, record in records.items():
         member = dict(record["member"])
@@ -94,6 +125,7 @@ def effective_membership_conn(conn) -> dict:
                                          "error": goal.get("error") or "work_goal_source_uncertain"}
         if record.get("progress_changed_at"):
             member["_progress_changed_at"] = record["progress_changed_at"]
+        member["_progress_at"] = record.get("progress_at")
         members[identity] = member
     return {**snapshot, "records": records, "members": members}
 
@@ -105,14 +137,23 @@ def effective_member_ids(conn, lane: dict, snapshot: dict | None = None) -> list
     return snapshot["membership"].get(lane["lane_id"], [])
 
 
+def _decoded_snapshot(conn, lane: dict, snapshot: dict | None) -> dict:
+    """A snapshot carrying the lane's decoded members, decoding only what is missing."""
+    if snapshot is not None and "members" in snapshot:
+        return snapshot
+    ids_snapshot = snapshot if snapshot is not None else effective_membership_ids_conn(conn)
+    return effective_membership_conn(conn, spec_ids=effective_member_ids(conn, lane, ids_snapshot),
+                                     snapshot=ids_snapshot)
+
+
 def members_conn(conn, lane: dict, snapshot: dict | None = None) -> list[dict]:
-    snapshot = snapshot if snapshot is not None else effective_membership_conn(conn)
+    snapshot = _decoded_snapshot(conn, lane, snapshot)
     return [snapshot["members"].get(identity) or unresolved_member(identity)
             for identity in effective_member_ids(conn, lane, snapshot)]
 
 
 def enrich_goals_conn(conn, lane: dict, snapshot: dict | None = None) -> None:
-    snapshot = snapshot if snapshot is not None else effective_membership_conn(conn)
+    snapshot = _decoded_snapshot(conn, lane, snapshot)
     lane_id = lane["lane_id"]
     goals = {identity: record for identity, record in snapshot["goals"].items()
              if record["facts"]["lane_id"] == lane_id}
@@ -170,7 +211,24 @@ def _observed_record(record: dict, state: dict) -> dict:
     return record
 
 
-def _prepare_records(rows, state: dict, scan: dict, *, settle_s: float, sweep: bool, known_lanes: set[str]):
+def progress_backfill_conn(conn) -> dict | None:
+    """One-time progress times for records written before they were kept.
+
+    Only stored stage changes and checked-count rises count; null means unknown.
+    """
+    if not conn.execute("SELECT 1 FROM v2_work_item_observations "
+                        "WHERE json_type(record_json,'$.progress_at') IS NULL LIMIT 1").fetchone():
+        return None
+    rows = conn.execute(
+        "SELECT json_extract(payload_json,'$.spec_id'),MAX(created_at) FROM v2_work_lane_events "
+        "WHERE operation='item_change' AND (json_extract(payload_json,'$.prior.status') "
+        "IS NOT json_extract(payload_json,'$.next.status') OR json_extract(payload_json,'$.next.ac_checked') "
+        "> json_extract(payload_json,'$.prior.ac_checked')) GROUP BY 1")
+    return {spec_id: stamp[:19] + "Z" for spec_id, stamp in rows if spec_id and stamp}
+
+
+def _prepare_records(rows, state: dict, scan: dict, *, settle_s: float, sweep: bool, known_lanes: set[str],
+                     backfill: dict | None = None):
     """Compute a delta without retaining a second decoded population or a cache."""
     known_ids = set()
     delta = {}
@@ -178,8 +236,11 @@ def _prepare_records(rows, state: dict, scan: dict, *, settle_s: float, sweep: b
     now = float(scan["scanned_at"])
     goals = advance_goals(state.get("goal_observations", {}), scan, known_lanes)
 
-    def advance(spec_id, previous):
+    def advance(spec_id, stored):
         nonlocal accepted
+        previous = stored
+        if stored is not None and "progress_at" not in stored:
+            previous = {**stored, "progress_at": (backfill or {}).get(spec_id)}
         candidate = _candidate(scan, spec_id, previous)
         if candidate["quality"] == "fresh":
             facts = candidate["facts"]
@@ -205,7 +266,7 @@ def _prepare_records(rows, state: dict, scan: dict, *, settle_s: float, sweep: b
                   and now - previous["bad_since"] >= settle_s):
                 # Once settled, counting more sweeps cannot change the decision.
                 record["bad_sweeps"] = previous["bad_sweeps"]
-        if record != previous:
+        if record != stored:
             delta[spec_id] = (json.dumps(record, separators=(",", ":")),
                               transition, record["member"]["obs_rev"])
 
@@ -226,7 +287,9 @@ def _prepare_file(path: str, scan: dict, *, settle_s: float, sweep: bool):
         rows = conn.execute("SELECT spec_id,record_json FROM v2_work_item_observations").fetchall()
         known_lanes = {row[0] for row in conn.execute(
             "SELECT lane_id FROM v2_assistant_composite_lanes WHERE work_state IS NOT NULL")}
-    return _prepare_records(rows, state, scan, settle_s=settle_s, sweep=sweep, known_lanes=known_lanes)
+        backfill = progress_backfill_conn(conn)
+    return _prepare_records(rows, state, scan, settle_s=settle_s, sweep=sweep, known_lanes=known_lanes,
+                            backfill=backfill)
 
 
 class WorkIndexStoreMixin:
@@ -240,6 +303,11 @@ class WorkIndexStoreMixin:
         from work_owed import lead_close_context_conn
         return await self.submit(lambda conn: lead_close_context_conn(conn, stream, generation, pending_only=pending_only,
                                                                      observation_available=observation_available))
+
+    async def lead_close_contexts(self, stream, generation, *, observation_available=True):
+        from work_owed import lead_close_contexts_conn
+        return await self.submit(lambda conn: lead_close_contexts_conn(
+            conn, stream, generation, observation_available=observation_available))
 
     async def front_desk_disposition_custody(self, stream, generation):
         from work_owed import front_desk_custody_conn
@@ -309,8 +377,9 @@ class WorkIndexStoreMixin:
                     # Memory Stores and a concurrent accepted scan use the same
                     # oracle here. Never publish a delta against a changed base.
                     current = _prepare_records(conn.execute(
-                        "SELECT spec_id,record_json FROM v2_work_item_observations"),
-                        state, scan, settle_s=settle_s, sweep=sweep, known_lanes=known_lanes)
+                        "SELECT spec_id,record_json FROM v2_work_item_observations").fetchall(),
+                        state, scan, settle_s=settle_s, sweep=sweep, known_lanes=known_lanes,
+                        backfill=progress_backfill_conn(conn))
                 _, known_ids, delta, accepted, goals, _ = current
                 # Membership may have changed while the read-only snapshot was
                 # prepared. Resolve new unknown members against this transaction.

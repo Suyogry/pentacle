@@ -42,7 +42,7 @@ SERVICES_ROOT = str(Path(__file__).resolve().parents[1])
 if SERVICES_ROOT not in sys.path:  # `_shared` is the fleet-wide module, never a v2 copy
     sys.path.insert(0, SERVICES_ROOT)
 
-from _shared.spawn_objective import objective_error, objective_required_for, resolve_objective
+from _shared.spawn_objective import resolve_objective
 from _shared.wip_cap import check_lead_spawn
 from _shared.specs_service import spec_resolution_view, SpecResolutionUnavailable  # noqa: E402
 
@@ -633,13 +633,7 @@ class SpawnCtl:
         return binding
 
     async def _work_link_refusal(self, msg: dict[str, Any], binding: dict[str, Any]) -> VerbError | None:
-        """Item (1): name one assigned spec that belongs to an open product lane."""
-        auth = msg.get("_auth_context") or {}
-        caller_id = str(auth.get("stream_id") or "")
-        caller = None
-        if ":" in caller_id:
-            caller = await self.store.fetch_session(*caller_id.split(":", 1))
-        policy = getattr(self.sessions, "assistant", None)
+        """Retain assignment validation without requiring lane membership."""
         spec_id = binding.get("assigned_spec_id")
         if not spec_id:
             source_id = str(msg.get("parent_stream_id") or "")
@@ -649,18 +643,7 @@ class SpawnCtl:
                 "work_assignment_required",
                 "a managed commission needs one assigned spec: pass --spec-id naming this commission's spec"
                 + (f"; {source_id} carries {carried} specs and no assignment" if source_id else ""))
-        if await self.store.open_lanes_for_spec(spec_id):
-            return None
-        home = await self.store.open_lanes_for_spec(effective_assignment(caller)) if effective_assignment(caller) else []
-        if len(home) == 1:
-            lane = home[0]
-            repair = f"agent-orch work-lane add-member {lane['lane_id']} {spec_id}"
-        else:
-            repair = ("agent-orch work-lane list; then "
-                      f"agent-orch work-lane add-member <lane_id> {spec_id}")
-        return VerbError("work_lane_assignment_unlinked",
-                         f"{spec_id} is not a member of any open product lane; the FD adds it first: {repair}",
-                         spec_id=spec_id)
+        return None
 
     async def _lane_admission(self, msg, binding, role):
         """The same guard covers new work, supporting work, resume and scheduled fire."""
@@ -676,8 +659,6 @@ class SpawnCtl:
                      and await self.store.lane_provisioning_allowed(msg.get("_auth_context") or {}))
         if msg.get("provision_only") and not provision:
             raise VerbError("work_lane_provisioning_forbidden", "Only the authenticated current FD may provision a promptless dedicated lead")
-        await self.store.require_lane_execution(spec, lane_id=msg.get("lane_id"), provisioning=provision,
-                                                linked_only=not msg.get("provision_only"))
         return provision
 
     async def work_checkpoint_warning(self, msg: dict[str, Any], stream_id: str) -> dict[str, Any] | None:
@@ -1649,7 +1630,7 @@ class SpawnCtl:
         # a top-level/handoff spawn derives one, and the brief is read only then.
         supported, parent = msg.get("objective_supported"), msg.get("parent_stream_id")
         obj = msg.get("objective")
-        will_derive = not objective_required_for(supported, parent) and (
+        will_derive = (
             obj is None or (isinstance(obj, str) and not obj.strip())
         )
         brief = await self._brief_from_message(msg) if will_derive else ""
@@ -1659,6 +1640,10 @@ class SpawnCtl:
         )
         if error:
             raise VerbError(error, error)
+        auth = msg.get("_auth_context") or {}
+        if (auth.get("service_authenticated") and auth.get("service_actor") == "daemon:scheduler"
+                and msg.get("objective_source") == "derived"):
+            objective_source = "derived"
         # Caller-supplied provenance cannot relabel a resolved objective.
         msg = {**deepcopy(msg), "objective": objective, "objective_source": objective_source}
         if "no_watch" in msg and not isinstance(msg["no_watch"], bool):
@@ -1700,6 +1685,19 @@ class SpawnCtl:
             host = str(msg.get("host") or local_host).strip()
             reply.update(await self._admitted_for_key(host, idempotency_key))
         if isinstance(reply, dict) and reply.get("type") == "spawn.ok":
+            session = reply.get("session") or {}
+            if not msg.get("handoff") and qa_dispatch.classified(msg, session):
+                stream = str(reply.get("stream_id") or "")
+                generation = session.get("session_generation")
+                if not generation and ":" in stream:
+                    try:
+                        current = await self.store.fetch_session(*stream.split(":", 1))
+                        generation = (current or {}).get("session_generation")
+                    except Exception:
+                        pass
+                warning = await qa_dispatch.scope_warning(self.store, stream, generation)
+                if warning:
+                    reply.setdefault("warnings", []).append(warning)
             checkpoint = await self.work_checkpoint_warning(msg, str(reply.get("stream_id") or ""))
             if checkpoint is not None:
                 reply["work_checkpoint"] = checkpoint
@@ -1796,10 +1794,6 @@ class SpawnCtl:
         Scheduling freezes this measured result; it must not reserve a stream,
         stage a token, create a pane, or otherwise begin dispatch.
         """
-        # The insert path resolves the objective (parented required, top-level
-        # derived) before this runs, so presence re-validation is sufficient.
-        if error := objective_error(msg.get("objective")):
-            raise VerbError(error, error)
         host = str(msg.get("host") or local_host).strip()
         if host != local_host:
             if self.hosts is None:
@@ -1986,9 +1980,8 @@ class SpawnCtl:
                 )
                 reply.update(admitted)
                 return reply
-            # A terminal FAILED (or other non-delivered terminal) outcome replays
-            # the stored FAILURE truthfully (Outcome Matrix class B) — NOT as
-            # pending. Same key = same operation; to re-attempt, use a new key.
+            # Cancellation or unresolved non-delivered outcomes retain their
+            # existing result. Failed outcomes are eligible for a new claim.
             recorded_reason = str(row.get("reason") or "spawn_failed")
             code = recorded_reason.split(":", 1)[0].strip() or "spawn_failed"
             raise VerbError(
@@ -2402,8 +2395,7 @@ class SpawnCtl:
                         *((((f"{host}:{name}", spec_binding_source(resume_prior_row)),)) if resume_prior_row is not None else ()),
                     ),
                     prepared_qa=prepared_qa,
-                    lane_admission={"spec_id": effective_assignment(execution_binding), "lane_id": msg.get("lane_id"),
-                                    "provisioning": bool(lane_provisioning), "linked_only": not msg.get("provision_only"),
+                    lane_admission={"provisioning": bool(lane_provisioning),
                                     "provisioning_auth": msg.get("_auth_context") or {}},
                 )
             if not recorded:
@@ -4380,8 +4372,7 @@ class SpawnCtl:
                 reason=(
                     "spawn_interrupted: daemon restarted before spawn intent was persisted"
                     if res.get("payload") is None else
-                    objective_error((intent.get("open_fields") or {}).get("objective"))
-                    or "spawn_interrupted: daemon restarted before the session row was persisted"
+                    "spawn_interrupted: daemon restarted before the session row was persisted"
                 ),
                 **outcome_identity,
             )
@@ -4478,9 +4469,14 @@ class SpawnCtl:
                         f"persisted spawn intent for {host}:{name} could not be read; "
                         "refusing to admit a defaulted registration",
                     )
-                if error := objective_error((intent.get("open_fields") or {}).get("objective")):
-                    raise VerbError(error, error)
                 adopted_fields = dict(intent["open_fields"])
+                objective, source, error = resolve_objective(
+                    adopted_fields.get("objective"), objective_supported=False,
+                    parent_stream_id=adopted_fields.get("parent_stream_id"),
+                    brief=str(intent.get("brief") or ""), title=adopted_fields.get("title"))
+                if error:
+                    raise VerbError(error, error)
+                adopted_fields.update(objective=objective, objective_source=source)
                 adopted_fields["visibility"] = tmux_transport.open_fields(adopted_fields)["visibility"]
                 await self.sessions.open(
                     host, name, **adopted_fields,
@@ -4528,10 +4524,6 @@ class SpawnCtl:
                 except Exception:  # noqa: BLE001 - pane rollback already confirmed
                     log.exception("could not persist registration-failure outcome for %s:%s", host, name)
                 return "released"
-        if objective_error((intent.get("open_fields") or {}).get("objective")):
-            # Preserve the already-running legacy generation, retire its unproven intent, and never replay its brief.
-            await self.store.set_spawn_outcome(host, name, "failed", request_id=request_id, reason="objective_required")
-            return "adopted"
         # `await_spawn` must never pend forever on a spawn nobody will finish.
         # `_settle_adoption` reconciles the live pane to a definite outcome:
         # delivered, failed, or indeterminate. Only a dead pane is failed by
@@ -4778,25 +4770,6 @@ class SpawnCtl:
         except asyncio.TimeoutError:
             return "no_transcript"
 
-    async def _mark_reset_blocked_session(self, host: str, name: str) -> None:
-        """Persist a reset interstitial discovered during live-pane adoption."""
-        row = await self.store.fetch_session(host, name)
-        if not isinstance(row, dict):
-            return
-        created_at = str(row.get("created_at") or "")
-        updated = await self.store.update_session(
-            host,
-            name,
-            expected_generation=created_at,
-            bootstrap_state=CODEX_RESET_BLOCKED,
-            pane_status="pane_alive",
-        )
-        if updated is not None:
-            self.sessions.apply_durable(
-                f"{host}:{name}",
-                bootstrap_state=CODEX_RESET_BLOCKED,
-                pane_status="pane_alive",
-            )
 
     async def _settle_adoption(
         self, host: str, name: str, brief: str, tmux: tmux_transport.Tmux,

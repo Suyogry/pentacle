@@ -41,9 +41,11 @@ import uuid
 
 from retention import (HistoryConnection, prepare_history_schema, history_query,
                        next_receipt_rowid, bind_history_archive, default_archive_path,
-                       migrate_route_batch_archive)
+                       migrate_route_batch_archive, DELIVERY_PROOF_VALID,
+                       DELIVERY_PROOF_TARGET, DELIVERY_PROOF_WIRE)
 from send_metadata import normalize_send_meta
 from loop_watchdog import StoreProgress, request_timing
+import store_call_diag
 from prockill import canonical_start
 from session_summary import SUMMARY_TAIL_LIMIT, apply_message_summary
 
@@ -51,6 +53,7 @@ import attachment_locks
 import store_exchange
 import store_attachments
 import store_usage
+import store_ingest_checkpoint
 import chat_recovery
 import store_capacity_retry
 import store_qa
@@ -641,7 +644,9 @@ def _project_send_receipt_row(
     return result
 
 
-def _restore_message_summary_conn(conn: sqlite3.Connection, session: dict[str, Any]) -> None:
+def _restore_message_summary_conn(
+    conn: sqlite3.Connection, session: dict[str, Any], *, deliveries=None,
+) -> None:
     """Rebuild one preview from a bounded, lifecycle-matched projected tail."""
     tail = conn.execute(
         "SELECT event_id, event_json FROM session_event_tail "
@@ -656,12 +661,12 @@ def _restore_message_summary_conn(conn: sqlite3.Connection, session: dict[str, A
             continue
         if isinstance(event, dict):
             events.append({**event, "daemon_seq": int(item["event_id"])})
-    for event in _project_session_events_conn(conn, events):
+    for event in _project_session_events_conn(conn, events, deliveries=deliveries):
         apply_message_summary(session, event)
 
 
 def _project_session_events_conn(
-    conn: sqlite3.Connection, events: list[dict[str, Any]],
+    conn: sqlite3.Connection, events: list[dict[str, Any]], *, deliveries=None,
 ) -> list[dict[str, Any]]:
     """Project immutable history, including metadata on old stamped USER rows."""
     projected = _project_daemon_notice_events_conn(conn, events)
@@ -669,8 +674,12 @@ def _project_session_events_conn(
     for index, event in enumerate(projected):
         raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
         if event.get("kind") in {"USER", "TELL"}:
-            origin = ({"kind": "service", "verified": True, "generation": None}
-                      if raw.get("daemon_notice") else input_origin(conn, event, event.get("daemon_seq")))
+            if raw.get("daemon_notice"):
+                origin = {"kind": "service", "verified": True, "generation": None}
+            elif deliveries is None:
+                origin = input_origin(conn, event, event.get("daemon_seq"))
+            else:
+                origin = input_origin(conn, event, event.get("daemon_seq"), deliveries=deliveries)
             event = {**event, "raw": {**raw, "input_provenance": origin}}
             if event.get("kind") == "TELL" and origin["kind"] != "peer":
                 event["raw"]["input_source_kind"] = "TELL"
@@ -940,6 +949,35 @@ CREATE TABLE IF NOT EXISTS v2_session_generations (
     PRIMARY KEY (host, session_name)
 )
 """
+
+# A single-row counter bumped by database triggers whenever a mutation could
+# change what `list_session_lineage` returns: new or removed sessions/generations
+# and changes to the exact columns that read projects (`parent_stream_id`,
+# `handoff_from_stream_id`, `visibility`; the joined `generation`). It is the
+# invalidation key for the in-process lineage cache. Because the triggers live in
+# the database, every writer is covered — including the direct-SQL paths in
+# store_host_transfer, store_routing's composite projection, and the close
+# reapers — without a hand-maintained Python writer list. Non-lineage column
+# updates (e.g. observer_binding, context_tokens) deliberately do not fire, so
+# routine usage polling does not invalidate the cache.
+LINEAGE_CACHE_VERSION_DDL = [
+    "CREATE TABLE IF NOT EXISTS _lineage_cache_version ("
+    "id INTEGER PRIMARY KEY CHECK(id=0), version INTEGER NOT NULL DEFAULT 0)",
+    "INSERT OR IGNORE INTO _lineage_cache_version(id, version) VALUES (0, 0)",
+    "CREATE TRIGGER IF NOT EXISTS _lineage_sessions_ai AFTER INSERT ON sessions "
+    "BEGIN UPDATE _lineage_cache_version SET version=version+1 WHERE id=0; END",
+    "CREATE TRIGGER IF NOT EXISTS _lineage_sessions_ad AFTER DELETE ON sessions "
+    "BEGIN UPDATE _lineage_cache_version SET version=version+1 WHERE id=0; END",
+    "CREATE TRIGGER IF NOT EXISTS _lineage_sessions_au AFTER UPDATE OF "
+    "parent_stream_id, handoff_from_stream_id, visibility ON sessions "
+    "BEGIN UPDATE _lineage_cache_version SET version=version+1 WHERE id=0; END",
+    "CREATE TRIGGER IF NOT EXISTS _lineage_generations_ai AFTER INSERT ON v2_session_generations "
+    "BEGIN UPDATE _lineage_cache_version SET version=version+1 WHERE id=0; END",
+    "CREATE TRIGGER IF NOT EXISTS _lineage_generations_ad AFTER DELETE ON v2_session_generations "
+    "BEGIN UPDATE _lineage_cache_version SET version=version+1 WHERE id=0; END",
+    "CREATE TRIGGER IF NOT EXISTS _lineage_generations_au AFTER UPDATE OF generation ON v2_session_generations "
+    "BEGIN UPDATE _lineage_cache_version SET version=version+1 WHERE id=0; END",
+]
 
 # v1's `session_event_tail` DDL, VERBATIM (not `v2_`-prefixed — this is a v1
 # table both daemons share, so pre-cutover rows render after the swap and v1's
@@ -1515,7 +1553,7 @@ def _iso_epoch(value: object) -> float | None:
 from store_voice_operations import VoiceOperationsStoreMixin, DDL as VOICE_OPERATIONS_DDL
 
 
-class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsStoreMixin, WorkIndexStoreMixin, store_attachments.AttachmentStoreMixin, _WorkLanesStoreMixin, _ExternalWorkStoreMixin, QaStoreMixin, store_usage.UsageStoreMixin, ExchangeStoreMixin, AssistantBindingStoreMixin, _RoutingStoreMixin, _SpecPersistenceMixin, _WatchWakeStoreMixin, VoiceAnswersStoreMixin):
+class Store(store_ingest_checkpoint.IngestCheckpointStoreMixin, ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsStoreMixin, WorkIndexStoreMixin, store_attachments.AttachmentStoreMixin, _WorkLanesStoreMixin, _ExternalWorkStoreMixin, QaStoreMixin, store_usage.UsageStoreMixin, ExchangeStoreMixin, AssistantBindingStoreMixin, _RoutingStoreMixin, _SpecPersistenceMixin, _WatchWakeStoreMixin, VoiceAnswersStoreMixin):
     """SQLite owned by exactly one worker thread; async callers use await."""
 
     def __init__(self, path: str = ":memory:", *, max_pending: int = 10_000,
@@ -1537,12 +1575,22 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
         # (stream_id, session_created_at) -> the stream's other event lifecycles;
         # read and written only on the store thread.
         self._other_event_lifecycles: dict[tuple[str, str], tuple[str, ...]] = {}
+        # (version, rows) cache for list_session_lineage; read and written only on
+        # the store thread. `version` is the trigger-maintained _lineage_cache_version
+        # row, so the cache is reused only while no lineage-relevant session or
+        # generation mutation has happened.
+        self._lineage_cache: tuple[int, list[dict[str, Any]]] | None = None
+        # The version table + triggers are created on the first lineage read,
+        # not at init (only question/asset scope read lineage), so most Stores
+        # never pay the DDL. Store-thread only.
+        self._lineage_ddl_ready = False
         self.schedule_schema_health = "initializing"
         # Bounded (QA #8): an unbounded write queue is exactly the growth that
         # helped wedge v1 — a stalled store thread let callers pile work up
         # without limit. Past the cap `submit` fails fast rather than growing.
         self._queue: queue.Queue[tuple | None] = queue.Queue(maxsize=max_pending)
         self.progress = StoreProgress()
+        self.call_diag = store_call_diag.StoreCallDiag()
         self._thread: threading.Thread | None = None
         # Serializes the start/stop transition against `submit` so no callable is
         # ever enqueued after the stop sentinel — such a future would never run
@@ -1557,6 +1605,7 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
         # carries its own mirror; empty keeps every non-direct
         # deployment unchanged.  Tuple: (composite_stream_id, source_stream_id,
         # source_generation, enabled_default, name).
+        self._assistant_strict_publication: dict[str, bool] = {}
         self._assistant_mirror_binding: dict[str, tuple[str, str, str, bool, str]] = {}
         self._init_routing_integrity_state()
 
@@ -1691,6 +1740,13 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
 
     def _run(self) -> None:
         conn = None
+        # A fresh connection (first start, or a stop()/start() restart on a
+        # :memory: or re-created DB) has no lineage version table yet, and any
+        # cache from a previous connection is stale. Re-arm lazy creation and
+        # drop the cache so the first lineage read on this connection rebuilds
+        # the table+triggers and re-scans, exactly as init did before.
+        self._lineage_ddl_ready = False
+        self._lineage_cache = None
         try:
             # Escape the literal store filename while enabling no-create URI
             # ATTACH for configured retention archives. Memory stores stay local.
@@ -1698,6 +1754,10 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             database = self._path if self._path in (':memory:', '') else Path(self._path).absolute().as_uri()
             conn = sqlite3.connect(database, uri=True, factory=HistoryConnection)
             conn.row_factory = sqlite3.Row
+            # A fresh connection gets a fresh delivery parse memo, bound to the
+            # connection lifetime, so a stop()/start() restart drops it.
+            from tell_proof import TellDeliveryParseCache
+            conn.delivery_parse_cache = TellDeliveryParseCache()
             # A provisioned empty file or auxiliary-only database is still a
             # fresh Store. Existing core/history schema, even with zero rows,
             # must never be mistaken for proof that its archive never existed.
@@ -1741,6 +1801,8 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 "WHERE state='cancelled'"
             )
             conn.execute(SPAWN_ADMISSION_HOLD_DDL)
+            from maintenance_delegation import DDL as MAINTENANCE_DELEGATIONS_DDL
+            conn.execute(MAINTENANCE_DELEGATIONS_DDL)
             conn.execute(SPAWN_OUTCOME_REQUEST_INDEX_DDL)
             conn.execute(TELL_DELIVERY_DDL)
             conn.execute(SESSION_ROLE_DDL)
@@ -1755,6 +1817,8 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             conn.execute(ROUTING_INTEGRITY_DDL)
             conn.execute(ROUTING_INTEGRITY_AUDIT_DDL)
             conn.execute(OUTBOUND_NOTICE_DDL)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_v2_outbound_notices_recipient "
+                         "ON v2_outbound_notices(recipient_stream_id)")
             # Measured error-alert dependency lookups. Partial indexes exclude
             # unrelated notice families without imposing a second notice store.
             conn.execute("CREATE INDEX IF NOT EXISTS ix_v2_error_notification ON v2_outbound_notices "
@@ -1805,6 +1869,8 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             conn.execute(RULING_AUDIT_DDL)
             conn.execute(ASSISTANT_COMPOSITE_ROUTES_DUE_INDEX_DDL)
             conn.execute(ASSISTANT_COMPOSITE_PUBLICATIONS_DDL)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_v2_assistant_publications_event "
+                         "ON v2_assistant_composite_publications(event_id)")
             conn.execute(ASSISTANT_COMPOSITE_LANES_DDL)
             conn.execute(ASSISTANT_COMPOSITE_OPERATIONS_DDL)
             conn.execute(ASSISTANT_COMPOSITE_TERMINAL_REPORTS_DDL)
@@ -1911,6 +1977,8 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             conn.execute(SESSION_EVENT_TAIL_INDEX_DDL)
             conn.execute(SESSION_EVENT_TAIL_IDENTITY_DDL)
             conn.execute(SESSION_EVENT_TAIL_RECORDED_DDL)
+            from native_input_lookup import ensure_schema as ensure_native_input_schema
+            ensure_native_input_schema(conn)
             conn.execute(SEND_RECEIPT_DDL)
             # Additive migration: an older receipts table gains meta_json (carries
             # meta.voice={duration_s} for the voice-input lane); a fresh DDL has it.
@@ -1938,6 +2006,7 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 if "objective" not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN objective TEXT")
             store_qa.initialize(conn)
+            store_ingest_checkpoint.initialize(conn)
             lifecycle_authority.initialize(conn)
             host_transfer.initialize(conn)
             consent.initialize(conn)
@@ -1974,6 +2043,8 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             if self._configured_archive_path is not None:
                 bind_history_archive(conn, Path(self._configured_archive_path))
             self._columns = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+            from tell_proof import DeliveryLookup
+            conn.delivery_lookup = DeliveryLookup(conn)
         except BaseException as exc:
             # Callers may have queued work while initialization ran; it will
             # never run, so close admission and fail it before reporting.
@@ -1993,7 +2064,7 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 item = self._queue.get()
                 if item is None:
                     break
-                fn, fut, loop, queued, timing = item
+                fn, fut, loop, queued, timing, name, quiet = item
                 started = time.monotonic()
                 self.progress.start(started)
                 try:
@@ -2009,6 +2080,7 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 if timing is not None:
                     loop.call_soon_threadsafe(timing.add, queued, started, finished)
                 loop.call_soon_threadsafe(_set_exception if failed else _set_result, fut, outcome)
+                self.call_diag.record(name, quiet, loop, queued, started, finished)
                 # A stop that found the queue full queued no sentinel; once
                 # closing, exit when the queue drains. Checked under the lock so
                 # a concurrent stop's sentinel is either queued or not needed.
@@ -2038,6 +2110,8 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
         `settle_on_cancel` callers (attachment lock owners) keep awaiting an
         enqueued callable through caller cancellation until it has actually
         run or been drained, then re-raise the cancellation."""
+        # Name the caller's operation before any wrapper replaces it.
+        name, quiet = store_call_diag.admit(fn)
         actor = host_transfer.actor_context.get()
         if actor is not None:
             operation = fn
@@ -2057,7 +2131,7 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 # Never block the event loop: past the cap fail fast rather than
                 # wait for the worker to drain (QA #8).
                 self.progress.enqueue(self._queue.put_nowait,
-                                      (fn, fut, loop, time.monotonic(), request_timing.get()))
+                                      (fn, fut, loop, time.monotonic(), request_timing.get(), name, quiet))
             except queue.Full as exc:
                 raise RuntimeError("store overloaded: pending write queue is full") from exc
         if settle_on_cancel:
@@ -2109,10 +2183,14 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
     async def configure_assistant_mirror(
         self, *, composite_stream_id: str, source_stream_id: str,
         source_generation: str, enabled_default: bool, name: str | None = None,
+        strict_publication_default: bool | None = None,
     ) -> None:
         name = name or primary_assistant_name()
         """Install one named assistant's trusted direct-primary mirror binding."""
         def _op(_conn: sqlite3.Connection) -> None:
+            self._assistant_strict_publication[composite_stream_id] = (
+                name == primary_assistant_name() if strict_publication_default is None else strict_publication_default
+            )
             self._assistant_mirror_binding[composite_stream_id] = (
                 composite_stream_id, source_stream_id, source_generation, enabled_default, name,
             )
@@ -2124,6 +2202,23 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
         # (daff) get their own per-name override key.
         return ("assistant.mirror.enabled" if name == primary_assistant_name()
                 else f"assistant.mirror.{name}.enabled")
+
+    def _strict_publication_state_conn(self, conn, composite_stream_id):
+        binding = self._assistant_mirror_binding.get(composite_stream_id)
+        if binding is None:
+            return {"enabled": False, "source": "unbound"}
+        name = binding[4]
+        key = ("assistant.strict_publication.enabled" if name == primary_assistant_name()
+               else f"assistant.strict_publication.{name}.enabled")
+        override = conn.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
+        if override is None:
+            return {"enabled": self._assistant_strict_publication[composite_stream_id], "source": "env"}
+        normalized = str(override[0]).strip().lower()
+        return {"enabled": normalized in {"1", "true", "on"},
+                "source": "kv" if normalized in {"1", "true", "on", "0", "false", "off"} else "kv_invalid"}
+
+    async def strict_publication_state(self, composite_stream_id):
+        return await self.submit(lambda conn: self._strict_publication_state_conn(conn, composite_stream_id))
 
     def _effective_mirror_source_conn(
         self, conn: sqlite3.Connection, binding: tuple[str, str, str, bool, str] | None,
@@ -2370,6 +2465,94 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 return key
         return None
 
+    @staticmethod
+    def _assistant_turn_boundary_conn(conn, source_stream_id, created_at, event_id, transcript, record):
+        """Fence unclassified prior assistant rows and exclude this provider record."""
+        return conn.execute(
+            "SELECT event_id FROM session_event_tail WHERE stream_id=? AND session_created_at=? "
+            "AND event_id<? AND json_extract(event_json,'$.raw.source_session_identity')=? "
+            "AND COALESCE(json_extract(event_json,'$.raw.jsonl_record_uuid'),'')<>? "
+            "AND json_extract(event_json,'$.kind')='ASSIST_TEXT' "
+            "AND COALESCE(json_extract(event_json,'$.raw.is_sidechain'),0)=0 "
+            "AND NOT ((COALESCE(json_extract(event_json,'$.raw.transport'),'')='claude-jsonl' "
+            "AND COALESCE(json_extract(event_json,'$.raw.stop_reason'),'')='tool_use') "
+            "OR (COALESCE(json_extract(event_json,'$.raw.transport'),'')='codex-rollout' "
+            "AND COALESCE(json_extract(event_json,'$.raw.phase'),'')='commentary')) "
+            "ORDER BY event_id DESC LIMIT 1",
+            (source_stream_id, created_at, event_id, transcript, record)).fetchone()
+
+    def _notice_unanswered_turn_conn(self, conn, composite_stream_id, source_stream_id,
+                                     generation, event, event_id):
+        """Persist a missing-reply notice atomically with the structured turn end."""
+        raw = event.get("raw") if isinstance(event.get("raw"), dict) else {}
+        transcript, record = raw.get("source_session_identity"), raw.get("jsonl_record_uuid")
+        if (event.get("kind") != "ASSIST_TEXT" or raw.get("is_sidechain")
+                or not isinstance(transcript, str) or not transcript
+                or not isinstance(record, str) or not record
+                or not (raw.get("transport") == "claude-jsonl" and raw.get("stop_reason") == "end_turn"
+                        or raw.get("transport") == "codex-rollout" and raw.get("phase") == "final_answer")):
+            return
+        host, _, name = source_stream_id.partition(":")
+        source = conn.execute(
+            "SELECT s.created_at FROM sessions s JOIN v2_session_generations g "
+            "ON g.host=s.host AND g.session_name=s.session_name "
+            "WHERE s.host=? AND s.session_name=? AND s.status='open' AND g.generation=?",
+            (host, name, generation)).fetchone()
+        if source is None:
+            return
+        # Preserve the mirror's conservative legacy/commentary boundary: an
+        # unclassified older assistant row must not lend its input to this turn.
+        boundary = self._assistant_turn_boundary_conn(conn, source_stream_id, source["created_at"],
+                                                      event_id, transcript, record)
+        from tell_proof import delivery_wire, input_origin, operator_dispatch
+        for candidate in self._assistant_turn_inputs_conn(conn, source_stream_id, source["created_at"],
+                                                          event_id, transcript,
+                                                          boundary["event_id"] if boundary else 0):
+            item = json.loads(candidate["event_json"])
+            wire = delivery_wire(item)
+            if not str(wire or "").strip():
+                continue
+            origin = input_origin(conn, item, candidate["event_id"])
+            if origin["kind"] in {"peer", "service"} and origin["verified"]:
+                continue
+            if origin["kind"] != "operator":
+                return
+            dispatch = operator_dispatch(conn, source_stream_id, wire, generation)
+            if dispatch is None:
+                return
+            route = conn.execute(
+                "SELECT * FROM v2_assistant_composite_routes WHERE stream_id=? AND dispatch_id=? "
+                "AND routing_state='resolved' AND delivery_state='landed'",
+                (composite_stream_id, dispatch["dispatch_id"])).fetchone()
+            if route is None or json.loads(route["route_json"] or "{}").get("desk_dispatch"):
+                return
+            dispatch_id = route["dispatch_id"]
+            notice_id = "dispatch_no_reply:" + dispatch_id
+            if conn.execute("SELECT 1 FROM v2_outbound_notices WHERE notice_id=?", (notice_id,)).fetchone():
+                return
+            if conn.execute("SELECT 1 FROM v2_assistant_composite_publications WHERE stream_id=? AND dispatch_id=? LIMIT 1",
+                            (composite_stream_id, dispatch_id)).fetchone():
+                return
+            import shlex
+            from outbound_notices import ensure_notice_marker
+            from store_routing import _insert_outbound_notice_conn
+            args = (f"--composite-stream-id {shlex.quote(composite_stream_id)} "
+                    f"--dispatch-id {shlex.quote(dispatch_id)} "
+                    f"--reply-to-message-id {shlex.quote(route['input_identity'])} ")
+            question = route["reply_to_question_id"]
+            if question:
+                args += f"--reply-to-question-id {shlex.quote(question)} "
+            ack = (f"agent-orch assistant publish --request-id {shlex.quote('publish:' + dispatch_id + ':ack')} "
+                   f"{args}--publish-kind status --response-state acknowledged --message 'I received your message.'")
+            final = (f"agent-orch assistant publish --request-id {shlex.quote('publish:' + dispatch_id)} "
+                     f"{args}--publish-kind prose --response-state final --message '<final answer>'")
+            body = (f"No reply was published for dispatch {dispatch_id}.\n"
+                    f"Message: {str(route['body'] or '')[:80]}\nAcknowledgment: {ack}\nFinal: {final}")
+            _insert_outbound_notice_conn(conn, notice_id=notice_id, kind="dispatch_no_reply",
+                                         dedupe_key=notice_id, recipient_stream_id=source_stream_id,
+                                         tell_id=notice_id, body=ensure_notice_marker(notice_id, body))
+            return
+
     def _mirror_source_event_for_binding(
         self, conn: sqlite3.Connection, binding: tuple[str, str, str, bool, str], *,
         source_stream_id: str, source_event: dict[str, Any], source_event_id: int,
@@ -2381,6 +2564,10 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             return
         effective_source_stream_id, source_generation, _source_binding = effective
         if source_stream_id != effective_source_stream_id:
+            return
+        if self._strict_publication_state_conn(conn, binding[0])["enabled"]:
+            self._notice_unanswered_turn_conn(conn, binding[0], source_stream_id,
+                                               source_generation, source_event, source_event_id)
             return
         if not self._assistant_mirror_state_conn(conn, binding[0])["enabled"]:
             return
@@ -2436,20 +2623,8 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             # can precede even its USER row. A sibling block in this same provider
             # record is not a previous turn. Unknown legacy assistant rows fence
             # the search too, preventing old dispatches crossing a metadata upgrade.
-            boundary = conn.execute(
-                "SELECT event_id FROM session_event_tail WHERE stream_id=? "
-                "AND session_created_at=? AND event_id<? "
-                "AND json_extract(event_json,'$.raw.source_session_identity')=? "
-                "AND COALESCE(json_extract(event_json,'$.raw.jsonl_record_uuid'),'')<>? "
-                "AND json_extract(event_json,'$.kind')='ASSIST_TEXT' "
-                "AND COALESCE(json_extract(event_json,'$.raw.is_sidechain'),0)=0 "
-                "AND NOT ((COALESCE(json_extract(event_json,'$.raw.transport'),'')='claude-jsonl' "
-                "AND COALESCE(json_extract(event_json,'$.raw.stop_reason'),'')='tool_use') "
-                "OR (COALESCE(json_extract(event_json,'$.raw.transport'),'')='codex-rollout' "
-                "AND COALESCE(json_extract(event_json,'$.raw.phase'),'')='commentary')) "
-                "ORDER BY event_id DESC LIMIT 1",
-                (source_stream_id, source["created_at"], source_event_id, transcript, record),
-            ).fetchone()
+            boundary = self._assistant_turn_boundary_conn(conn, source_stream_id, source["created_at"],
+                                                          source_event_id, transcript, record)
             if self._project_dispatch_turn_final_conn(
                 conn, binding[0], composite_created_at=composite["created_at"],
                 source_stream_id=source_stream_id, source_generation=source_generation,
@@ -3465,8 +3640,28 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
 
         Scope walks do not need session JSON, usage or report hydration. Keep
         table order so question scope retains the full-read API's ordering.
+
+        Called on the order of thousands of times an hour by question/asset
+        scope. The rows change only on a lineage-relevant session or generation
+        mutation, tracked by the trigger-maintained `_lineage_cache_version`, so
+        an unchanged version serves the cached rows instead of re-scanning every
+        session. Rows and order are identical to the direct query.
         """
         def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            if not self._lineage_ddl_ready:
+                # Create the version table and its triggers on the first lineage
+                # read rather than at every Store init. Idempotent (IF NOT
+                # EXISTS), so a reopened DB that already has them is cheap; a
+                # fresh process re-arms the flag and re-asserts them once.
+                for ddl in LINEAGE_CACHE_VERSION_DDL:
+                    conn.execute(ddl)
+                conn.commit()
+                self._lineage_ddl_ready = True
+            version = conn.execute(
+                "SELECT version FROM _lineage_cache_version WHERE id=0").fetchone()[0]
+            cache = self._lineage_cache
+            if cache is not None and cache[0] == version:
+                return cache[1]
             rows = conn.execute(
                 """SELECT s.host, s.session_name, s.parent_stream_id,
                           s.handoff_from_stream_id, s.visibility, g.generation
@@ -3475,13 +3670,15 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                      ON g.host=s.host AND g.session_name=s.session_name
                    ORDER BY s.rowid"""
             ).fetchall()
-            return [{
+            result = [{
                 "stream_id": f"{row['host']}:{row['session_name']}",
                 "parent_stream_id": row["parent_stream_id"],
                 "handoff_from_stream_id": row["handoff_from_stream_id"],
                 "visibility": row["visibility"],
                 "session_generation": str(row["generation"]) if row["generation"] is not None else "",
             } for row in rows]
+            self._lineage_cache = (version, result)
+            return result
 
         return await self.submit(_op)
 
@@ -3873,8 +4070,6 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
         """Persist what it would take to finish this spawn's row, BEFORE the
         pane exists. Written to the reservation the spawn already holds."""
 
-        reader = getattr(self, "lane_presence_reader", None)
-        lane_live = reader() if reader else ()
         def _op(conn: sqlite3.Connection) -> bool:
             host_transfer.preparation_may_open(conn, f'{host}:{session_name}')
             for stream_id, expected in expected_spec_sources:
@@ -3897,7 +4092,7 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             if res.get("payload") is None and float(res.get("expires_at") or 0.0) < time.time():
                 return False
             if lane_admission:
-                from store_work_lanes import require_lane_execution_conn, fd_backend_conn, _session_conn
+                from store_work_lanes import fd_backend_conn, _session_conn
                 from work_lane_progress import seat_live
                 context = dict(lane_admission)
                 auth = context.pop("provisioning_auth", None)
@@ -3908,7 +4103,6 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                             or not fd_backend_conn(conn, auth["stream_id"])):
                         from sessions import VerbError
                         raise VerbError("work_lane_provisioning_forbidden", "The current FD binding changed before provisioning")
-                require_lane_execution_conn(conn, live_sessions=lane_live, **context)
             existing = json.loads(res.get("payload") or "{}")
             prior_intent = dict(payload)
             for key in ("exchange_binding", spawn_creation.KEY):
@@ -4627,7 +4821,7 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             outcome = _row(conn.execute(
                 f"SELECT * FROM (SELECT {_SPAWN_OUTCOME_COLUMNS} FROM v2_spawn_outcomes UNION ALL "
                 f"SELECT {_SPAWN_OUTCOME_COLUMNS} FROM v2_spawn_cancellations) "
-                "WHERE host=? AND idempotency_key=? ORDER BY updated_at DESC LIMIT 1",
+                "WHERE host=? AND idempotency_key=? AND state != 'failed' ORDER BY updated_at DESC LIMIT 1",
                 (host, idempotency_key),
             ).fetchone())
             if outcome is not None:
@@ -4670,7 +4864,7 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 outcome = _row(conn.execute(
                     f"SELECT * FROM (SELECT {_SPAWN_OUTCOME_COLUMNS} FROM v2_spawn_outcomes UNION ALL "
                     f"SELECT {_SPAWN_OUTCOME_COLUMNS} FROM v2_spawn_cancellations) "
-                    "WHERE host=? AND idempotency_key=? ORDER BY updated_at DESC LIMIT 1",
+                    "WHERE host=? AND idempotency_key=? AND state != 'failed' ORDER BY updated_at DESC LIMIT 1",
                     (host, idempotency_key),
                 ).fetchone())
                 existing = outcome
@@ -5645,8 +5839,12 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
 
     async def prepare_native_input_events(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         from tell_proof import split_native_input
-        return await self.submit(lambda conn: [segment for event in events
-                                                for segment in split_native_input(conn, event)])
+        from native_input_lookup import PREPARE_SECONDS
+        def prepare(conn):
+            deadline = time.monotonic() + PREPARE_SECONDS
+            return [segment for event in events
+                    for segment in split_native_input(conn, event, lookup_deadline=deadline)]
+        return await self.submit(prepare)
 
     @staticmethod
     def _insert_session_event_conn(conn, stream_id, session_created_at, event, identity):
@@ -6128,8 +6326,6 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
         )
         timestamp = created_at or iso_now()
 
-        reader = getattr(self, "lane_presence_reader", None)
-        lane_live = reader() if reader else ()
         def _op(conn: sqlite3.Connection) -> dict[str, Any]:
             # Select the NEWEST receipt for this send's identity regardless of
             # state, so the latest outcome is authoritative: a later not_landed
@@ -6166,10 +6362,6 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 and str(latest["delivery"]) != "not_landed"
             ):
                 return {"coalesced": True, "winner": _send_receipt_row(latest, include_rowid=True)}
-            from store_work_lanes import require_lane_execution_conn
-            destination = _session_for_stream_conn(conn, target)
-            require_lane_execution_conn(conn, effective_assignment(destination), target_stream_id=target,
-                                        linked_only=True, live_sessions=lane_live, fd_input=True)
             row = _insert_send_receipt_row(
                 conn, to_stream_id=target, request_id=request, receipt_id=receipt,
                 state="accepted", optimistic_id=opt or None, wire_digest=wire_digest,
@@ -6570,8 +6762,10 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             if not isinstance(wire, str):
                 return
             for payload, row in send_proofs(conn, target, wire):
+                if payload["delivery"].get("proof_event_id") is not None:
+                    continue
                 proof = retained_proof(conn, payload)
-                if proof is None or payload["delivery"].get("proof_event_id") is not None:
+                if proof is None:
                     continue
                 meta = json.loads(row["meta_json"])
                 meta["_input_proof"].update(proof)
@@ -6595,8 +6789,8 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 tell_id = candidate["id"]
             elif isinstance(wire, str) and wire.startswith("[pentacle-notice:"):
                 tell_id = await self.submit(lambda conn: next((row[0] for row in conn.execute(
-                    "SELECT tell_id FROM v2_tell_deliveries WHERE json_extract(reply,'$.delivery.to_stream_id')=? "
-                    "AND json_extract(reply,'$.delivery.text')=?", (target, wire))), None))
+                    f"SELECT tell_id FROM v2_tell_deliveries WHERE {DELIVERY_PROOF_VALID} "
+                    f"AND {DELIVERY_PROOF_TARGET}=? AND {DELIVERY_PROOF_WIRE}=?", (target, wire))), None))
         if not isinstance(tell_id, str) or not tell_id:
             return
         prior = await self.get_tell_delivery(tell_id)
@@ -6670,6 +6864,10 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             "AND c.generation=? LIMIT 1", (host, name, generation),
         ).fetchone() is not None)
 
+    def _history_deliveries(self, conn, shared):
+        """Called only on the Store thread, inside the reader's savepoint."""
+        return conn.delivery_lookup.get(conn, shared=shared)
+
     async def fetch_session_event_page(
         self,
         stream_id: str,
@@ -6677,12 +6875,18 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
         before_daemon_seq: int | None,
         limit: int,
         generation: str | None = None,
+        after_daemon_seq: int | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch one newest-first cursor page, returned oldest-first.
 
         The SQL limit is the page bound, not the requested history length. A
         caller can therefore walk a permanently large tail without loading the
         whole stream into one Python list or frame.
+        ``after_daemon_seq`` filters raw rows before that bound and projection;
+        it preserves filtering the returned newest page by the same watermark.
+
+        The connection keeps its delivery lookup across unrelated local writes.
+        A caller's outer transaction always gets a private lookup instead.
         """
         if not stream_id or limit <= 0:
             return []
@@ -6691,7 +6895,7 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
         if not separator or not host or not session_name:
             return []
 
-        def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        def _op(conn: sqlite3.Connection, shared: bool) -> list[dict[str, Any]]:
             where = "t.stream_id = ? AND t.session_created_at = s.created_at"
             params: list[Any] = [host, session_name, stream_id]
             if generation is not None:
@@ -6708,6 +6912,9 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
             if before_daemon_seq is not None:
                 where += " AND t.event_id < ?"
                 params.append(int(before_daemon_seq))
+            if after_daemon_seq is not None:
+                where += " AND t.event_id > ?"
+                params.append(int(after_daemon_seq))
             params.append(int(limit))
             join = "JOIN sessions s ON s.host=? AND s.session_name=?" if generation is None else ""
             rows = conn.execute(
@@ -6733,20 +6940,82 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                     # value here as on its live broadcast (append_session_event).
                     event["daemon_seq"] = int(row["event_id"])
                     newest_first.append(event)
-            return list(reversed(_project_session_events_conn(conn, newest_first)))
+            deliveries = self._history_deliveries(conn, shared)
+            try:
+                return list(reversed(_project_session_events_conn(
+                    conn, newest_first, deliveries=deliveries)))
+            finally:
+                deliveries.reuse = None
+
+        def snapshot(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            shared = not conn.in_transaction
+            conn.execute("SAVEPOINT session_history_snapshot")
+            try:
+                return _op(conn, shared)
+            finally:
+                conn.execute("RELEASE session_history_snapshot")
+
+        return await self.submit(snapshot)
+
+    async def fetch_session_event_watermark(self, stream_id: str) -> int:
+        """Newest durable row in the current session, without decode/projection.
+
+        Undecodable rows still fence the next append: all future events receive
+        larger IDs, so they cannot change a post-watermark proof outcome.
+        """
+        host, separator, session_name = str(stream_id or "").partition(":")
+        if not separator or not host or not session_name:
+            return 0
+
+        def _op(conn: sqlite3.Connection) -> int:
+            row = conn.execute(
+                "SELECT max(t.event_id) FROM session_event_tail t "
+                "JOIN sessions s ON s.host=? AND s.session_name=? "
+                "WHERE t.stream_id=? AND t.session_created_at=s.created_at",
+                (host, session_name, stream_id),
+            ).fetchone()
+            return int(row[0] or 0)
 
         return await self.submit(_op)
 
-    async def fetch_session_event_tail(self, stream_id: str, *, limit: int, generation: str | None = None) -> list[dict[str, Any]]:
-        """The newest `limit` events for a stream, returned oldest-first."""
+    async def fetch_session_event_tail(
+        self, stream_id: str, *, limit: int, generation: str | None = None,
+        after_daemon_seq: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Newest `limit` raw rows after an optional watermark, oldest-first.
+
+        The bound applies before decoding, exactly as for an unfiltered tail.
+        """
         return await self.fetch_session_event_page(
             stream_id, before_daemon_seq=None, limit=limit, generation=generation,
+            after_daemon_seq=after_daemon_seq,
         )
+
+    async def list_open_usage_fence_rows(self, host: str) -> list[dict[str, Any]]:
+        """Current host fence metadata in one snapshot, without history hydration."""
+        def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(
+                """SELECT s.host, s.session_name, s.provider, s.pane_pid,
+                          s.created_at, s.account_binding,
+                          g.generation AS session_generation
+                   FROM sessions s
+                   LEFT JOIN v2_session_generations g
+                     ON g.host=s.host AND g.session_name=s.session_name
+                   WHERE s.host=? AND s.status='open'
+                     AND s.provider IN ('codex','claude')
+                   ORDER BY s.rowid""",
+                (host,),
+            ).fetchall()
+            # Preserve the ordinary row decoder's optional binding semantics;
+            # _session_row would also hydrate usage/report/capacity state.
+            return [_row(row) for row in rows]
+
+        return await self.submit(_op)
 
     async def list_open_sessions_with_event_summary(self) -> list[dict[str, Any]]:
         """Open rows plus lifecycle-matched event state from one DB snapshot."""
 
-        def _op(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+        def _op(conn: sqlite3.Connection, shared: bool) -> list[dict[str, Any]]:
             rows = conn.execute(
                 """
                 SELECT s.*,
@@ -6768,14 +7037,19 @@ class Store(ScreenLeaseStoreMixin, WorkLaneEpisodesStoreMixin, VoiceOperationsSt
                 """
             ).fetchall()
             result = [_session_row(conn, row) for row in rows]
-            for session in result:
-                _restore_message_summary_conn(conn, session)
-            return result
+            deliveries = self._history_deliveries(conn, shared)
+            try:
+                for session in result:
+                    _restore_message_summary_conn(conn, session, deliveries=deliveries)
+                return result
+            finally:
+                deliveries.reuse = None
 
         def snapshot(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            shared = not conn.in_transaction
             conn.execute("SAVEPOINT session_inventory_snapshot")
             try:
-                return _op(conn)
+                return _op(conn, shared)
             finally:
                 conn.execute("RELEASE session_inventory_snapshot")
 

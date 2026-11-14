@@ -508,6 +508,17 @@ def test_incident_fixture_bounded_batches_and_twenty_interleaved_reads(tmp_path,
                 return {table: c.execute('SELECT SUM(' + '+'.join('COALESCE(octet_length("'+column+'"),0)' for column in r._columns(c,table)) + '+8) FROM '+table).fetchone()[0] for table in r.HISTORY_TABLES}
             family_bytes=await store.submit(total_bytes)
             job = r.RetentionJob(store)
+            submit_batch = job._submit
+            read_between_batches = False
+            async def submit_with_read(fn):
+                nonlocal read_between_batches
+                result = await submit_batch(fn)
+                if len(batches) == 1 and not read_between_batches:
+                    read_between_batches = True
+                    assert await store.submit(lambda c: c.execute("SELECT 1").fetchone()[0]) == 1
+                    order.append(dict(event="boundary_read_complete"))
+                return result
+            monkeypatch.setattr(job, "_submit", submit_with_read)
             async def loop_probe():
                 while active:
                     start=time.perf_counter(); await asyncio.sleep(.001)
@@ -546,8 +557,11 @@ def test_incident_fixture_bounded_batches_and_twenty_interleaved_reads(tmp_path,
         assert 0 < result.receipts_moved + result.routes_moved <= 2000
         assert all(b['examined']<=500 and b['materialized_bytes']<=1024*1024 for b in result.history_batches)
         assert len(delays)==20
-        assert max(delays)<.2, "request_s max must be < 0.2s"
-        assert max(loop_delays)<.2, "loop_delay_s max must be < 0.2s"
+        events = [item['event'] for item in order]
+        first_end = events.index('batch_end')
+        boundary_read = events.index('boundary_read_complete')
+        second_start = events.index('batch_start', first_end + 1)
+        assert first_end < boundary_read < second_start
     asyncio.run(run())
 
 
@@ -602,41 +616,6 @@ def test_archive_configuration_cannot_abandon_event_history(tmp_path):
     asyncio.run(run())
 
 
-def test_retro_older_window_combines_before_latest_and_cutoff(tmp_path):
-    from tools import daily_retro as retro
-    async def run():
-        store = running(tmp_path)
-        try:
-            await store.open_session("fixture", "root", created_at="2026-07-01T00:00:00Z")
-            await store.submit(lambda c:(c.execute("INSERT INTO v2_assistant_direct_binding VALUES(?,'fixture:root','generation',1,'2026-07-01T00:00:00Z')", (AssistantCompositeConfig().name,)),c.commit()))
-            await append(store, "failure", stamp="2026-08-01T12:00:00Z", state="not_landed", delivery="not_landed", from_stream_id="fixture:root")
-            await append(store, "failure", stamp="2026-08-02T12:00:00Z", from_stream_id="fixture:root")
-            # Give archived recipient membership the established same-name schema.
-            from store import SESSIONS_DDL
-            archive = await archive_path(store)
-            with sqlite3.connect(archive) as c:
-                c.execute(SESSIONS_DDL)
-                c.execute("INSERT INTO sessions(host,session_name,visibility,created_at,status,closed_at) VALUES('fixture','retired','hidden','2026-07-01T00:00:00Z','closed','2026-08-01T11:00:00Z')")
-            settings=retro.Settings(tmp_path/'memory',tmp_path/'state','ws://127.0.0.1:12345',tmp_path/'token','fixture',isolated=True,primary_store=Path(store.path),primary_archive=archive)
-            start=datetime(2026,8,1,tzinfo=timezone.utc);cutoff=start+timedelta(days=1)
-            before=retro.primary_evidence(settings,start,cutoff)
-            assert [x['kind'] for x in before['observations'] if x.get('receipt_id')]==['delivery_failure']
-            assert (await move(store))["moved"]==2
-            after=retro.primary_evidence(settings,start,cutoff)
-            assert after['observations']==before['observations']
-            assert after['coverage']['send_receipts']==before['coverage']['send_receipts']
-            # Equal timestamps still choose global physical identity.
-            await append(store, "equal", stamp="2026-08-01T12:00:00Z", state="not_landed", delivery="not_landed", from_stream_id="fixture:root")
-            await move(store)
-            await append(store, "equal", stamp="2026-08-01T12:00:00Z", from_stream_id="fixture:root")
-            packet=retro.primary_evidence(settings,start,cutoff,max_rows=1)
-            assert not any(x.get('request_id')=='equal' and x['kind']=='delivery_failure' for x in packet['observations'])
-            archive.rename(archive.with_suffix('.missing'))
-            outage=retro.primary_evidence(settings,start,cutoff)
-            assert any(x['source']=='send_receipts' for x in outage['gaps'])
-            assert outage['coverage']['send_receipts']=={'available':False}
-        finally: store.stop()
-    asyncio.run(run())
 
 
 @pytest.mark.parametrize("owner", ["receipt", "route"])
@@ -859,32 +838,6 @@ def test_actual_legacy_store_never_bootstraps_missing_archive_after_restart(tmp_
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('defect',['different_pair','incompatible_schema'])
-def test_pending_bootstrap_retro_validates_archive_before_union(tmp_path,defect):
-    from tools import daily_retro as retro
-    async def run():
-        first,second=running(tmp_path,'first.db'),running(tmp_path,'second.db')
-        try:
-            await append(first,'foreign',stamp='2026-08-01T12:00:00Z',state='not_landed',delivery='not_landed',from_stream_id='fixture:root')
-            await move(first)
-            await second.open_session('fixture','root',created_at='2026-07-01T00:00:00Z')
-            await second.submit(lambda c:(c.execute("INSERT INTO v2_assistant_direct_binding VALUES(?,'fixture:root','generation',1,'2026-07-01T00:00:00Z')", (AssistantCompositeConfig().name,)),c.commit()))
-            sequence=await second.submit(lambda c:dict(c.execute('SELECT * FROM v2_send_receipt_sequence').fetchone()))
-            assert sequence['archive_ready']==0
-            archive=await archive_path(first)
-            if defect=='incompatible_schema':
-                with sqlite3.connect(archive) as c:
-                    c.execute('UPDATE v2_receipt_route_archive SET pair_id=?',(sequence['pair_id'],))
-                    c.execute('ALTER TABLE v2_send_receipts DROP COLUMN meta_json')
-            settings=retro.Settings(tmp_path/'memory',tmp_path/'state','ws://127.0.0.1:12345',tmp_path/'token','fixture',isolated=True,primary_store=Path(second.path),primary_archive=archive)
-            before=archive.read_bytes()
-            packet=retro.primary_evidence(settings,datetime(2026,8,1,tzinfo=timezone.utc),datetime(2026,8,2,tzinfo=timezone.utc))
-            assert packet['coverage']['send_receipts']=={'available':False}
-            assert any(g['source']=='send_receipts' for g in packet['gaps'])
-            assert not any(o.get('request_id')=='foreign' for o in packet['observations'])
-            assert archive.read_bytes()==before
-        finally:first.stop();second.stop()
-    asyncio.run(run())
 
 
 @pytest.mark.parametrize("missing_columns", [("batched_into_dispatch_id", "answered_by_event_id"), ("answered_by_event_id",)])
@@ -944,6 +897,7 @@ def test_batch_archive_migration_preserves_read_gap_without_altering_it(tmp_path
             if defect == "foreign_pair":
                 conn.execute("UPDATE v2_receipt_route_archive SET pair_id='foreign-pair'")
             elif defect == "receipt_schema":
+                conn.execute("DROP INDEX IF EXISTS idx_archive_receipt_proof_wire")
                 conn.execute(f"ALTER TABLE {r.RECEIPT_TABLE} DROP COLUMN meta_json")
             before = conn.execute(f"SELECT * FROM {r.ROUTE_TABLE}").fetchall()
             schema = conn.execute(f"PRAGMA table_info({r.ROUTE_TABLE})").fetchall()

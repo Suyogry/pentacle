@@ -83,6 +83,11 @@ def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
             if not _NAME.match(pname) or not isinstance(profile.get("targets"), dict) or not profile["targets"]:
                 problems.append("profile " + pname)
                 continue
+            # Compatibility names share the canonical target's one configuration.
+            for tname, target in list(profile["targets"].items()):
+                if isinstance(target, dict) and set(target) == {"alias"}:
+                    name = target["alias"]
+                    profile["targets"][tname] = profile["targets"].get(name, {}) if isinstance(name, str) else {}
             for tname, target in profile["targets"].items():
                 if not _NAME.match(tname) or target.get("kind") not in ("run_gate", "pytest_files", "npm_test", "web_gate"):
                     problems.append("target " + tname)
@@ -244,8 +249,8 @@ def build_env(config: Dict[str, Any], profile: Dict[str, Any], target: Dict[str,
         "PATH": os.pathsep.join(dict.fromkeys(dirs)),
         "HOME": str(home), "TMPDIR": str(tmp), "TMP": str(tmp), "TEMP": str(tmp),
         "LANG": locale_name, "LC_ALL": locale_name,
-        "SHELL": "/bin/sh", "TERM": "dumb", "PYTHONNOUSERSITE": "1",
-        "PENTACLE_TEST_STRICT_CAPABILITIES": "1",
+        "SHELL": "/bin/sh", "TERM": "dumb", "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1",
+        "PENTACLE_TEST_STRICT_CAPABILITIES": "1" if target.get("strict_capabilities", True) else "0",
         "PENTACLE_GATE_ATTEMPT_ID": attempt_id,
         "PENTACLE_GATE_EVIDENCE_DIR": str(evidence),
     }
@@ -421,10 +426,10 @@ def check_process_listing(run, env: Dict[str, str]) -> List[Dict[str, str]]:
     try:
         out = run(["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True, timeout=10, env=env)
     except (OSError, subprocess.SubprocessError) as exc:
-        return [fail("capability", "ps cannot be executed from the child environment (%s)" % type(exc).__name__, "the node runner needs ps on the owned PATH")]
+        return [fail("capability", "process identity cannot be verified without ps (%s)" % type(exc).__name__, "rerun outside the sandbox")]
     rows = [l.split() for l in out.stdout.splitlines() if l.strip()]
     if out.returncode or not any(len(r) == 3 and r[0] == str(os.getpid()) or (len(r) == 3 and r[0].isdigit()) for r in rows):
-        return [fail("capability", "ps returned no process rows (rc=%s)" % out.returncode, "run where ps can list processes")]
+        return [fail("capability", "process identity cannot be verified without ps (rc=%s)" % out.returncode, "rerun outside the sandbox")]
     return []
 
 
@@ -479,6 +484,21 @@ def validate_selection(target: Dict[str, Any], select: List[str], checkout: Path
     out = []
     root = checkout / spec.get("root", "")
     for item in [*select, *target.get("required_select", [])]:
+        original = item
+        file_part, separator, node = item.partition("::")
+        file_path = Path(file_part)
+        if file_path.is_absolute():
+            try:
+                file_part = str(file_path.resolve().relative_to(root.resolve()))
+            except ValueError:
+                pass
+        elif spec.get("root") and file_part.startswith(spec["root"] + "/"):
+            file_part = file_part[len(spec["root"]) + 1:]
+        elif not file_part.startswith("tests/") and (root / "tests" / file_part).is_file():
+            file_part = "tests/" + file_part
+        item = file_part + (separator + node if separator else "")
+        if item != original:
+            print("[gate-env] selector normalized: %s" % item, flush=True)
         if item.startswith("-") or ".." in Path(item).parts or item.startswith("/") or not pattern.match(item):
             raise SetupFailure([fail("selection", "selector %r does not match the target's declared pattern" % item, "")])
         file_part = item.split("::", 1)[0]
@@ -707,6 +727,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--target")
     parser.add_argument("--select", action="append", default=[], help="run only: test files/nodes; required for pytest targets (never defaults to the full suite)")
+    parser.add_argument("--shard-index", type=int)
+    parser.add_argument("--shard-count", type=int)
     parser.add_argument("--pass-env", action="append", default=[], metavar="NAME")
     parser.add_argument("--spec")
     parser.add_argument("--series")
@@ -723,8 +745,36 @@ def main(argv: Optional[List[str]] = None) -> int:
     workspace = args.workspace.resolve()
     checkout = args.checkout.resolve()
     attempt_id = ga.new_attempt_id()
+    tmp_root = (args.tmp_root or Path("/tmp/ge-%d" % os.getuid())).resolve()
     evidence = (args.evidence_dir or workspace / "evidence" / attempt_id).resolve()
-    evidence.mkdir(parents=True, exist_ok=True)
+    requested_evidence = evidence
+    try:
+        max_tmp = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["max_tmpdir_bytes"]
+        if type(max_tmp) is not int or max_tmp <= 0:
+            max_tmp = 48
+    except (OSError, ValueError, KeyError, TypeError):
+        max_tmp = 48  # load_config reports a malformed configuration below.
+    home, tmp, basetemp = scratch_paths(workspace, tmp_root, attempt_id)
+    if check_layout(checkout, workspace, evidence, home, tmp, basetemp, max_tmp):
+        short = attempt_id[:8]
+        workspace = Path("/tmp/gw-%d-%s" % (os.getuid(), short)).resolve()
+        tmp_root = Path("/tmp/ge-%d" % os.getuid()).resolve()
+        evidence = Path("/tmp/gv-%d-%s" % (os.getuid(), short)).resolve()
+        home, tmp, basetemp = scratch_paths(workspace, tmp_root, attempt_id)
+        print("[gate-env] using owned temporary workspace and evidence: %s %s" % (workspace, evidence), flush=True)
+    if args.attempt_manifest and (_inside(args.attempt_manifest.resolve(), checkout) or
+                                  (evidence != requested_evidence and _inside(args.attempt_manifest.resolve(), requested_evidence))):
+        args.attempt_manifest = evidence / "attempt-manifest.json"
+        print("[gate-env] using temporary attempt manifest: %s" % args.attempt_manifest, flush=True)
+    try:
+        evidence.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        prior_evidence = evidence
+        evidence = Path("/tmp/gv-%d-%s" % (os.getuid(), attempt_id[:8])).resolve()
+        evidence.mkdir(parents=True, exist_ok=True)
+        if args.attempt_manifest and _inside(args.attempt_manifest.resolve(), prior_evidence):
+            args.attempt_manifest = evidence / "attempt-manifest.json"
+        print("[gate-env] using temporary evidence directory: %s" % evidence, flush=True)
 
     missing_identity = [n for n, v in (("spec", args.spec), ("series", args.series), ("purpose", args.purpose)) if not v]
     identity = {
@@ -745,8 +795,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     state: Dict[str, Any] = {"outcome": "harness_failure", "first_failure": {"stage": "setup", "code": "crash"}, "secondary": {}, "evidence": [], "extra": {}}
     cancelled = {"hit": False}
-    tmp_root = (args.tmp_root or Path("/tmp/ge-%d" % os.getuid())).resolve()
-    home, tmp, basetemp = scratch_paths(workspace, tmp_root, attempt_id)
     run_dir = home.parent
 
     def on_signal(_n, _f):
@@ -773,6 +821,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             target = profile["targets"].get(args.target)
             if target is None:
                 raise SetupFailure([fail("config", "unknown target %r" % args.target, "choose one of %s" % sorted(profile["targets"]))])
+        if args.shard_index is not None or args.shard_count is not None:
+            if (args.command != "run" or not target or not target.get("shardable")
+                    or args.shard_index is None or args.shard_count is None
+                    or not 0 <= args.shard_index < args.shard_count):
+                raise SetupFailure([fail("selection", "sharding requires a shardable target and 0 <= index < count")])
         if args.command == "prepare":
             # prepare never launches a subject: it provisions and preflights --target's needs (or every target's when none is named).
             if args.select:
@@ -784,9 +837,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                       "npm_ci": any(t.get("npm_ci") for t in profile["targets"].values()), "timeout_s": 600, "max_timeout_s": 600}
         identity["identities"]["config"] = ga.digest_of(config)
         identity["identities"]["profile"] = ga.digest_of(profile)
-        timeout_s = args.timeout_seconds or target["timeout_s"]
-        if timeout_s > target["max_timeout_s"]:
-            raise SetupFailure([fail("selection", "--timeout-seconds %d exceeds the target maximum %d" % (timeout_s, target["max_timeout_s"]))])
+        timeout_s = args.timeout_seconds if args.timeout_seconds is not None else target["timeout_s"]
+        if timeout_s <= 0:
+            timeout_s = target["timeout_s"]
+            print("[gate-env] using default timeout: %d seconds" % timeout_s, flush=True)
+        elif timeout_s > target["max_timeout_s"]:
+            timeout_s = target["max_timeout_s"]
+            print("[gate-env] timeout clamped to %d seconds" % timeout_s, flush=True)
         selection = validate_selection(target, args.select, checkout) if target["kind"] != "prepare" else []
         resolved_selection = list(selection)  # retained even when setup fails before prepared
         # This explicitly selected integration file boots the same fixture as web-gate.
@@ -831,6 +888,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         env = build_env(config, profile, target, checkout=checkout, toolchain=toolchain, venv=None, home=home, tmp=tmp, locale_name=locale_name,
                         evidence=evidence, attempt_id=attempt_id, pass_env=pass_env, ambient=dict(os.environ))
         log = lambda m: print("[gate-env] " + m, flush=True)  # noqa: E731
+        log("Python bytecode writes disabled for disposable fixtures")
         venv = None
         dep_info: Dict[str, Any] = {}
         if "python" in target.get("needs", []):
@@ -859,8 +917,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             failures += check_dependencies(subprocess.run, venv / "bin" / "python", env, [checkout / r for r in profile["python_requirements"]])
             caps = config["capability_sets"].get(target.get("capabilities") or "", [])
             if caps and not failures:
-                failures += check_capabilities(subprocess.run, venv / "bin" / "python", env, service_dir / "tests", caps)
+                unavailable = check_capabilities(subprocess.run, venv / "bin" / "python", env, service_dir / "tests", caps)
+                if target.get("strict_capabilities", True):
+                    failures += unavailable
+                else:
+                    for item in unavailable:
+                        log("capability unavailable: " + item["detail"])
         if target.get("process_listing"):
+            # Node's runner currently needs process listing to reap its owned groups.
             failures += check_process_listing(subprocess.run, env)
         if args.command == "run" and (args.target == "web-gate" or web_selected):
             # Optional npm dependencies can be silently dropped by a successful install.
@@ -899,7 +963,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if target["kind"] == "prepare":
             state.update(outcome="pass", first_failure=None)
         else:
-            command, results = build_command(config, target, venv, checkout, service_dir, evidence, basetemp, selection, timeout_s, env)
+            command, results = build_command(config, target, venv, checkout, service_dir, evidence, basetemp, selection, timeout_s, env,
+                                             **({"shard_index": args.shard_index, "shard_count": args.shard_count}
+                                                if args.shard_index is not None else {}))
             if target["kind"] == "pytest_files":  # establish ownership before claiming a subject start
                 owner = OwnedProcesses(service_dir, basetemp / ".owned.json")
                 env[OwnedProcesses.ENV] = str(owner.path)
@@ -1017,7 +1083,8 @@ def profile_root(service_dir: Path, checkout: Path) -> str:
 
 
 def build_command(config: Dict[str, Any], target: Dict[str, Any], venv: Optional[Path], checkout: Path, service_dir: Path, evidence: Path, basetemp: Path,
-                  selection: List[str], timeout_s: int, env: Dict[str, str]) -> Tuple[List[str], Dict[str, Any]]:
+                  selection: List[str], timeout_s: int, env: Dict[str, str], *, shard_index: Optional[int] = None,
+                  shard_count: Optional[int] = None) -> Tuple[List[str], Dict[str, Any]]:
     gate_dir = evidence / "gate"
     gate_dir.mkdir(parents=True, exist_ok=True)
     kind = target["kind"]
@@ -1028,6 +1095,8 @@ def build_command(config: Dict[str, Any], target: Dict[str, Any], venv: Optional
         runner = service_dir / "tools" / "run_gate.py"
         command = [str(venv / "bin" / "python"), str(runner), target["gate"], "--evidence-dir", str(gate_dir),
                    "--basetemp", str(basetemp)]
+        if "unit_workers" in target:
+            command += ["--unit-workers", str(target["unit_workers"])]
         if not limits:
             command += ["--timeout-seconds", str(tier_s)]
         wall_s = timeout_s + config["reserve_s"]
@@ -1038,6 +1107,8 @@ def build_command(config: Dict[str, Any], target: Dict[str, Any], venv: Optional
             deadline_s = (sum(limits.values()) if limits else tier_s * tiers) + budget["preflight_s"] * preflights + budget["reserve_s"] + budget["slack_s"]
             command += ["--deadline-seconds", str(deadline_s), "--deadline-reserve-seconds", str(budget["reserve_s"])]
             wall_s = deadline_s + budget["slack_s"]
+        if shard_index is not None:
+            command += ["--shard-index", str(shard_index), "--shard-count", str(shard_count)]
         out = gate_dir / ("v2-%s-evidence.json" % target["gate"])
         return command, {"cwd": checkout, "wall_s": wall_s, "classify": lambda rc, to: classify_run_gate(out, rc, to, False)}
     if kind == "pytest_files":

@@ -312,6 +312,7 @@ def operator_hello(token_path: Path, welcome: dict[str, Any]) -> dict[str, objec
     return {
         "type": "hello",
         "client": "pentacle",
+        "capabilities": {"assistant_composite_v1": True},
         "subscribe": {"include_subagents": True, "events_mode": "summary"},
         "auth_v2": {
             "scheme": operator_auth.AUTH_SCHEME,
@@ -403,7 +404,9 @@ class _OperatorConnection(AbstractContextManager["_OperatorConnection"]):
         # Proof runs with no graceful-close wait, so a peer that begins closing
         # can never hold a send or close past the deadline; _promote restores
         # the normal close policy only for a proven, still-open connection.
-        self._socket = connect(self.url, open_timeout=self._remaining(deadline), close_timeout=0)
+        # Operator broadcasts may include images; match the agent-orch receive bound.
+        self._socket = connect(self.url, open_timeout=self._remaining(deadline),
+                               close_timeout=0, max_size=128 * 1024 * 1024)
         try:
             welcome = self._receive(self._remaining(deadline))
             self._remaining(deadline)
@@ -725,10 +728,6 @@ class LiveWindow(AbstractContextManager["LiveWindow"]):
             "owned": [asdict(item) for item in self._owned.values() if item.stream_id not in self._closed],
         })
 
-    def drop_primary_connection_for_recovery_test(self) -> None:
-        """Deliberately sever this client socket; next teardown must rescue fresh."""
-        if self._connection is not None:
-            self._connection.close()
 
     def teardown(self) -> list[str]:
         failures: list[str] = []

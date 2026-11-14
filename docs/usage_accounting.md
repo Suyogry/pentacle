@@ -91,6 +91,13 @@ record read after a same-name reopen was also credited to the new generation.
 Wire v2 resolves the generation on the daemon from durable history and the
 record's own transcript time. It never uses receipt time or a grace window.
 
+Usage fences read only current open Codex/Claude rows for the requested host,
+joined to their current generation in one SQL snapshot. The projection retains
+the existing ordered wire fields and optional account binding, without loading
+event history, message previews or usage totals. A successful empty lookup sends
+`usage_fences: []`; a projection error keeps stats available and omits the field.
+The full session-inventory restoration path remains separate.
+
 **History.** `v2_session_generation_history` has one row per
 (host, session name, generation). The row holds `pane_pid`, `provider`,
 `created_at`, `precision`, `closed_at` and the transcript identity
@@ -290,9 +297,6 @@ every local transcript once: Claude `~/.claude/projects/**/*.jsonl` (including
 # satellite host (its satellite.env supplies the WS URL and secrets)
 python3 services/chat-stream-v2/satellite.py --backfill --dry-run
 python3 services/chat-stream-v2/satellite.py --backfill
-# ledger host (Thoth), beside the running daemon
-python3 services/chat-stream-v2/tools/backfill_usage_provenance.py \
-  --db ~/.local/share/pentacle-stream/sessions.db --host thoth [--dry-run]
 ```
 
 ### Thread proof

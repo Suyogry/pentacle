@@ -1089,8 +1089,7 @@ def _derive_default_idempotency_key(
 def spawn(args: argparse.Namespace) -> int:
     """Spawn directly through chat_streamd."""
     from _shared.spawn_objective import resolve_objective
-    # An objective is required only for a parented child spawn (it feeds the
-    # parent's roster); it is validated below once lineage is known.
+    # The daemon derives an omitted objective from the brief.
     objective = getattr(args, "objective", None)
     config = load_config()
     host = args.host or config.host_id
@@ -1155,8 +1154,7 @@ def spawn(args: argparse.Namespace) -> int:
     parent = args.parent if args.parent is not None else (
         None if (handoff or top_level) else caller_stream_id
     )
-    # Objectives are required only for parented child spawns; the daemon derives
-    # one for a top-level/handoff seat. A present objective is still shape-checked.
+    # The daemon derives a missing objective; a present value is shape-checked.
     _, _, objective_error_code = resolve_objective(
         objective, objective_supported=True, parent_stream_id=parent,
     )
@@ -1542,6 +1540,9 @@ def spawn_freeze(args: argparse.Namespace) -> int:
         payload["ttl_s"] = float(args.ttl)
     for name in ("input_provider","input_account","expected_login_generation","maintenance_id","expected_hold_digest"):
         if getattr(args,name,None) is not None:payload[name]=getattr(args,name)
+    if getattr(args,"delegation_dispatch",None) is not None or getattr(args,"delegation_ruling",None) is not None:
+        payload["delegation"]={"source_dispatch_id":getattr(args,"delegation_dispatch",None),
+                               "ruling_tell_id":getattr(args,"delegation_ruling",None)}
     try:
         response = asyncio.run(spawn_freeze_once(
             load_config(), payload, timeout=float(getattr(args, "timeout", 30.0) or 30.0),
@@ -1563,6 +1564,9 @@ def spawn_unfreeze(args: argparse.Namespace) -> int:
         payload["host"] = args.host
     for name in ("maintenance_id","expected_maintenance_digest","expected_hold_digest"):
         if getattr(args,name,None) is not None:payload[name]=getattr(args,name)
+    if getattr(args,"delegation_dispatch",None) is not None or getattr(args,"delegation_ruling",None) is not None:
+        payload["delegation"]={"source_dispatch_id":getattr(args,"delegation_dispatch",None),
+                               "ruling_tell_id":getattr(args,"delegation_ruling",None)}
     try:
         response = asyncio.run(spawn_freeze_once(
             load_config(), payload, timeout=float(getattr(args, "timeout", 30.0) or 30.0),
@@ -1799,6 +1803,12 @@ def _assistant_call(args: argparse.Namespace, payload: dict[str, object]) -> int
     return 0 if str(response.get("type") or "").endswith(".ok") else 1
 
 
+def _publication_ref(value: str) -> str:
+    if not re.fullmatch(r"(?:message|lane|report|wake|tell):\S+", value):
+        raise argparse.ArgumentTypeError("expected <message|lane|report|wake|tell>:<id>")
+    return value
+
+
 def assistant_publish(args: argparse.Namespace) -> int:
     attachment_ids: object = []
     evidence_refs: object = []
@@ -1844,6 +1854,9 @@ def assistant_publish(args: argparse.Namespace) -> int:
         payload["reply_to_message_ids"] = reply_ids
     if getattr(args, "response_state", None) is not None:
         payload["response_state"] = args.response_state
+    for field in ("note_type", "ref"):
+        if getattr(args, field, None) is not None:
+            payload[field] = getattr(args, field)
     return _assistant_call(args, payload)
 
 
@@ -5073,6 +5086,11 @@ def _print_inspect_pretty(response: dict[str, object], *, max_text: int | None =
         ):
             if key in close_audit:
                 print(f"  {key}: {close_audit.get(key)}")
+    guidelines = inspect.get("assistant_guidelines")
+    if isinstance(guidelines, dict):
+        print("assistant_guidelines:")
+        for key in ("seat", "identity", "delivered_at", "delivery_status", "matches_current"):
+            print(f"  {key}: {guidelines.get(key)}")
     deferred = inspect.get("deferred_reap")
     if isinstance(deferred, dict):
         print("deferred_reap:")
@@ -5255,6 +5273,12 @@ def ssh_passthrough(ssh_args: list[str]) -> int:
     return 1
 
 
+def compact(args: argparse.Namespace) -> int:
+    request_id = args.request_id or f"compact-{uuid.uuid4()}"
+    print(f"compact request: {request_id}", file=sys.stderr)
+    return _coordination_request(args, {"type": "compact", "request_id": request_id})
+
+
 def watch_wake(args: argparse.Namespace) -> int:
     kind = args.watch_wake_kind
     target = args.watch_wake_target
@@ -5347,6 +5371,11 @@ def build_parser() -> argparse.ArgumentParser:
     stop_parser.add_argument("--kill-children", action="store_true", help=argparse.SUPPRESS)
     stop_parser.set_defaults(func=stop)
 
+    compact_parser = subparsers.add_parser("compact", help="Request context compaction for this seat now.")
+    compact_parser.add_argument("--request-id", help="Reuse this ID when retrying the same request.")
+    compact_parser.add_argument("--timeout", type=float, default=30.0)
+    compact_parser.set_defaults(func=compact)
+
     for kind in ("wake", "watch"):
         timer_parser = subparsers.add_parser(kind)
         timer_parser.add_argument("watch_wake_target", nargs="?", default="register",
@@ -5401,7 +5430,7 @@ def build_parser() -> argparse.ArgumentParser:
     thread_parser.add_argument("--cursor")
     thread_parser.add_argument("--timeout", type=float, default=30.0)
     thread_parser.set_defaults(func=thread)
-    spawn_parser.add_argument("--objective", help="Immutable one-line objective, at most 120 code points; required for parented child spawns, optional otherwise (top-level/--top-level/--handoff derive one)")
+    spawn_parser.add_argument("--objective", help="One-line objective; derived from the brief when omitted and truncated to 120 code points")
     spawn_parser.add_argument("--visibility", choices=["default", "nested", "hidden"])
     spawn_parser.add_argument("--parent")
     spawn_parser.add_argument("--handoff", action="store_true")
@@ -5512,6 +5541,8 @@ def build_parser() -> argparse.ArgumentParser:
     spawn_freeze_parser.add_argument("--expected-login-generation")
     spawn_freeze_parser.add_argument("--maintenance-id")
     spawn_freeze_parser.add_argument("--expected-hold-digest")
+    spawn_freeze_parser.add_argument("--delegation-dispatch", help="Operator dispatch granting this seat one maintenance hold; pair with --delegation-ruling.")
+    spawn_freeze_parser.add_argument("--delegation-ruling", help="Advisor tell with the matching DELEGATED-HOLD v1 scope; pair with --delegation-dispatch.")
     spawn_freeze_parser.set_defaults(func=spawn_freeze)
 
     spawn_unfreeze_parser = subparsers.add_parser(
@@ -5523,6 +5554,8 @@ def build_parser() -> argparse.ArgumentParser:
     spawn_unfreeze_parser.add_argument("--maintenance-id")
     spawn_unfreeze_parser.add_argument("--expected-maintenance-digest")
     spawn_unfreeze_parser.add_argument("--expected-hold-digest")
+    spawn_unfreeze_parser.add_argument("--delegation-dispatch", help="Operator dispatch granting this seat one maintenance hold; pair with --delegation-ruling.")
+    spawn_unfreeze_parser.add_argument("--delegation-ruling", help="Advisor tell with the matching DELEGATED-HOLD v1 scope; pair with --delegation-dispatch.")
     spawn_unfreeze_parser.set_defaults(func=spawn_unfreeze)
 
     schedule_parser = subparsers.add_parser("schedule")
@@ -5699,6 +5732,8 @@ def build_parser() -> argparse.ArgumentParser:
     send_file_parser.add_argument("--to", help="Target assistant composite for authorized publication")
     send_file_parser.add_argument("--proactive", action="store_true",
         help="With --to: publish prose/status without dispatch/reply IDs from the current direct-primary binding; request ID defaults to send-file:<upload-id>")
+    send_file_parser.add_argument("--note-type", choices=("result", "problem", "reminder", "relay"))
+    send_file_parser.add_argument("--ref", type=_publication_ref)
     send_file_parser.add_argument("--dispatch-id")
     send_file_parser.add_argument("--reply-to-message-id")
     send_file_parser.add_argument("--reply-to-question-id")
@@ -5777,6 +5812,8 @@ def build_parser() -> argparse.ArgumentParser:
     assistant_publish_parser.add_argument("--request-id", required=True)
     assistant_publish_parser.add_argument("--composite-stream-id", required=True)
     assistant_publish_parser.add_argument("--proactive", action="store_true", help="publish prose/status, optionally with attachments, from the current direct-primary binding")
+    assistant_publish_parser.add_argument("--note-type", choices=("result", "problem", "reminder", "relay"))
+    assistant_publish_parser.add_argument("--ref", type=_publication_ref)
     assistant_publish_parser.add_argument("--dispatch-id")
     assistant_publish_parser.add_argument("--reply-to-message-id")
     assistant_publish_parser.add_argument(

@@ -13,6 +13,8 @@ from server import Server
 from store import STREAM_TOKEN_HASH_VERSION, Store
 from test_nudges import HOST, Harness
 
+pytestmark = pytest.mark.usefixtures("virtual_submission_clock")
+
 T0 = 1_900_000_000.0
 WATCH = "fixture-watch"
 CONFIG = ExternalWorkConfig("enabled", WATCH, "Fixture external worker", "fixture://queue")
@@ -492,7 +494,7 @@ def test_trusted_reminder_bypasses_the_digest_hold_and_a_forged_marker_cannot():
         await rig.outbound.drain_once()  # empty digest: the reminder still arrives
         (row,) = await rig.notices()
         assert rig.h.tmux.pasted == [row["body"]]
-        await comms.tell({"stream_id": DESK, "message": "START: routine", "tell_id": "held-start"})
+        await comms.tell({"stream_id": DESK, "message": "Routine work", "tell_id": "held-routine"})
         server = Server(store=rig.store, sessions=rig.h.sessions, comms=comms, local_host=HOST)
         forged = await server._dispatch(json.dumps({
             "type": "tell", "to_stream_id": DESK, "tell_id": "forged", "from_stream_id": f"{HOST}:peer",

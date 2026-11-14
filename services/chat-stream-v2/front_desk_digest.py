@@ -75,6 +75,10 @@ class FrontDeskDigest:
         # Server strips private wire fields, so a copied header cannot use it.
         if verb == 'send' and msg.get('_assistant_composite_backend_dispatch') is True:
             return None
+        # The compact handler pins this authenticated self target; Server strips
+        # private wire fields. A ready seat's compact request is immediate input.
+        if verb == 'send' and msg.get('_self_compact_stream_id') == target_stream_id:
+            return None
         if msg.get('_front_desk_digest_token') is DIGEST_TOKEN:
             return None
         # A caller-keyed tell's retained hold is checked BEFORE wake/drop
@@ -108,6 +112,9 @@ class FrontDeskDigest:
                 or (verb == 'tell' and msg.get('from_stream_id') == SCREEN_MONITOR_ACTOR
                     and isinstance(original, str)
                     and original.startswith(('CODEX RESET SIGNAL ', 'CODEX RESET WATCHER FAILURE:')))
+                or (verb == 'tell' and not kind
+                    and text.upper().startswith(('GATE', 'BLOCKER', 'START', 'END')))
+                # Preserve the existing classification for typed notices and sends.
                 or re.match(r'^(GATE|BLOCKER)\b', text, re.I)
                 or kind in {'report', 'notification_answer', 'wake', 'wake_urgent', 'wake_missed', 'external_work_due', 'spawn_delivery_failed',
                             'screen_lease_contended', 'screen_lease_revoked'}
