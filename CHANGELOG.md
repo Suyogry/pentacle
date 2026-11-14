@@ -12,6 +12,7 @@ backfilled. Changes that land between releases accumulate under `Unreleased`.
 ## Unreleased
 
 - Add stable release records and tools for checking and updating a single-user install.
+- Show each saved account repin attempt's park reason and host receipt codes in front desk account status, including settled attempts.
 
 ## 2026-11-14
 

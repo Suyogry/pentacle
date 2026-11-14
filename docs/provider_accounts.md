@@ -787,7 +787,10 @@ identity failures stay distinct; they never initiate login automatically.
 An interrupted operation has two separate histories: attempts, including zero
 binding effects, and successful same-home binding links. Status reports the
 current pin, the union of `uncertain`, `split` and `conflict` causes, the chain's
-canonical tail, missing prerequisites and one FD next action. Offline or disabled
+canonical tail, missing prerequisites and one FD next action. Its
+`attempt_receipts` list every saved attempt, settled ones included, with the
+park reason and the saved host receipt's `state`, `outcome` and `kind` codes
+(`null` when absent); it never includes proofs, bindings or profiles. Offline or disabled
 consumers remain pending. Time, hold expiry and matching rollback bytes never
 clear a cause.
 

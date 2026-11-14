@@ -809,3 +809,34 @@ def test_b_topology_exclusion_boundaries(tmp_path,monkeypatch,subtests):
                 case=selected[index];root=tmp_path/(row+variant.replace("/","-")+str(index));root.mkdir()
                 with subtests.test(msg=case.id),monkeypatch.context() as mp:
                     asyncio.run(run(case,root,mp))
+
+
+@pytest.mark.parametrize("where",["before_journal","host_receipt"])
+def test_saved_failure_receipt_is_readable_after_settlement(tmp_path,monkeypatch,where):
+    async def run():
+        store,runtime,host,old,request,calls,native,logins,cell,pin=await host_journey(tmp_path,monkeypatch)
+        import provider_cli_artifact,provider_account_host
+        verify,turn=provider_cli_artifact.verify,provider_account_host.minimal_turn
+        def refuse(*args,**kwargs):raise AccountError("provider_cli_pin_mismatch")
+        if where=="before_journal":
+            monkeypatch.setattr(provider_cli_artifact,"verify",refuse)
+            expected={"operation_id":request["operation_id"],"status":"parked","park_reason":"provider_cli_pin_mismatch","host_receipt":None}
+        else:
+            # The host journals the failure and returns it as a done receipt.
+            monkeypatch.setattr(provider_account_host,"minimal_turn",refuse)
+            expected={"operation_id":request["operation_id"],"status":"parked","park_reason":"account_repin_execution_failed",
+                "host_receipt":{"state":"done","outcome":"provider_cli_pin_mismatch","kind":"repin"}}
+        try:
+            with pytest.raises(VerbError):await runtime.operation(request)
+            monkeypatch.setattr(provider_cli_artifact,"verify",verify);monkeypatch.setattr(provider_account_host,"minimal_turn",turn)
+            assert (await recovery(runtime,old))["attempt_receipts"]==[expected]
+            pin3=await move_pin(runtime,pin,3)
+            assert (await runtime.operation(fresh(request,pin3,"after-refusal")))["result"]["outcome"]=="repinned"
+            # Settlement removes the fence, never the saved cause.
+            status=await recovery(runtime,old)
+            assert not status["fence_causes"] and expected in status["attempt_receipts"]
+            for row in status["attempt_receipts"]:
+                assert set(row)=={"operation_id","status","park_reason","host_receipt"}
+                assert row["host_receipt"] is None or set(row["host_receipt"])=={"state","outcome","kind"}
+        finally:store.stop()
+    asyncio.run(run())

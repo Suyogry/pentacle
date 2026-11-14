@@ -272,6 +272,19 @@ async def mutation_status(executor,old):
     return remote
 
 
+def saved_receipts(attempts):
+    """Each attempt's saved host_receipt, settled attempts included: allowlisted codes only."""
+    result=[]
+    for state in attempts.values():
+        receipt=state.get("host_receipt")
+        saved=({k:receipt[k] if type(receipt.get(k)) in {str,int} else None for k in ("state","outcome","kind")}
+            if isinstance(receipt,dict) else None)
+        reason=state.get("park_reason")
+        result.append({"operation_id":state["arguments"]["operation_id"],"status":state.get("status"),
+            "park_reason":reason if isinstance(reason,str) else None,"host_receipt":saved})
+    return sorted(result,key=lambda x:x["operation_id"])
+
+
 def public_status(a,value,remote,now):
     from account_repin import _states
     from provider_cli_pin import raw,raw_digest
@@ -304,7 +317,7 @@ def public_status(a,value,remote,now):
         "real admission hold" if not held or held["held_until"]<=now else
         "valid current pin or immutable pre-enforcement target" if pin is None and recovery_target is None else None)
     return {**cell(value),"snapshot_digest":digest(snapshot),"origin_digest":digest(origins),"canonical_tail":canonical_tail,
-        "fence_causes":fences,"dispositions":list(dispositions.values()),"current_pin":pin,"recovery_target_pin":recovery_target,
+        "fence_causes":fences,"dispositions":list(dispositions.values()),"attempt_receipts":saved_receipts(attempts),"current_pin":pin,"recovery_target_pin":recovery_target,
         "missing_prerequisite":missing,"next_action":"repair "+missing if missing else
             "FD reconcile canonical tail or explicitly relogin with supersede_repin" if fences else "ordinary current-pin work",
         "_snapshot":snapshot}
